@@ -312,7 +312,6 @@
                                  <&ccu CLK_AUDIO_DAC>;
                         clock-names = "apb", "adc", "dac";
                         resets = <&ccu RST_BUS_AUDIO>;
-                        /* DMA: revertimos a <7,7> (patrón observado en parches originales) */
                         dmas = <&dma 7>, <&dma 7>;
                         dma-names = "rx", "tx";
                         allwinner,codec-analog-controls = <&codec_analog>;
@@ -322,14 +321,6 @@
                 codec_analog: codec-analog@2030300 {
                         compatible = "allwinner,sun20i-d1-codec-analog";
                         reg = <0x02030300 0xd00>;
-                        /* Provide audio clocks for the analog codec subdevice so
-                         * the driver's devm_clk_get(dev, NULL) can find a clock
-                         * (avoids -ENOENT during probe). Match the parent codec's
-                         * clock naming where appropriate.
-                         */
-                        clocks = <&ccu CLK_BUS_AUDIO>,
-                                 <&ccu CLK_AUDIO_ADC>;
-                        clock-names = "apb", "mod";
                         status = "disabled";
                 };
 
