@@ -1,0 +1,579 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+// Copyright (C) 2022 Arm Ltd.
+
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/dts-v1/;
+
+#include "sun8i-t113-spuc.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/power/allwinner,sun20i-d1-ppu.h>
+
+/ {
+	model = "SPuC T113";
+	compatible = "serper3d,spuc-t113", "allwinner,sun8i-t113s";
+
+	aliases {
+		wifi0 = &rtl8821cs;
+                mmc0 = &mmc0;
+                mmc2 = &mmc2;
+                serial0 = &uart0;
+                serial1 = &uart1;
+                serial4 = &uart4;
+	};
+
+	// chosen {
+	// 	stdout-path = "serial3:115200n8";
+	// };
+
+	/* board wide 5V supply directly from the USB-C socket */
+	reg_vcc5v: regulator-5v {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-5v";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-always-on;
+	};
+
+	/* SY8008 DC/DC regulator on the board */
+	reg_3v3: regulator-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&reg_vcc5v>;
+	};
+
+	/* SY8008 DC/DC regulator on the board, also supplying VDD-SYS */
+	reg_vcc_core: regulator-core {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-core";
+		regulator-min-microvolt = <880000>;
+		regulator-max-microvolt = <880000>;
+		vin-supply = <&reg_vcc5v>;
+	};
+
+	/* XC6206 LDO on the board */
+	reg_avdd2v8: regulator-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "avdd2v8";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		vin-supply = <&reg_3v3>;
+	};
+
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+                post-power-on-delay-ms = <200>;
+		reset-gpios = <&pio 6 12 GPIO_ACTIVE_LOW>; /* PG12 */
+	};
+
+        backlight: backlight {
+                compatible = "pwm-backlight";
+                pwms = <&pwm 7 5000000 0>;
+                pinctrl-0 = <&pwm7_pd22_pin>;
+                pinctrl-names = "default";
+                brightness-levels = <0 1000>;
+                num-interpolated-steps = <1000>;
+                default-brightness-level = <200>;
+                status = "okay";
+        };
+
+        // panel {
+        //         compatible = "bananapi,s070wv20-ct16", "simple-panel";
+        //         connector-type = <7>;
+        //         power-supply = <&reg_vcc5v>;
+        //         width-mm = <108>;
+        //         height-mm = <65>;
+        //         backlight = <&backlight>;
+        //         status = "okay";
+
+        //         display-timings {
+        //                 native-mode = <&timing0>;
+        //                 timing0: timing0 {
+        //                         clock-frequency = <25000000>;
+        //                         hactive = <800>;
+        //                         vactive = <480>;
+        //                         hsync-len = <8>;
+        //                         hback-porch = <8>;
+        //                         hfront-porch = <8>;
+        //                         vsync-len = <8>;
+        //                         vback-porch = <8>;
+        //                         vfront-porch = <8>;
+        //                         hsync-active = <0>;
+        //                         vsync-active = <0>;
+        //                 };
+        //         };
+
+        //         port {
+        //                 panel_input: endpoint {
+        //                         remote-endpoint = <&tcon_lcd0_out_panel>;
+        //                 };
+        //         };
+        // };
+        // panel {
+	// 	compatible = "bananapi,s070wv20-ct16", "simple-panel";
+        //         backlight = <&backlight>;
+        //         status = "okay";
+        // 
+	// 	port {
+	// 		panel_input: endpoint {
+	// 			remote-endpoint = <&tcon_lcd0_out_panel>;
+	// 		};
+	// 	};
+	// };
+
+        panel {
+                compatible = "serper3d,qt5000h40r79l";
+                backlight = <&backlight>;
+                power-supply = <&reg_3v3>;
+                status = "okay";
+
+                port {
+                        panel_input: endpoint {
+                                remote-endpoint = <&tcon_lcd0_out_panel>;
+                        };
+                };
+        };
+
+        poweroff {
+                compatible = "gpio-poweroff";
+                gpios = <&pio 4 7 GPIO_ACTIVE_LOW>;   /* PE7 */
+                timeout-ms = <300>;        /* mantener la línea 300 ms */
+                post-delay-ms = <200>;     /* dar tiempo a que el ATtiny corte */
+                priority = <255>;          /* gana frente a otros handlers */
+                force;                     /* (opcional) sigue aunque la línea parezca ocupada */
+                status = "okay";
+        };
+
+
+        gpio-keys {
+                compatible = "gpio-keys";
+                status = "okay";
+
+                key-power {
+                        label = "Power Button";
+                        gpios = <&pio 4 11 GPIO_ACTIVE_LOW>; // PE11 (ideal si es R_PIO)
+                        linux,code = <KEY_POWER>;            // 116
+                        wakeup-source;
+                        debounce-interval = <50>;
+                };
+
+                key-down {
+                        label = "Down Button";
+                        gpios = <&tca9535 6 GPIO_ACTIVE_LOW>; // TCA9535 pin 6
+                        linux,code = <KEY_DOWN>;
+                        autorepeat;
+                };
+                
+                key-ok {
+                        label = "OK Button";
+                        gpios = <&tca9535 7 GPIO_ACTIVE_LOW>; // TCA9535 pin 7
+                        linux,code = <KEY_ENTER>;
+                        wakeup-source;
+                };
+                
+                key-up {
+                        label = "Up Button";
+                        gpios = <&tca9535 8 GPIO_ACTIVE_LOW>; // TCA9535 pin 8
+                        linux,code = <KEY_UP>;
+                        autorepeat;
+                };
+        };
+
+        // sound_i2s {
+        //         compatible = "simple-audio-card";
+        //         simple-audio-card,name = "rtl8821cs-i2s";
+        //         simple-audio-card,format = "i2s";
+        //         simple-audio-card,bitclock-master = <&codec_dai>;
+        //         simple-audio-card,frame-master = <&codec_dai>;
+        //         status = "okay";
+                
+        //         simple-audio-card,cpu {
+        //                 sound-dai = <&i2s2>;
+        //                 dai-tdm-slot-num = <2>;
+        //                 dai-tdm-slot-width = <32>;
+        //         };
+                
+        //         codec_dai: simple-audio-card,codec {
+        //                 sound-dai = <&rtl8821cs_codec>;
+        //         };
+        // };
+
+        // rtl8821cs_codec: rtl8821cs-codec {
+        //         compatible = "linux,bt-sco";
+        //         #sound-dai-cells = <0>;
+        //         status = "okay";
+        // };
+};
+
+&codec {
+        allwinner,audio-routing =
+                "Speaker", "Left DAC",
+                "Speaker", "Right DAC",
+                "Speaker", "RAMP Enable",
+                "MIC3", "Mic3 Amplifier",
+                "Mic3 Amplifier", "MIC3 Source Capture Route",
+                "MIC3 Source Capture Route", "ADC3",
+                "MIC3", "MBIAS";
+
+        widgets =
+                "Speaker", "Speaker",
+                "Microphone", "MIC3";
+
+        status = "okay";
+};
+
+&codec_analog {
+        status = "okay";
+};
+
+&dcxo {
+	clock-frequency = <24000000>;
+};
+
+&ehci1 {
+	status = "okay";
+};
+
+&mmc0 {
+	pinctrl-0 = <&mmc0_pins>;
+	pinctrl-names = "default";
+	vmmc-supply = <&reg_3v3>;
+	cd-gpios = <&pio 5 6 GPIO_ACTIVE_LOW>;
+	disable-wp;
+	bus-width = <4>;
+	status = "okay";
+};
+
+&mmc1 {
+    pinctrl-0 = <&mmc1_pins>;
+    pinctrl-names = "default";
+    vmmc-supply = <&reg_3v3>;
+    non-removable;
+    bus-width = <4>;
+    mmc-pwrseq = <&wifi_pwrseq>;
+    cap-sd-highspeed;
+    status = "okay";
+
+    rtl8821cs: sdio_wifi@1 {
+        reg = <1>;
+        compatible = "realtek,rtl8821cs-sdio";
+        interrupt-parent = <&pio>;
+        interrupts = <6 10 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "host-wake";
+    };
+};
+
+&mmc2 {
+    status = "okay";
+    bus-width = <4>;
+    max-frequency = <150000000>;
+    pinctrl-0 = <&mmc2_pins>;
+    pinctrl-names = "default";
+    vmmc-supply = <&reg_3v3>;
+    vqmmc-supply = <&reg_3v3>;
+    cap-sd-highspeed;
+    sd-uhs-ddr50;
+    no-1-8-v;
+    full-pwr-cycle;
+    disable-wp;
+};
+
+&ohci1 {
+	status = "okay";
+};
+
+&pio {
+	vcc-pb-supply = <&reg_3v3>;
+	vcc-pd-supply = <&reg_3v3>;
+	vcc-pe-supply = <&reg_avdd2v8>;
+	vcc-pf-supply = <&reg_3v3>;
+	vcc-pg-supply = <&reg_3v3>;
+
+        clk_pg11_pin: clk-pg11-pin {
+                pins = "PG11";
+                function = "clk";
+        };
+
+        /omit-if-no-ref/
+        uart0_pe2_pins: uart0-pe2-pins {
+                pins = "PE2", "PE3";
+                function = "uart0";
+        };
+
+        /omit-if-no-ref/
+        uart4_pe4_pins: uart4-pe4-pins {
+                pins = "PE4", "PE5";
+                function = "uart4";
+        };
+
+        /omit-if-no-ref/
+        i2c1_pe0_pins: i2c1_pe0_pins {
+                pins = "PE0", "PE1";
+                function = "i2c1";
+        };
+
+        /omit-if-no-ref/
+        i2c2_pe12_pins: i2c2-pe12-pins {
+                pins = "PE12", "PE13";
+                function = "i2c2";
+        };
+
+        /omit-if-no-ref/
+        pwm7_pd22_pin: pwm7-pd22-pin {
+                pins = "PD22";
+                function = "pwm7";
+        };
+
+        /omit-if-no-ref/
+        i2s2_pb_din_pins: i2s2-pb-din-pins {
+                pins = "PB3";
+                function = "i2s2_din";
+        };
+
+        i2s2_pb_dout_pins: i2s2-pb-dout-pins {
+                pins = "PB4";
+                function = "i2s2_dout";
+        };
+
+        /omit-if-no-ref/
+        i2s2_pb_control_pins: i2s2-pb-control-pins {
+                pins = "PB5", "PB6";
+                function = "i2s2";
+        };    
+};
+
+&uart0 {
+        pinctrl-0 = <&uart0_pe2_pins>;
+        pinctrl-names = "default";
+        status = "okay";
+};
+
+&uart1 {
+        uart-has-rtscts;
+        pinctrl-0 = <&uart1_pg6_pins>, <&uart1_pg8_rts_cts_pins>;
+        pinctrl-names = "default";
+        status = "okay";
+
+        // bluetooth {
+        //         compatible = "realtek,rtl8821cs-bt";
+        //         device-wake-gpios = <&pio 6 13 GPIO_ACTIVE_HIGH>; /* PG13 */
+        //         enable-gpios = <&pio 6 15 GPIO_ACTIVE_HIGH>; /* PG15 */
+        //         host-wake-gpios = <&pio 6 14 GPIO_ACTIVE_HIGH>; /* PG14 */
+        //         max-speed = <1500000>;
+        //         uart-has-rtscts;
+        // };
+        bluetooth {
+                compatible = "realtek,rtl8821cs-bt", "realtek,rtl8723bs-bt";
+                device-wake-gpios = <&pio 6 13 GPIO_ACTIVE_HIGH>; /* PG13 */
+                enable-gpios = <&pio 6 15 GPIO_ACTIVE_HIGH>; /* PG15 */
+                host-wake-gpios = <&pio 6 14 GPIO_ACTIVE_HIGH>; /* PG14 */
+                max-speed = <1500000>;
+                uart-has-rtscts;
+                // audio-interface = "i2s"; /* Especificar I2S en lugar de PCM */
+        };
+};
+
+&uart4 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart4_pe4_pins>;
+	status = "okay";
+};
+
+/* The USB-C socket has its CC pins pulled to GND, so is hardwired as a UFP. */
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&usbphy {
+	usb1_vbus-supply = <&reg_vcc5v>;
+	status = "okay";
+};
+
+&wdt {
+        status = "okay";
+};
+
+&de {
+        status = "okay";
+};
+
+&pwm {
+        status = "okay";
+};
+
+&tcon_top {
+    status = "okay";
+};
+
+&tcon_lcd0 {
+        pinctrl-names = "default";
+        pinctrl-0 = <&lcd_rgb666_pins>;
+        status = "okay";
+};
+
+&tcon_lcd0_out {
+        tcon_lcd0_out_panel: endpoint@0 {
+                reg = <0>;
+                remote-endpoint = <&panel_input>;
+        };
+};
+
+&display_clocks {
+        status = "okay";
+};
+
+&sid {
+        cpu_speed_grade: cpu-speed-grade@0 {
+                reg = <0x0 0x2>;
+        };
+
+        ths_calibration: ths-calibration@14 {
+                reg = <0x14 0x4>;
+        };
+
+        bg_trim: bg-trim@28 {
+                reg = <0x28 0x4>;
+                bits = <16 8>;
+        };
+};
+
+&i2c2 {
+        pinctrl-0 = <&i2c2_pe12_pins>;
+        pinctrl-names = "default";
+        status = "okay";
+        clock-frequency = <400000>;
+
+        gt911@14 {
+                compatible = "goodix,gt911";
+                reg = <0x14>;
+                interrupt-parent = <&pio>;
+                interrupts = <1 7 IRQ_TYPE_EDGE_RISING>;
+
+                irq-gpios = <&pio 1 7 GPIO_ACTIVE_HIGH>; /* PE7 */
+                reset-gpios = <&pio 1 2 GPIO_ACTIVE_HIGH>;
+
+                touchscreen-size-x = <800>;
+                touchscreen-size-y = <480>;
+                // touchscreen-swapped-x-y;
+
+                VDD-supply = <&reg_3v3>;
+
+                status = "okay";
+                wakeup-source;
+        };
+};
+
+&i2c1 {
+        pinctrl-0 = <&i2c1_pe0_pins>;
+        pinctrl-names = "default";
+        status = "okay";
+        clock-frequency = <400000>;
+
+        tca9535: gpio@20 {
+                compatible = "ti,tca9535";
+                reg = <0x20>;
+                gpio-controller;
+                #gpio-cells = <2>;
+                interrupt-parent = <&pio>;
+                interrupts = <4 6 IRQ_TYPE_EDGE_FALLING>; /* PE6 */
+                interrupt-controller;
+                #interrupt-cells = <2>;
+                ti,enable-auto-increment; // Añadir soporte AI
+                vdd-supply = <&reg_3v3>;
+                vddio-supply = <&reg_3v3>;
+                
+                status = "okay";
+                wakeup-source;
+            
+            gpio-line-names = 
+                "gps-on-off", "none", "gps-ant-power", "audio-power",
+                "audio-mute", "audio-mode", "button-down", "button-ok",
+                "button-up", "io1-1", "io1-2", "io1-3",
+                "usb-c-en", "usb-c-fault", "usb-a-fault", "usb-a-en";
+
+           none-sel-hog {
+                gpio-hog;
+                gpios = <1 GPIO_ACTIVE_HIGH>;
+                input;
+                bias-pull-up;
+                line-name = "none-sel";
+           };
+        };
+
+        rtc@32 {
+                compatible = "epson,rx8025";
+                reg = <0x32>;
+                status = "okay";
+                #clock-cells = <0>;
+        };
+
+        // bme280@76 {
+        //         compatible = "bosch,bme280";
+        //         reg = <0x76>;
+        //         status = "okay";
+        //         vddd-supply = <&reg_3v3>;  // Digital supply
+        //         vdda-supply = <&reg_3v3>;  // Analog supply
+        // };
+
+        // icm20948@68 {
+        //         compatible = "invensense,mpu9250";
+        //         reg = <0x68>;
+        //         interrupt-parent = <&pio>;
+        //         interrupts = <4 4 IRQ_TYPE_EDGE_RISING>; /* PE4 */
+        //         status = "okay";
+        //         vdd-supply = <&reg_3v3>;
+        //         vddio-supply = <&reg_3v3>;
+        //         
+        //         /* Configuración opcional de magnetómetro AK09916 */
+        //         mount-matrix = "1", "0", "0",
+        //                 "0", "1", "0",
+        //                 "0", "0", "1";
+        //     
+        //         i2c-gate {
+        //                 #address-cells = <1>;
+        //                 #size-cells = <0>;
+        //                 magnetometer@c {
+        //                 compatible = "asahi-kasei,ak8975";
+        //                 reg = <0x0c>;
+        //                 };
+        //         };
+        // };
+
+        // max30102@57 {
+        //         compatible = "maxim,max30102";
+        //         reg = <0x57>;
+        //         interrupt-parent = <&pio>;
+        //         interrupts = <4 9 IRQ_TYPE_EDGE_FALLING>; /* PE9 */
+        //         status = "okay";
+        //         maxim,red-led-current-microamp = <7000>;
+        //         maxim,ir-led-current-microamp = <7000>;
+        // };
+
+        // ina219@40 {
+        //         compatible = "ti,ina219";
+        //         reg = <0x40>;
+        //         #io-channel-cells = <1>;
+        //         status = "okay";
+        //         shunt-resistor = <100000>; /* 100000 micro-ohms = 0.1 ohm */
+        // };
+        
+        bh1750: light-sensor@23 {
+                compatible = "rohm,bh1750";
+                reg = <0x23>; // Dirección I2C del BH1750FVI
+                reset-gpios = <&pio 4 8 GPIO_ACTIVE_LOW>; //PE8
+                status = "okay";
+        };
+};
+
+&i2s2 {
+    status = "okay";
+    
+    pinctrl-names = "default";
+    pinctrl-0 = <&i2s2_pb_din_pins &i2s2_pb_dout_pins &i2s2_pb_control_pins>;
+};
