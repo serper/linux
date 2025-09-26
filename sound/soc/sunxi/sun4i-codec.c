@@ -30,11 +30,6 @@
 #include <sound/initval.h>
 #include <sound/dmaengine_pcm.h>
 
-static int sun4i_codec_dma_prepare_slave_config(struct snd_pcm_substream *substream,
-					     struct snd_pcm_hw_params *params,
-					     struct dma_slave_config *slave_config);
-static const struct snd_dmaengine_pcm_config sun4i_codec_dmaengine_pcm_config;
-
 /* Codec DAC digital controls and FIFO registers */
 #define SUN4I_CODEC_DAC_DPC			(0x00)
 #define SUN4I_CODEC_DAC_DPC_EN_DA			(31)
@@ -109,6 +104,7 @@ static const struct snd_dmaengine_pcm_config sun4i_codec_dmaengine_pcm_config;
 #define SUN4I_CODEC_ADC_DEBUG			(0x2c)
 
 /* FIFO counters */
+#define SUN4I_CODEC_DAC_TXCNT			(0x30)
 #define SUN4I_CODEC_ADC_RXCNT			(0x34)
 
 /* Calibration register (sun7i only) */
@@ -213,7 +209,8 @@ static const struct snd_dmaengine_pcm_config sun4i_codec_dmaengine_pcm_config;
 /* Calibration controls */
 #define SUN6I_CODEC_CALIBRATION			(0x34)
 
-/* FIFO counters (sun6i) */
+/* FIFO counters */
+#define SUN6I_CODEC_DAC_TXCNT			(0x40)
 #define SUN6I_CODEC_ADC_RXCNT			(0x44)
 
 /* headset jack detection and button support registers */
@@ -222,7 +219,8 @@ static const struct snd_dmaengine_pcm_config sun4i_codec_dmaengine_pcm_config;
 
 /* TODO sun6i DAP (Digital Audio Processing) bits */
 
-/* FIFO counters moved on A23 (solo RX se emplearía en este driver) */
+/* FIFO counters moved on A23 */
+#define SUN8I_A23_CODEC_DAC_TXCNT		(0x1c)
 #define SUN8I_A23_CODEC_ADC_RXCNT		(0x20)
 
 /* TX FIFO moved on H3 */
@@ -395,7 +393,6 @@ struct sun4i_codec {
 
 	struct snd_dmaengine_dai_dma_data	capture_dma_data;
 	struct snd_dmaengine_dai_dma_data	playback_dma_data;
-	unsigned int	ofs_txdata; /* Offset dinámico TXDATA (D1=0x20) */
 };
 
 static void sun4i_codec_start_playback(struct sun4i_codec *scodec)
@@ -431,7 +428,7 @@ static void sun4i_codec_stop_capture(struct sun4i_codec *scodec)
 }
 
 static int sun4i_codec_trigger(struct snd_pcm_substream *substream, int cmd,
-		       struct snd_soc_dai *dai)
+			       struct snd_soc_dai *dai)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct sun4i_codec *scodec = snd_soc_card_get_drvdata(rtd->card);
@@ -440,33 +437,10 @@ static int sun4i_codec_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 			sun4i_codec_start_playback(scodec);
-		} else {
-			/* D1: Configure ADC channel and DRQ for capture */
-			if (of_device_is_compatible(scodec->dev->of_node, "allwinner,sun20i-d1-codec")) {
-				bool mono = substream->runtime && substream->runtime->channels == 1;
-				
-				/* Enable ADC */
-				regmap_update_bits(scodec->regmap, SUN20I_D1_CODEC_ADC_FIFOC,
-					BIT(SUN20I_D1_CODEC_ADC_FIFOC_EN_AD),
-					BIT(SUN20I_D1_CODEC_ADC_FIFOC_EN_AD));
-				
-				/* Configure ADC channels: ADC3 for mono, ADC1+ADC3 for stereo */
-				regmap_update_bits(scodec->regmap, SUN20I_D1_CODEC_ADC_DIG_CTRL,
-					BIT(SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC1_CH_EN) |
-					BIT(SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC3_CH_EN),
-					mono ? BIT(SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC3_CH_EN) :
-					(BIT(SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC1_CH_EN) |
-					 BIT(SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC3_CH_EN)));
-				
-				/* Enable DRQ */
-				regmap_update_bits(scodec->regmap, SUN20I_D1_CODEC_ADC_FIFOC,
-					BIT(SUN20I_D1_CODEC_ADC_FIFOC_ADC_DRQ_EN),
-					BIT(SUN20I_D1_CODEC_ADC_FIFOC_ADC_DRQ_EN));
-			}
+		else
 			sun4i_codec_start_capture(scodec);
-		}
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -491,9 +465,11 @@ static int sun4i_codec_prepare_capture(struct snd_pcm_substream *substream,
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct sun4i_codec *scodec = snd_soc_card_get_drvdata(rtd->card);
 
+
 	/* Flush RX FIFO */
 	regmap_field_set_bits(scodec->reg_adc_fifoc,
 				 BIT(SUN4I_CODEC_ADC_FIFOC_FIFO_FLUSH));
+
 
 	/* Set RX FIFO trigger level */
 	regmap_field_update_bits(scodec->reg_adc_fifoc,
@@ -525,7 +501,7 @@ static int sun4i_codec_prepare_capture(struct snd_pcm_substream *substream,
 }
 
 static int sun4i_codec_prepare_playback(struct snd_pcm_substream *substream,
-				struct snd_soc_dai *dai)
+					struct snd_soc_dai *dai)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct sun4i_codec *scodec = snd_soc_card_get_drvdata(rtd->card);
@@ -533,12 +509,12 @@ static int sun4i_codec_prepare_playback(struct snd_pcm_substream *substream,
 
 	/* Flush the TX FIFO */
 	regmap_field_set_bits(scodec->reg_dac_fifoc,
-		      BIT(SUN4I_CODEC_DAC_FIFOC_FIFO_FLUSH));
+			      BIT(SUN4I_CODEC_DAC_FIFOC_FIFO_FLUSH));
 
 	/* Set TX FIFO Empty Trigger Level */
 	regmap_field_update_bits(scodec->reg_dac_fifoc,
-			 0x3f << SUN4I_CODEC_DAC_FIFOC_TX_TRIG_LEVEL,
-			 0x18 << SUN4I_CODEC_DAC_FIFOC_TX_TRIG_LEVEL);
+				 0x3f << SUN4I_CODEC_DAC_FIFOC_TX_TRIG_LEVEL,
+				 0xf << SUN4I_CODEC_DAC_FIFOC_TX_TRIG_LEVEL);
 
 	if (substream->runtime->rate > 32000)
 		/* Use 64 bits FIR filter */
@@ -548,12 +524,12 @@ static int sun4i_codec_prepare_playback(struct snd_pcm_substream *substream,
 		val = BIT(SUN4I_CODEC_DAC_FIFOC_FIR_VERSION);
 
 	regmap_field_update_bits(scodec->reg_dac_fifoc,
-			 BIT(SUN4I_CODEC_DAC_FIFOC_FIR_VERSION),
-			 val);
+				 BIT(SUN4I_CODEC_DAC_FIFOC_FIR_VERSION),
+				 val);
 
 	/* Send zeros when we have an underrun */
 	regmap_field_clear_bits(scodec->reg_dac_fifoc,
-			BIT(SUN4I_CODEC_DAC_FIFOC_SEND_LASAT));
+				BIT(SUN4I_CODEC_DAC_FIFOC_SEND_LASAT));
 
 	return 0;
 };
@@ -640,57 +616,50 @@ static int sun4i_codec_get_hw_rate(struct snd_pcm_hw_params *params)
 }
 
 static int sun4i_codec_hw_params_capture(struct sun4i_codec *scodec,
-			 struct snd_pcm_hw_params *params,
-			 unsigned int hwrate)
+					 struct snd_pcm_hw_params *params,
+					 unsigned int hwrate)
 {
-	u32 before = 0;
-
-	regmap_field_read(scodec->reg_adc_fifoc, &before);
-
-	if (of_device_is_compatible(scodec->dev->of_node, "allwinner,sun20i-d1-codec")) {
-		/* D1: Configure ADC FIFO for capture */
-		regmap_field_update_bits(scodec->reg_adc_fifoc,
+	/* Set ADC sample rate */
+	regmap_field_update_bits(scodec->reg_adc_fifoc,
 				 7 << SUN4I_CODEC_ADC_FIFOC_ADC_FS,
 				 hwrate << SUN4I_CODEC_ADC_FIFOC_ADC_FS);
-		
-		/* Configure for 16-bit samples */
-		regmap_field_clear_bits(scodec->reg_adc_fifoc,
-				BIT(scodec->quirks->rx_sample_bits));
-		
-		/* Configure RX_FIFO_MODE for proper DMA transfer */
-		regmap_field_set_bits(scodec->reg_adc_fifoc,
-				BIT(SUN4I_CODEC_ADC_FIFOC_RX_FIFO_MODE));
-		
-		/* Configure MONO_EN for single channel */
+
+	if (!scodec->quirks->has_dual_clock) {
+		/* Set the number of channels we want to use */
 		if (params_channels(params) == 1)
 			regmap_field_set_bits(scodec->reg_adc_fifoc,
-				      BIT(SUN4I_CODEC_ADC_FIFOC_MONO_EN));
+					      BIT(SUN4I_CODEC_ADC_FIFOC_MONO_EN));
 		else
 			regmap_field_clear_bits(scodec->reg_adc_fifoc,
-					BIT(SUN4I_CODEC_ADC_FIFOC_MONO_EN));
+						BIT(SUN4I_CODEC_ADC_FIFOC_MONO_EN));
+	}
+
+	/* Set the number of sample bits to either 16 or 24 bits */
+	if (hw_param_interval(params, SNDRV_PCM_HW_PARAM_SAMPLE_BITS)->min == 32) {
+		regmap_field_set_bits(scodec->reg_adc_fifoc,
+				      BIT(scodec->quirks->rx_sample_bits));
+
+		regmap_field_clear_bits(scodec->reg_adc_fifoc,
+					BIT(SUN4I_CODEC_ADC_FIFOC_RX_FIFO_MODE));
+
+		scodec->capture_dma_data.addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
 	} else {
-		/* Ruta legacy original */
-		regmap_field_update_bits(scodec->reg_adc_fifoc,
-				 7 << SUN4I_CODEC_ADC_FIFOC_ADC_FS,
-				 hwrate << SUN4I_CODEC_ADC_FIFOC_ADC_FS);
-		if (params_channels(params) == 1)
-			regmap_field_set_bits(scodec->reg_adc_fifoc,
-				      BIT(SUN4I_CODEC_ADC_FIFOC_MONO_EN));
-		else
-			regmap_field_clear_bits(scodec->reg_adc_fifoc,
-					BIT(SUN4I_CODEC_ADC_FIFOC_MONO_EN));
 		regmap_field_clear_bits(scodec->reg_adc_fifoc,
-				BIT(SUN4I_CODEC_ADC_FIFOC_RX_SAMPLE_BITS));
+					BIT(SUN4I_CODEC_ADC_FIFOC_RX_SAMPLE_BITS));
+
+		/* Fill most significant bits with valid data MSB */
 		regmap_field_set_bits(scodec->reg_adc_fifoc,
-				BIT(SUN4I_CODEC_ADC_FIFOC_RX_FIFO_MODE));
+				      BIT(SUN4I_CODEC_ADC_FIFOC_RX_FIFO_MODE));
+
+		scodec->capture_dma_data.addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
 	}
 
 	return 0;
 }
 
 static int sun4i_codec_hw_params_playback(struct sun4i_codec *scodec,
-				  struct snd_pcm_hw_params *params,
-				  unsigned int hwrate)
+					  struct snd_pcm_hw_params *params,
+					  unsigned int hwrate)
 {
 	u32 val;
 
@@ -709,11 +678,26 @@ static int sun4i_codec_hw_params_playback(struct sun4i_codec *scodec,
 				 BIT(SUN4I_CODEC_DAC_FIFOC_MONO_EN),
 				 val);
 
-	/* Sólo 16 bits */
-	regmap_field_clear_bits(scodec->reg_dac_fifoc,
-				BIT(SUN4I_CODEC_DAC_FIFOC_TX_SAMPLE_BITS));
-	regmap_field_set_bits(scodec->reg_dac_fifoc,
-				BIT(SUN4I_CODEC_DAC_FIFOC_TX_FIFO_MODE));
+	/* Set the number of sample bits to either 16 or 24 bits */
+	if (hw_param_interval(params, SNDRV_PCM_HW_PARAM_SAMPLE_BITS)->min == 32) {
+		regmap_field_set_bits(scodec->reg_dac_fifoc,
+				      BIT(SUN4I_CODEC_DAC_FIFOC_TX_SAMPLE_BITS));
+
+		/* Set TX FIFO mode to padding the LSBs with 0 */
+		regmap_field_clear_bits(scodec->reg_dac_fifoc,
+					BIT(SUN4I_CODEC_DAC_FIFOC_TX_FIFO_MODE));
+
+		scodec->playback_dma_data.addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	} else {
+		regmap_field_clear_bits(scodec->reg_dac_fifoc,
+					BIT(SUN4I_CODEC_DAC_FIFOC_TX_SAMPLE_BITS));
+
+		/* Set TX FIFO mode to repeat the MSB */
+		regmap_field_set_bits(scodec->reg_dac_fifoc,
+				      BIT(SUN4I_CODEC_DAC_FIFOC_TX_FIFO_MODE));
+
+		scodec->playback_dma_data.addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
+	}
 
 	return 0;
 }
@@ -789,44 +773,20 @@ static void sun4i_codec_shutdown(struct snd_pcm_substream *substream,
 		clk_disable_unprepare(scodec->clk_module);
 }
 
-static int sun4i_codec_dai_probe(struct snd_soc_dai *dai)
-{
-	struct snd_soc_card *card = dai->component && dai->component->card ? dai->component->card : NULL;
-	struct sun4i_codec *scodec = card ? snd_soc_card_get_drvdata(card) : NULL;
-
-	if (!scodec) {
-		dev_err(dai->dev, "Missing codec drvdata\n");
-		return -ENODEV;
-	}
-
-	snd_soc_dai_init_dma_data(dai,
-							  &scodec->playback_dma_data,
-							  &scodec->capture_dma_data);
-	return 0;
-}
-
 static const struct snd_soc_dai_ops sun4i_codec_dai_ops = {
-    /* .probe inicializa dma_data ahora que el DAI existe; scodec se obtiene vía card->drvdata */
-    .probe          = sun4i_codec_dai_probe,
-    .startup        = sun4i_codec_startup,
-    .shutdown       = sun4i_codec_shutdown,
-    .trigger        = sun4i_codec_trigger,
-    .hw_params      = sun4i_codec_hw_params,
-    .prepare        = sun4i_codec_prepare,
+	.startup	= sun4i_codec_startup,
+	.shutdown	= sun4i_codec_shutdown,
+	.trigger	= sun4i_codec_trigger,
+	.hw_params	= sun4i_codec_hw_params,
+	.prepare	= sun4i_codec_prepare,
 };
 
-/* Máscaras separadas: playback hasta 192 kHz; capture limitado a 48 kHz */
-#define SUN4I_CODEC_PLAYBACK_RATES (\
-		SNDRV_PCM_RATE_8000_48000 |\
-		SNDRV_PCM_RATE_12000 |\
-		SNDRV_PCM_RATE_24000 |\
-		SNDRV_PCM_RATE_96000 |\
+#define SUN4I_CODEC_RATES (			\
+		SNDRV_PCM_RATE_8000_48000 |	\
+		SNDRV_PCM_RATE_12000 |		\
+		SNDRV_PCM_RATE_24000 |		\
+		SNDRV_PCM_RATE_96000 |		\
 		SNDRV_PCM_RATE_192000)
-
-/* 24 kHz no está incluido dentro del rango 8000_48000 */
-#define SUN4I_CODEC_CAPTURE_RATES (\
-		SNDRV_PCM_RATE_8000_48000 |\
-		SNDRV_PCM_RATE_24000)
 
 static struct snd_soc_dai_driver sun4i_codec_dai = {
 	.name	= "Codec",
@@ -837,9 +797,10 @@ static struct snd_soc_dai_driver sun4i_codec_dai = {
 		.channels_max	= 2,
 		.rate_min	= 8000,
 		.rate_max	= 192000,
-		.rates		= SUN4I_CODEC_PLAYBACK_RATES,
-		.formats	= SNDRV_PCM_FMTBIT_S16_LE,
-		.sig_bits	= 16,
+		.rates		= SUN4I_CODEC_RATES,
+		.formats	= SNDRV_PCM_FMTBIT_S16_LE |
+				  SNDRV_PCM_FMTBIT_S32_LE,
+		.sig_bits	= 24,
 	},
 	.capture = {
 		.stream_name	= "Codec Capture",
@@ -847,9 +808,10 @@ static struct snd_soc_dai_driver sun4i_codec_dai = {
 		.channels_max	= 2,
 		.rate_min	= 8000,
 		.rate_max	= 48000,
-		.rates		= SUN4I_CODEC_CAPTURE_RATES,
-		.formats	= SNDRV_PCM_FMTBIT_S16_LE,
-		.sig_bits	= 16,
+		.rates		= SUN4I_CODEC_RATES,
+		.formats	= SNDRV_PCM_FMTBIT_S16_LE |
+				  SNDRV_PCM_FMTBIT_S32_LE,
+		.sig_bits	= 24,
 	},
 };
 
@@ -1098,45 +1060,11 @@ static const struct snd_soc_dapm_widget sun20i_d1_codec_codec_widgets[] = {
 			    SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC2_CH_EN, 0, NULL, 0),
 	SND_SOC_DAPM_SUPPLY("ADC3 CH Enable", SUN20I_D1_CODEC_ADC_DIG_CTRL,
 			    SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC3_CH_EN, 0, NULL, 0),
-	/* Widget ADC digital para activar supplies pero sin stream_name */
-	SND_SOC_DAPM_ADC("Digital ADC", NULL, SND_SOC_NOPM, 0, 0),
-	/* Endpoint de entrada desde el dominio analógico */
-	SND_SOC_DAPM_INPUT("Codec In"),
-	/* AIF de captura digital - endpoint del stream PCM */
-	SND_SOC_DAPM_AIF_OUT("Capture AIF", "Codec Capture", 0, SND_SOC_NOPM, 0, 0),
-	/* Suministro de mic bias y preamp (equivalentes a variante legacy) */
-	SND_SOC_DAPM_SUPPLY("VMIC", SUN4I_CODEC_ADC_ACTL,
-			    SUN4I_CODEC_ADC_ACTL_VMICEN, 0, NULL, 0),
-	SND_SOC_DAPM_PGA("MIC1 Pre-Amplifier", SUN4I_CODEC_ADC_ACTL,
-			 SUN4I_CODEC_ADC_ACTL_PREG1EN, 0, NULL, 0),
-	SND_SOC_DAPM_INPUT("Mic1"),
-	/* (Placeholder) Mic3 analógico vive en driver analog; aquí sólo enlazamos digitalmente */
 	/* Digital parts of the DACs */
 	SND_SOC_DAPM_SUPPLY("DAC Enable", SUN4I_CODEC_DAC_DPC,
 			    SUN4I_CODEC_DAC_DPC_EN_DA, 0, NULL, 0),
 	SND_SOC_DAPM_SUPPLY("DAC VOL_SEL Enable", SUN20I_D1_CODEC_DAC_VOL_CTRL,
 			    SUN20I_D1_CODEC_DAC_VOL_SEL, 0, NULL, 0),
-	/* Nuevo nodo intermedio para que DAPM tenga un sink digital real antes de cruzar
-	 * al componente analógico. El stream PCM engancha aquí; las supplies deben
-	 * encenderse cuando este DAC digital se active.
-	 */
-	SND_SOC_DAPM_DAC("Digital DAC", "Codec Playback", SND_SOC_NOPM, 0, 0),
-	/* Endpoint de salida digital interno */
-	SND_SOC_DAPM_OUTPUT("Codec Out"),
-	/* AIF explícito para playback: ayuda a DAPM a establecer dependencia */
-	SND_SOC_DAPM_AIF_OUT("Playback AIF", "Codec Playback", 0, SND_SOC_NOPM, 0, 0),
-};
-
-static const struct snd_soc_dapm_route sun20i_d1_codec_codec_routes[] = {
-	/* Rutas de playback */
-	{ "Codec Out", NULL, "Digital DAC" },
-	{ "Digital DAC", NULL, "Playback AIF" },
-	
-	/* Rutas internas de captura: entrada -> ADC -> supplies -> AIF */
-	{ "Digital ADC", NULL, "Codec In" },
-	{ "Digital ADC", NULL, "ADC Enable" },
-	{ "Digital ADC", NULL, "ADC3 CH Enable" },
-	{ "Capture AIF", NULL, "Digital ADC" },
 };
 
 static const struct snd_soc_component_driver sun4i_codec_codec = {
@@ -1148,7 +1076,7 @@ static const struct snd_soc_component_driver sun4i_codec_codec = {
 	.num_dapm_routes	= ARRAY_SIZE(sun4i_codec_codec_dapm_routes),
 	.idle_bias_on		= 1,
 	.use_pmdown_time	= 1,
-	.endianness		= 0,
+	.endianness		= 1,
 };
 
 static const struct snd_soc_component_driver sun20i_d1_codec_codec = {
@@ -1156,11 +1084,9 @@ static const struct snd_soc_component_driver sun20i_d1_codec_codec = {
 	.num_controls		= ARRAY_SIZE(sun20i_d1_codec_codec_controls),
 	.dapm_widgets		= sun20i_d1_codec_codec_widgets,
 	.num_dapm_widgets	= ARRAY_SIZE(sun20i_d1_codec_codec_widgets),
-	.dapm_routes		= sun20i_d1_codec_codec_routes,
-	.num_dapm_routes	= ARRAY_SIZE(sun20i_d1_codec_codec_routes),
 	.idle_bias_on		= 1,
 	.use_pmdown_time	= 1,
-	.endianness		= 0,
+	.endianness		= 1,
 };
 
 static const struct regmap_config sun20i_d1_codec_regmap_config = {
@@ -1170,7 +1096,21 @@ static const struct regmap_config sun20i_d1_codec_regmap_config = {
 	.max_register	= SUN20I_D1_CODEC_VRA1SPEEDUP_DOWN_CTRL,
 };
 
-/* Legacy quirks removed - D1 focused implementation */
+/*
+static const struct sun4i_codec_quirks sun4i_codec_quirks = {
+	.regmap_config	= &sun4i_codec_regmap_config,
+	.codec		= &sun4i_codec_codec,
+	.create_card	= sun4i_codec_create_card,
+	.reg_dac_fifoc	= REG_FIELD(SUN4I_CODEC_DAC_FIFOC, 0, 31),
+	.reg_adc_fifoc	= REG_FIELD(SUN4I_CODEC_ADC_FIFOC, 0, 31),
+	.adc_drq_en	= SUN4I_CODEC_ADC_FIFOC_ADC_DRQ_EN,
+	.rx_sample_bits	= SUN4I_CODEC_ADC_FIFOC_RX_SAMPLE_BITS,
+	.rx_trig_level	= SUN4I_CODEC_ADC_FIFOC_RX_TRIG_LEVEL,
+	.reg_dac_txdata	= SUN4I_CODEC_DAC_TXDATA,
+	.reg_adc_rxdata	= SUN4I_CODEC_ADC_RXDATA,
+	.dma_max_burst	= SUN4I_DMA_MAX_BURST,
+};
+*/
 
 static const struct sun4i_codec_quirks sun20i_d1_codec_quirks = {
 	.regmap_config	= &sun20i_d1_codec_regmap_config,
@@ -1181,35 +1121,31 @@ static const struct sun4i_codec_quirks sun20i_d1_codec_quirks = {
 	.adc_drq_en	= SUN20I_D1_CODEC_ADC_FIFOC_ADC_DRQ_EN,
 	.rx_sample_bits	= SUN20I_D1_CODEC_ADC_FIFOC_RX_SAMPLE_BITS,
 	.rx_trig_level	= SUN20I_D1_CODEC_ADC_FIFOC_RX_TRIG_LEVEL,
-	/* D1: TXDATA se encuentra en 0x20 (verificado en reproducción estable). */
-	.reg_dac_txdata	= 0x20,
+	.reg_dac_txdata	= SUN8I_H3_CODEC_DAC_TXDATA,
 	.reg_adc_rxdata	= SUN20I_D1_CODEC_ADC_RXDATA,
 	.has_reset	= true,
 	.has_dual_clock = true,
 	.dma_max_burst	= SUN4I_DMA_MAX_BURST,
 };
 
+/*
+ * Para el bring-up inicial del D1/T113 eliminamos las rutas de nivel "card".
+ *
+ * Motivo del fallo anterior (-ENODEV): al añadir rutas de tarjeta que cruzan
+ * widgets pertenecientes a dos componentes distintos (digital vs analógico),
+ * alguno de los widgets todavía no estaba visible (o el nombre no coincidía
+ * exactamente con la topología interna), provocando errores al registrar la
+ * tarjeta: "ASoC: Failed to add route ..." y posterior retorno -19.
+ *
+ * Estrategia: dejar que cada componente (sun4i-codec digital y
+ * sun20i-d1-codec-analog) gestione sus propias rutas internas. Una vez la
+ * tarjeta registre correctamente podremos reintroducir sólo las rutas de
+ * puente estrictamente necesarias verificando primero los nombres reales de
+ * los widgets publicados por ambos componentes vía
+ *   cat /sys/kernel/debug/asoc/<card>/dapm
+ */
 static const struct snd_soc_dapm_route sun20i_d1_codec_card_routes[] = {
-	/* Playback path: Digital DAC -> analog DACs */
-	{ "Digital DAC", NULL, "DAC Enable" },
-	{ "Digital DAC", NULL, "DAC VOL_SEL Enable" },
-	{ "Digital DAC", NULL, "Codec Playback" },
-	{ "Left DAC", NULL, "Codec Out" },
-	{ "Right DAC", NULL, "Codec Out" },
-	{ "Speaker", NULL, "Left DAC" },
-	{ "Speaker", NULL, "Right DAC" },
-	{ "Speaker", NULL, "RAMP Enable" },
-
-	/* Capture path: ADC3 -> Digital ADC */
-	{ "MIC1 Pre-Amplifier", NULL, "Mic1" },
-	{ "Mic1", NULL, "VMIC" },
-	{ "ADC1", NULL, "MIC1 Pre-Amplifier" },
-	{ "Codec In", NULL, "ADC3" },
-	{ "ADC3", NULL, "Mic3 Amplifier" },
-	{ "Mic3 Amplifier", NULL, "MBIAS" },
 };
-
-/* Card-level DAPM routes connecting digital and analog components */
 
 static struct snd_soc_dai_link *sun4i_codec_create_link(struct device *dev, int *num_links)
 {
@@ -1382,13 +1318,13 @@ static int sun4i_codec_probe(struct platform_device *pdev)
 	}
 
 	/* DMA configuration for TX FIFO */
-	scodec->ofs_txdata = quirks->reg_dac_txdata;
-	scodec->playback_dma_data.addr = res->start + scodec->ofs_txdata;
+	scodec->playback_dma_data.addr = res->start + quirks->reg_dac_txdata;
 	scodec->playback_dma_data.maxburst = quirks->dma_max_burst;
 	scodec->playback_dma_data.addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
 
 	/* DMA configuration for RX FIFO */
-	scodec->capture_dma_data.addr = res->start + quirks->reg_adc_rxdata;
+	scodec->capture_dma_data.addr = res->start +
+					quirks->reg_adc_rxdata;
 	scodec->capture_dma_data.maxburst = quirks->dma_max_burst;
 	scodec->capture_dma_data.addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
 
@@ -1399,7 +1335,7 @@ static int sun4i_codec_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = devm_snd_dmaengine_pcm_register(&pdev->dev, &sun4i_codec_dmaengine_pcm_config, 0);
+	ret = devm_snd_dmaengine_pcm_register(&pdev->dev, NULL, 0);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to register against DMAEngine\n");
 		return ret;
@@ -1414,9 +1350,21 @@ static int sun4i_codec_probe(struct platform_device *pdev)
 
 	snd_soc_card_set_drvdata(card, scodec);
 
+	/* Debug: print card device node and attempt to register the card */
+	if (card->dev && card->dev->of_node)
+		dev_info(&pdev->dev, "sun4i-codec: card->dev->of_node phandle=%pOF\n", card->dev->of_node);
+	else
+		dev_info(&pdev->dev, "sun4i-codec: card->dev or of_node is NULL\n");
+
+	/* Print card summary just before registration for debugging */
+	dev_info(&pdev->dev, "sun4i-codec: registering card=%p name=%s num_links=%d dai_link=%p\n",
+			 card, card->name ? card->name : "(null)", card->num_links, card->dai_link);
+
 	ret = snd_soc_register_card(card);
+	dev_info(&pdev->dev, "sun4i-codec: snd_soc_register_card returned %d for card=%p\n", ret, card);
+
 	if (ret) {
-		dev_err_probe(&pdev->dev, ret, "Failed to register our card\n");
+		dev_err_probe(&pdev->dev, ret, "Failed to register our card (ret=%d)\n", ret);
 		return ret;
 	}
 
@@ -1430,56 +1378,12 @@ static void sun4i_codec_remove(struct platform_device *pdev)
 	snd_soc_unregister_card(card);
 }
 
-/*
- * Callback para completar dma_slave_config antes de que el driver DMA lo valide.
- * Observamos que en reproducción (MEM_TO_DEV) dst_maxburst quedaba en 0 y fallaba
- * la comprobación (bit 0 no soportado). Forzamos que src y dst compartan los
- * parámetros de burst y ancho definidos en playback/capture_dma_data.
- */
-static int sun4i_codec_dma_prepare_slave_config(struct snd_pcm_substream *substream,
-					     struct snd_pcm_hw_params *params,
-					     struct dma_slave_config *slave_config)
-{
-	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
-	struct sun4i_codec *scodec = snd_soc_card_get_drvdata(rtd->card);
-
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		if (!slave_config->dst_addr)
-			slave_config->dst_addr = scodec->playback_dma_data.addr;
-		if (!slave_config->dst_addr_width)
-			slave_config->dst_addr_width = scodec->playback_dma_data.addr_width;
-		if (!slave_config->dst_maxburst)
-			slave_config->dst_maxburst = scodec->playback_dma_data.maxburst;
-		/* Asegura también un src_maxburst (>0) si quedara a cero */
-		if (!slave_config->src_maxburst)
-			slave_config->src_maxburst = scodec->playback_dma_data.maxburst;
-		if (!slave_config->src_addr_width)
-			slave_config->src_addr_width = scodec->playback_dma_data.addr_width;
-	} else {
-		if (!slave_config->src_addr)
-			slave_config->src_addr = scodec->capture_dma_data.addr;
-		if (!slave_config->src_addr_width)
-			slave_config->src_addr_width = scodec->capture_dma_data.addr_width;
-		if (!slave_config->src_maxburst)
-			slave_config->src_maxburst = scodec->capture_dma_data.maxburst;
-		if (!slave_config->dst_maxburst)
-			slave_config->dst_maxburst = scodec->capture_dma_data.maxburst;
-		if (!slave_config->dst_addr_width)
-			slave_config->dst_addr_width = scodec->capture_dma_data.addr_width;
-	}
-
-	return 0;
-}
-
-static const struct snd_dmaengine_pcm_config sun4i_codec_dmaengine_pcm_config = {
-	.prepare_slave_config = sun4i_codec_dma_prepare_slave_config,
-};
-
 static struct snd_soc_aux_dev aux_dev;
 
 static struct snd_soc_card *sun20i_d1_codec_create_card(struct device *dev)
 {
 	struct snd_soc_card *card;
+	int ret;
 
 	card = devm_kzalloc(dev, sizeof(*card), GFP_KERNEL);
 	if (!card)
@@ -1503,21 +1407,14 @@ static struct snd_soc_card *sun20i_d1_codec_create_card(struct device *dev)
 	card->dapm_widgets	= NULL;
 	card->num_dapm_widgets	= 0;
 	card->dapm_routes	= sun20i_d1_codec_card_routes;
-	/* No añadimos rutas de tarjeta hasta confirmar nombres reales de widgets
-	 * publicados por ambos componentes (ver debugfs DAPM). */
 	card->num_dapm_routes	= ARRAY_SIZE(sun20i_d1_codec_card_routes);
 	card->aux_dev		= &aux_dev;
 	card->num_aux_devs	= 1;
-	/* Usamos false para permitir que DAPM añada rutas implícitas entre los
-	 * widgets del DAI y los endpoints recién añadidos (Playback AIF -> Digital DAC). */
-	card->fully_routed	= false;
+	card->fully_routed	= true;
 
-	/* Parse optional device tree audio routing */
-	if (of_find_property(dev->of_node, "allwinner,audio-routing", NULL)) {
-		int ret = snd_soc_of_parse_audio_routing(card, "allwinner,audio-routing");
-		if (ret)
-			dev_warn(dev, "failed to parse audio-routing: %d\n", ret);
-	}
+	ret = snd_soc_of_parse_audio_routing(card, "allwinner,audio-routing");
+	if (ret)
+		dev_warn(dev, "failed to parse audio-routing: %d\n", ret);
 
 	return card;
 }
