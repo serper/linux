@@ -4437,6 +4437,42 @@ static const struct panel_desc startek_kd070wvfpa = {
 		     DRM_BUS_FLAG_SYNC_SAMPLE_NEGEDGE,
 };
 
+/* serper3d */
+static const struct display_timing qt5000h40r79l_timing = {
+	.pixelclock = { 25200000, 27200000, 30500000 },
+	.hactive = { 800, 800, 800 },
+	.hfront_porch = { 4, 8, 48 },
+	.hback_porch = { 4, 8, 48 },
+	.hsync_len = { 4, 8, 48 },
+	.vactive = { 480, 480, 480 },
+	.vfront_porch = { 2, 4, 8 },
+	.vback_porch = { 4, 8, 12 },
+	.vsync_len = { 4, 8, 12 },
+	.flags = DISPLAY_FLAGS_HSYNC_LOW | DISPLAY_FLAGS_VSYNC_LOW |
+		 DISPLAY_FLAGS_DE_HIGH | DISPLAY_FLAGS_PIXDATA_NEGEDGE |
+		 DISPLAY_FLAGS_SYNC_NEGEDGE,
+};
+
+static const struct panel_desc qt5000h40r79l_desc = {
+	.timings = &qt5000h40r79l_timing,
+	.num_timings = 1,
+	.bpc = 6,
+	.size = {
+		.width = 108,
+		.height = 65,
+	},
+	// .delay = {
+	// 	.prepare = 20,
+	// 	.enable = 200,
+	// 	.disable = 200,
+	// },
+	.bus_format = MEDIA_BUS_FMT_RGB666_1X18,
+	.bus_flags = DRM_BUS_FLAG_DE_HIGH |
+		     DRM_BUS_FLAG_PIXDATA_SAMPLE_NEGEDGE |
+		     DRM_BUS_FLAG_SYNC_SAMPLE_NEGEDGE,
+	.connector_type = DRM_MODE_CONNECTOR_DPI,
+};
+
 static const struct display_timing tsd_tst043015cmhx_timing = {
 	.pixelclock = { 5000000, 9000000, 12000000 },
 	.hactive = { 480, 480, 480 },
@@ -5382,6 +5418,9 @@ static const struct of_device_id platform_of_match[] = {
 	}, {
 		.compatible = "startek,kd070wvfpa",
 		.data = &startek_kd070wvfpa,
+	}, {
+		.compatible = "serper3d,qt5000h40r79l",
+		.data = &qt5000h40r79l_desc,
 	}, {
 		.compatible = "team-source-display,tst043015cmhx",
 		.data = &tsd_tst043015cmhx,

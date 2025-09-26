@@ -1409,7 +1409,8 @@ reset:
 
 	ts->chip = goodix_get_chip_data(ts->id);
 
-	if (ts->load_cfg_from_disk) {
+	// if (ts->load_cfg_from_disk) {
+	if (0) {
 		/* update device config */
 		error = device_property_read_string(&client->dev,
 						    "goodix,config-name",

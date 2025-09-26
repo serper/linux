@@ -211,20 +211,16 @@
 };
 
 &codec {
-        allwinner,audio-routing =
-                "Speaker", "Left DAC",
-                "Speaker", "Right DAC",
-                "Speaker", "RAMP Enable",
-                "MIC3", "Mic3 Amplifier",
-                "Mic3 Amplifier", "MIC3 Source Capture Route",
-                "MIC3 Source Capture Route", "ADC3",
-                "MIC3", "MBIAS";
-
-        widgets =
-                "Speaker", "Speaker",
-                "Microphone", "MIC3";
-
-        status = "okay";
+    /*
+     * Eliminamos rutas y widgets personalizados del board-level por ahora.
+     * Razón: los nombres (MIC3, ADC3, Left/Right DAC, RAMP Enable, etc.) no
+     * existen en la topología efectiva combinada actual y causan intentos de
+     * crear rutas DAPM inválidas durante el registro de la tarjeta ASoC.
+     *
+     * Cuando la tarjeta registre correctamente, podremos inspeccionar los
+     * widgets reales en debugfs (asoc) y añadir sólo las rutas necesarias.
+     */
+    status = "okay";
 };
 
 &codec_analog {

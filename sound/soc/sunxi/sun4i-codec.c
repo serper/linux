@@ -1128,30 +1128,31 @@ static const struct sun4i_codec_quirks sun20i_d1_codec_quirks = {
 	.dma_max_burst	= SUN4I_DMA_MAX_BURST,
 };
 
+/*
+ * Para el bring-up inicial del D1/T113 eliminamos las rutas de nivel "card".
+ *
+ * Motivo del fallo anterior (-ENODEV): al añadir rutas de tarjeta que cruzan
+ * widgets pertenecientes a dos componentes distintos (digital vs analógico),
+ * alguno de los widgets todavía no estaba visible (o el nombre no coincidía
+ * exactamente con la topología interna), provocando errores al registrar la
+ * tarjeta: "ASoC: Failed to add route ..." y posterior retorno -19.
+ *
+ * Estrategia: dejar que cada componente (sun4i-codec digital y
+ * sun20i-d1-codec-analog) gestione sus propias rutas internas. Una vez la
+ * tarjeta registre correctamente podremos reintroducir sólo las rutas de
+ * puente estrictamente necesarias verificando primero los nombres reales de
+ * los widgets publicados por ambos componentes vía
+ *   cat /sys/kernel/debug/asoc/<card>/dapm
+ */
 static const struct snd_soc_dapm_route sun20i_d1_codec_card_routes[] = {
-	/* ADC Routes */
-	{ "ADC1", NULL, "ADC Enable" },
-	{ "ADC2", NULL, "ADC Enable" },
-	{ "ADC3", NULL, "ADC Enable" },
-	{ "ADC1", NULL, "ADC1 CH Enable" },
-	{ "ADC2", NULL, "ADC2 CH Enable" },
-	{ "ADC3", NULL, "ADC3 CH Enable" },
-	{ "Codec Capture", NULL, "ADC1" },
-	{ "Codec Capture", NULL, "ADC2" },
-	{ "Codec Capture", NULL, "ADC3" },
-
-	/* DAC Routes */
-	{ "Left DAC", NULL, "DAC Enable" },
-	{ "Right DAC", NULL, "DAC Enable" },
-	{ "Left DAC", NULL, "DAC VOL_SEL Enable" },
-	{ "Right DAC", NULL, "DAC VOL_SEL Enable" },
-	{ "Left DAC", NULL, "Codec Playback" },
-	{ "Right DAC", NULL, "Codec Playback" },
 };
 
 static struct snd_soc_dai_link *sun4i_codec_create_link(struct device *dev, int *num_links)
 {
 	struct snd_soc_dai_link *link;
+	struct snd_soc_dai_link_component *cpus;
+	struct snd_soc_dai_link_component *codecs;
+	struct snd_soc_dai_link_component *platforms;
 
 	link = devm_kzalloc(dev, sizeof(*link), GFP_KERNEL);
 	if (!link)
@@ -1160,6 +1161,43 @@ static struct snd_soc_dai_link *sun4i_codec_create_link(struct device *dev, int 
 	link->name = "Codec";
 	link->stream_name = "Codec";
 	link->dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_CBP_CFC;
+
+	/*
+	 * El driver original minimalista solo rellenaba name/stream_name/dai_fmt.
+	 * Las versiones recientes del core ASoC esperan que se configuren los
+	 * arrays cpus/codecs/platforms (multi-component). La ausencia de estos
+	 * punteros provoca un NULL deref en snd_soc_runtime_set_dai_fmt.
+	 *
+	 * El codec interno expone un único DAI llamado "Codec"; usamos el mismo
+	 * of_node (este dispositivo) tanto para CPU DAI como para CODEC DAI.
+	 * Esto es aceptable para un codec interno integrado (pattern utilizado
+	 * en otros drivers legacy migrados). Si más adelante se desea separar
+	 * CPU y CODEC, se podrá ajustar aquí.
+	 */
+	cpus = devm_kzalloc(dev, sizeof(*cpus), GFP_KERNEL);
+	codecs = devm_kzalloc(dev, sizeof(*codecs), GFP_KERNEL);
+	platforms = devm_kzalloc(dev, sizeof(*platforms), GFP_KERNEL);
+	if (!cpus || !codecs || !platforms)
+		return NULL;
+
+	/* CPU side */
+	cpus[0].of_node = dev->of_node;
+	cpus[0].dai_name = "Codec"; /* nombre del DAI expuesto por sun4i_codec_dai */
+	link->cpus = cpus;
+	link->num_cpus = 1;
+
+	/* CODEC side */
+	codecs[0].of_node = dev->of_node;
+	codecs[0].dai_name = "Codec";
+	link->codecs = codecs;
+	link->num_codecs = 1;
+
+	/* Platform (DMA / PCM) provider: mismo nodo */
+	platforms[0].of_node = dev->of_node;
+	link->platforms = platforms;
+	link->num_platforms = 1;
+
+	/* Link totalmente enrutado dentro del codec interno */
 
 	*num_links = 1;
 	return link;
@@ -1312,9 +1350,21 @@ static int sun4i_codec_probe(struct platform_device *pdev)
 
 	snd_soc_card_set_drvdata(card, scodec);
 
+	/* Debug: print card device node and attempt to register the card */
+	if (card->dev && card->dev->of_node)
+		dev_info(&pdev->dev, "sun4i-codec: card->dev->of_node phandle=%pOF\n", card->dev->of_node);
+	else
+		dev_info(&pdev->dev, "sun4i-codec: card->dev or of_node is NULL\n");
+
+	/* Print card summary just before registration for debugging */
+	dev_info(&pdev->dev, "sun4i-codec: registering card=%p name=%s num_links=%d dai_link=%p\n",
+			 card, card->name ? card->name : "(null)", card->num_links, card->dai_link);
+
 	ret = snd_soc_register_card(card);
+	dev_info(&pdev->dev, "sun4i-codec: snd_soc_register_card returned %d for card=%p\n", ret, card);
+
 	if (ret) {
-		dev_err_probe(&pdev->dev, ret, "Failed to register our card\n");
+		dev_err_probe(&pdev->dev, ret, "Failed to register our card (ret=%d)\n", ret);
 		return ret;
 	}
 
