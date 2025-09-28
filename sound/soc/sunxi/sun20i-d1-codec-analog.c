@@ -1,323 +1,225 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0+
 /*
- * Allwinner sun20i-d1 SoC Analog Codec Driver
+ * This driver supports the analog controls for the internal codec
+ * found in Allwinner's D1/T113s SoCs family.
  *
- * Copyright (C) 2023 Maksim Kiselev <bigunclemax@gmail.com>
+ * Based on sun50i-codec-analog.c and legacy working 6.13 patch.
  */
 
+#include <linux/io.h>
+#include <linux/bitops.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/clk.h>
+#include <linux/platform_device.h>
 #include <linux/regmap.h>
-#include <linux/regulator/consumer.h>
+
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/tlv.h>
 
-#define SUN20I_D1_CODEC_ANALOG_EN_DAC		0x00
-#define SUN20I_D1_CODEC_ANALOG_EN_ADC		0x04
-#define SUN20I_D1_CODEC_ANALOG_DAC_VOL		0x08
-#define SUN20I_D1_CODEC_ANALOG_ADC_VOL		0x0c
-#define SUN20I_D1_CODEC_ANALOG_MIC1_VOL		0x10
-#define SUN20I_D1_CODEC_ANALOG_MIC2_VOL		0x14
-#define SUN20I_D1_CODEC_ANALOG_LINEIN_VOL	0x18
-#define SUN20I_D1_CODEC_ANALOG_MIXER_VOL	0x1c
-#define SUN20I_D1_CODEC_ANALOG_OUT_MIXER	0x20
-#define SUN20I_D1_CODEC_ANALOG_IN_MIXER		0x24
-#define SUN20I_D1_CODEC_ANALOG_MIC1_MIXER	0x28
-#define SUN20I_D1_CODEC_ANALOG_MIC2_MIXER	0x2c
-#define SUN20I_D1_CODEC_ANALOG_LINEIN_MIXER	0x30
-#define SUN20I_D1_CODEC_ANALOG_REC_MIXER	0x34
-#define SUN20I_D1_CODEC_ANALOG_HEADPHONE_VOL	0x38
-#define SUN20I_D1_CODEC_ANALOG_SPK_VOL		0x3c
-#define SUN20I_D1_CODEC_ANALOG_MIC1_PA		0x40
-#define SUN20I_D1_CODEC_ANALOG_MIC2_PA		0x44
-#define SUN20I_D1_CODEC_ANALOG_LINEIN_PA	0x48
-#define SUN20I_D1_CODEC_ANALOG_HP_PA		0x4c
-#define SUN20I_D1_CODEC_ANALOG_SPK_PA		0x50
-#define SUN20I_D1_CODEC_ANALOG_PA_EN		0x54
+/* Codec analog control register offsets and bit fields */
+#define SUN20I_D1_ADDA_ADC1			(0x00)
+#define SUN20I_D1_ADDA_ADC2			(0x04)
+#define SUN20I_D1_ADDA_ADC3			(0x08)
+#define SUN20I_D1_ADDA_ADC_EN				(31)
+#define SUN20I_D1_ADDA_ADC_PGA_EN			(30)
+#define SUN20I_D1_ADDA_ADC_MIC_SIN_EN			(28)
+#define SUN20I_D1_ADDA_ADC_LINEINLEN			(23)
+#define SUN20I_D1_ADDA_ADC_PGA_GAIN			(8)
 
-struct sun20i_d1_codec_analog {
-	struct device *dev;
-	struct regmap *regmap;
-	struct clk *clk;
+#define SUN20I_D1_ADDA_DAC			(0x10)
+#define SUN20I_D1_ADDA_DAC_DACL_EN			(15)
+#define SUN20I_D1_ADDA_DAC_DACR_EN			(14)
+
+#define SUN20I_D1_ADDA_MICBIAS			(0x18)
+#define SUN20I_D1_ADDA_MICBIAS_MMICBIASEN		(7)
+
+#define SUN20I_D1_ADDA_RAMP			(0x1C)
+#define SUN20I_D1_ADDA_RAMP_RD_EN			(0)
+
+#define SUN20I_D1_ADDA_HP2			(0x40)
+#define SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN		(28)
+
+#define SUN20I_D1_ADDA_ADC_CUR_REG		(0x4C)
+
+static const DECLARE_TLV_DB_RANGE(sun20i_d1_codec_adc_gain_scale,
+	0, 0, TLV_DB_SCALE_ITEM(TLV_DB_GAIN_MUTE, 0, 1),
+	1, 3, TLV_DB_SCALE_ITEM(600, 0, 0),
+	4, 4, TLV_DB_SCALE_ITEM(900, 0, 0),
+	5, 31, TLV_DB_SCALE_ITEM(1000, 100, 0),
+);
+
+static const DECLARE_TLV_DB_SCALE(sun20i_d1_codec_hp_vol_scale, -4200, 600, 0);
+
+static const struct snd_kcontrol_new sun20i_d1_codec_controls[] = {
+	SOC_SINGLE_TLV("Headphone Playback Volume", SUN20I_D1_ADDA_HP2,
+		     SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN, 0x7, 1,
+		     sun20i_d1_codec_hp_vol_scale),
+	SOC_SINGLE_TLV("ADC1 Gain Capture Volume", SUN20I_D1_ADDA_ADC1,
+		     SUN20I_D1_ADDA_ADC_PGA_GAIN, 0x1f, 0,
+		     sun20i_d1_codec_adc_gain_scale),
+	SOC_SINGLE_TLV("ADC2 Gain Capture Volume", SUN20I_D1_ADDA_ADC2,
+		     SUN20I_D1_ADDA_ADC_PGA_GAIN, 0x1f, 0,
+		     sun20i_d1_codec_adc_gain_scale),
+	SOC_SINGLE_TLV("ADC3 Gain Capture Volume", SUN20I_D1_ADDA_ADC3,
+		     SUN20I_D1_ADDA_ADC_PGA_GAIN, 0x1f, 0,
+		     sun20i_d1_codec_adc_gain_scale),
 };
 
-static const DECLARE_TLV_DB_SCALE(dac_vol_tlv, -11925, 75, 0);
-static const DECLARE_TLV_DB_SCALE(adc_vol_tlv, -11925, 75, 0);
-static const DECLARE_TLV_DB_SCALE(mic_vol_tlv, -450, 150, 0);
-static const DECLARE_TLV_DB_SCALE(linein_vol_tlv, -450, 150, 0);
-static const DECLARE_TLV_DB_SCALE(mixer_vol_tlv, -450, 150, 0);
-static const DECLARE_TLV_DB_SCALE(hp_vol_tlv, -6300, 100, 1);
-static const DECLARE_TLV_DB_SCALE(spk_vol_tlv, -4800, 150, 0);
-
-static const struct snd_kcontrol_new sun20i_d1_codec_analog_controls[] = {
-	/* Renombrado para evitar colisión con control homónimo en driver digital */
-	SOC_SINGLE_TLV("Analog DAC Playback Volume", SUN20I_D1_CODEC_ANALOG_DAC_VOL,
-		       0, 255, 0, dac_vol_tlv),
-	SOC_SINGLE_TLV("ADC Capture Volume", SUN20I_D1_CODEC_ANALOG_ADC_VOL,
-		       0, 255, 0, adc_vol_tlv),
-	SOC_SINGLE_TLV("MIC1 Capture Volume", SUN20I_D1_CODEC_ANALOG_MIC1_VOL,
-		       0, 31, 0, mic_vol_tlv),
-	SOC_SINGLE_TLV("MIC2 Capture Volume", SUN20I_D1_CODEC_ANALOG_MIC2_VOL,
-		       0, 31, 0, mic_vol_tlv),
-	SOC_SINGLE_TLV("LINEIN Capture Volume", SUN20I_D1_CODEC_ANALOG_LINEIN_VOL,
-		       0, 31, 0, linein_vol_tlv),
-	SOC_SINGLE_TLV("MIXER Capture Volume", SUN20I_D1_CODEC_ANALOG_MIXER_VOL,
-		       0, 31, 0, mixer_vol_tlv),
-	SOC_SINGLE_TLV("Headphone Playback Volume", SUN20I_D1_CODEC_ANALOG_HEADPHONE_VOL,
-		       0, 63, 0, hp_vol_tlv),
-	SOC_SINGLE_TLV("Speaker Playback Volume", SUN20I_D1_CODEC_ANALOG_SPK_VOL,
-		       0, 31, 0, spk_vol_tlv),
+static const struct snd_kcontrol_new sun20i_d1_codec_mixer_controls[] = {
+	SOC_DAPM_DOUBLE_R("Line In Switch",
+			  SUN20I_D1_ADDA_ADC1,
+			  SUN20I_D1_ADDA_ADC2,
+			  SUN20I_D1_ADDA_ADC_LINEINLEN, 1, 0),
 };
 
-static const char * const out_mixer_texts[] = {
-	"Stereo DAC", "MIC1", "MIC2", "LINEIN", "MIXER"
+static const char * const sun20i_d1_codec_mic3_src_enum_text[] = {
+	"Differential", "Single",
 };
 
-static const struct soc_enum out_mixer_enum =
-	SOC_ENUM_SINGLE(SUN20I_D1_CODEC_ANALOG_OUT_MIXER, 0, 5, out_mixer_texts);
+static SOC_ENUM_SINGLE_DECL(sun20i_d1_codec_mic3_src_enum,
+			    SUN20I_D1_ADDA_ADC3,
+			    SUN20I_D1_ADDA_ADC_MIC_SIN_EN,
+			    sun20i_d1_codec_mic3_src_enum_text);
 
-static const struct snd_kcontrol_new sun20i_d1_out_mixer_controls =
-	SOC_DAPM_ENUM("Route", out_mixer_enum);
-
-static const char * const in_mixer_texts[] = {
-	"Stereo DAC", "MIC1", "MIC2", "LINEIN"
+static const struct snd_kcontrol_new sun20i_d1_codec_mic3_input_src[] = {
+	SOC_DAPM_ENUM("MIC3 Source Capture Route",
+		      sun20i_d1_codec_mic3_src_enum),
 };
 
-static const struct soc_enum in_mixer_enum =
-	SOC_ENUM_SINGLE(SUN20I_D1_CODEC_ANALOG_IN_MIXER, 0, 4, in_mixer_texts);
+static const struct snd_soc_dapm_widget sun20i_d1_codec_widgets[] = {
+	/* DACs analógicos (no asignamos stream_name aquí; el stream vive en el
+	 * lado digital y se puentea vía rutas de tarjeta). */
+	SND_SOC_DAPM_DAC("Left DAC", NULL, SUN20I_D1_ADDA_DAC,
+			 SUN20I_D1_ADDA_DAC_DACL_EN, 0),
+	SND_SOC_DAPM_DAC("Right DAC", NULL, SUN20I_D1_ADDA_DAC,
+			 SUN20I_D1_ADDA_DAC_DACR_EN, 0),
+	/* ADC */
+	SND_SOC_DAPM_ADC("ADC1", NULL, SUN20I_D1_ADDA_ADC1,
+			 SUN20I_D1_ADDA_ADC_EN, 0),
+	SND_SOC_DAPM_ADC("ADC2", NULL, SUN20I_D1_ADDA_ADC2,
+			 SUN20I_D1_ADDA_ADC_EN, 0),
+	/* Anclar stream de captura en el ADC3 físico */
+	SND_SOC_DAPM_ADC("ADC3", "Codec Capture", SUN20I_D1_ADDA_ADC3,
+			 SUN20I_D1_ADDA_ADC_EN, 0),
 
-static const struct snd_kcontrol_new sun20i_d1_in_mixer_controls =
-	SOC_DAPM_ENUM("Route", in_mixer_enum);
+	/* Headphone output */
+	SND_SOC_DAPM_OUTPUT("HP"),
+	/* Optional Speaker output for board using speaker pin */
+	SND_SOC_DAPM_OUTPUT("Speaker"),
+	SND_SOC_DAPM_SUPPLY("RAMP Enable", SUN20I_D1_ADDA_RAMP,
+			    SUN20I_D1_ADDA_RAMP_RD_EN, 0, NULL, 0),
 
-static const char * const mic1_mixer_texts[] = {
-	"MIC1", "MIXER"
-};
-
-static const struct soc_enum mic1_mixer_enum =
-	SOC_ENUM_SINGLE(SUN20I_D1_CODEC_ANALOG_MIC1_MIXER, 0, 2, mic1_mixer_texts);
-
-static const struct snd_kcontrol_new sun20i_d1_mic1_mixer_controls =
-	SOC_DAPM_ENUM("Route", mic1_mixer_enum);
-
-static const char * const mic2_mixer_texts[] = {
-	"MIC2", "MIXER"
-};
-
-static const struct soc_enum mic2_mixer_enum =
-	SOC_ENUM_SINGLE(SUN20I_D1_CODEC_ANALOG_MIC2_MIXER, 0, 2, mic2_mixer_texts);
-
-static const struct snd_kcontrol_new sun20i_d1_mic2_mixer_controls =
-	SOC_DAPM_ENUM("Route", mic2_mixer_enum);
-
-static const char * const linein_mixer_texts[] = {
-	"LINEIN", "MIXER"
-};
-
-static const struct soc_enum linein_mixer_enum =
-	SOC_ENUM_SINGLE(SUN20I_D1_CODEC_ANALOG_LINEIN_MIXER, 0, 2, linein_mixer_texts);
-
-static const struct snd_kcontrol_new sun20i_d1_linein_mixer_controls =
-	SOC_DAPM_ENUM("Route", linein_mixer_enum);
-
-static const char * const rec_mixer_texts[] = {
-	"MIC1", "MIC2", "LINEIN", "MIXER"
-};
-
-static const struct soc_enum rec_mixer_enum =
-	SOC_ENUM_SINGLE(SUN20I_D1_CODEC_ANALOG_REC_MIXER, 0, 4, rec_mixer_texts);
-
-static const struct snd_kcontrol_new sun20i_d1_rec_mixer_controls =
-	SOC_DAPM_ENUM("Route", rec_mixer_enum);
-
-static const struct snd_soc_dapm_widget sun20i_d1_codec_analog_widgets[] = {
-	SND_SOC_DAPM_DAC("DAC", "Playback", SUN20I_D1_CODEC_ANALOG_EN_DAC, 0, 0),
-	SND_SOC_DAPM_ADC("ADC", "Capture", SUN20I_D1_CODEC_ANALOG_EN_ADC, 0, 0),
-
-	/* Enumerated source selectors: use MUX (one active source) */
-	SND_SOC_DAPM_MUX("Output Mixer", SUN20I_D1_CODEC_ANALOG_PA_EN, 0, 0,
-			 &sun20i_d1_out_mixer_controls),
-	SND_SOC_DAPM_MUX("Input Mixer", SND_SOC_NOPM, 0, 0,
-			 &sun20i_d1_in_mixer_controls),
-	SND_SOC_DAPM_MUX("MIC1 Mixer", SND_SOC_NOPM, 0, 0,
-			 &sun20i_d1_mic1_mixer_controls),
-	SND_SOC_DAPM_MUX("MIC2 Mixer", SND_SOC_NOPM, 0, 0,
-			 &sun20i_d1_mic2_mixer_controls),
-	SND_SOC_DAPM_MUX("LINEIN Mixer", SND_SOC_NOPM, 0, 0,
-			 &sun20i_d1_linein_mixer_controls),
-	SND_SOC_DAPM_MUX("Record Mixer", SND_SOC_NOPM, 0, 0,
-			 &sun20i_d1_rec_mixer_controls),
-
-	SND_SOC_DAPM_INPUT("MIC1"),
-	SND_SOC_DAPM_INPUT("MIC2"),
+	/* Line input */
 	SND_SOC_DAPM_INPUT("LINEIN"),
 
-	SND_SOC_DAPM_OUTPUT("HP"),
-	SND_SOC_DAPM_OUTPUT("SPK"),
+	/* Microphone */
+	SND_SOC_DAPM_INPUT("MIC3"),
+	SND_SOC_DAPM_MUX("MIC3 Source Capture Route", SND_SOC_NOPM, 0, 0,
+			 sun20i_d1_codec_mic3_input_src),
+	SND_SOC_DAPM_PGA("Mic3 Amplifier", SUN20I_D1_ADDA_ADC3,
+			 SUN20I_D1_ADDA_ADC_PGA_EN, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("MBIAS", SUN20I_D1_ADDA_MICBIAS,
+			    SUN20I_D1_ADDA_MICBIAS_MMICBIASEN, 0, NULL, 0),
 };
 
-/*
- * Correct DAPM routing: for enumerated MIXER widgets (used here like MUXes)
- * the sink is the MIXER, the second field is the enum value (control value),
- * and the source is the upstream widget. The previous table had many routes
- * reversed which caused "Control not supported" and -ENODEV during aux
- * component probe.
- */
-static const struct snd_soc_dapm_route sun20i_d1_codec_analog_routes[] = {
-	/* Output Mixer source selections */
-	{ "Output Mixer", "Stereo DAC", "DAC" },
-	{ "Output Mixer", "MIC1",      "MIC1" },
-	{ "Output Mixer", "MIC2",      "MIC2" },
-	{ "Output Mixer", "LINEIN",    "LINEIN" },
-	/* "MIXER" enum value: route from Record Mixer (acts as combined source) */
-	{ "Output Mixer", "MIXER",     "Record Mixer" },
+static const struct snd_soc_dapm_route sun20i_d1_codec_routes[] = {
+	/* Headphone/Speaker routes */
+	{ "HP", NULL, "Left DAC" },
+	{ "HP", NULL, "Right DAC" },
+	{ "HP", NULL, "RAMP Enable" },
+	{ "Speaker", NULL, "Left DAC" },
+	{ "Speaker", NULL, "Right DAC" },
+	{ "Speaker", NULL, "RAMP Enable" },
 
-	/* Input Mixer source selections */
-	{ "Input Mixer",  "Stereo DAC", "DAC" },
-	{ "Input Mixer",  "MIC1",       "MIC1" },
-	{ "Input Mixer",  "MIC2",       "MIC2" },
-	{ "Input Mixer",  "LINEIN",     "LINEIN" },
-
-	/* MIC1 Mixer selections */
-	{ "MIC1 Mixer",   "MIC1",  "MIC1" },
-	{ "MIC1 Mixer",   "MIXER", "Input Mixer" },
-
-	/* MIC2 Mixer selections */
-	{ "MIC2 Mixer",   "MIC2",  "MIC2" },
-	{ "MIC2 Mixer",   "MIXER", "Input Mixer" },
-
-	/* LINEIN Mixer selections */
-	{ "LINEIN Mixer", "LINEIN", "LINEIN" },
-	{ "LINEIN Mixer", "MIXER",  "Input Mixer" },
-
-	/* Record Mixer selections */
-	{ "Record Mixer", "MIC1",   "MIC1 Mixer" },
-	{ "Record Mixer", "MIC2",   "MIC2 Mixer" },
-	{ "Record Mixer", "LINEIN", "LINEIN Mixer" },
-	{ "Record Mixer", "MIXER",  "Input Mixer" },
-
-	/* Capture path from Record Mixer to ADC */
-	{ "ADC",          NULL,      "Record Mixer" },
-
-	/* Playback fanout from DAC to Output Mixer already implicit via
-	 * Output Mixer routes. Route Output Mixer to outputs: */
-	{ "HP",           NULL,      "Output Mixer" },
-	{ "SPK",          NULL,      "Output Mixer" },
+	/* Mic3 capture chain */
+	{ "MIC3 Source Capture Route", "Differential", "MIC3" },
+	{ "MIC3 Source Capture Route", "Single", "MIC3" },
+	{ "Mic3 Amplifier", NULL, "MIC3 Source Capture Route" },
+	{ "ADC3", NULL, "Mic3 Amplifier" },
 };
 
-static const struct regmap_config sun20i_d1_codec_analog_regmap_config = {
+static const struct snd_soc_component_driver sun20i_d1_codec_analog_cmpnt_drv = {
+	.controls		= sun20i_d1_codec_controls,
+	.num_controls		= ARRAY_SIZE(sun20i_d1_codec_controls),
+	.dapm_widgets		= sun20i_d1_codec_widgets,
+	.num_dapm_widgets	= ARRAY_SIZE(sun20i_d1_codec_widgets),
+	.dapm_routes		= sun20i_d1_codec_routes,
+	.num_dapm_routes	= ARRAY_SIZE(sun20i_d1_codec_routes),
+};
+
+static const struct of_device_id sun20i_d1_codec_analog_of_match[] = {
+	{ .compatible = "allwinner,sun20i-d1-codec-analog" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, sun20i_d1_codec_analog_of_match);
+
+static const struct regmap_config sun20i_d1_codec_regmap_config = {
 	.reg_bits = 32,
 	.reg_stride = 4,
 	.val_bits = 32,
-	.max_register = SUN20I_D1_CODEC_ANALOG_PA_EN,
+	.max_register = SUN20I_D1_ADDA_ADC_CUR_REG,
 };
 
 static int sun20i_d1_codec_analog_probe(struct platform_device *pdev)
 {
-	struct sun20i_d1_codec_analog *scodec;
-	struct device *dev = &pdev->dev;
+	struct regmap *regmap;
 	void __iomem *base;
-	int ret;
-
-	scodec = devm_kzalloc(dev, sizeof(*scodec), GFP_KERNEL);
-	if (!scodec)
-		return -ENOMEM;
-
-	scodec->dev = dev;
-	dev_info(dev, "sun20i-d1-codec-analog: probe start\n");
 
 	base = devm_platform_ioremap_resource(pdev, 0);
-	dev_info(dev, "sun20i-d1-codec-analog: ioremap returned %pK, IS_ERR=%d\n",
-		 base, IS_ERR(base));
 	if (IS_ERR(base)) {
-		long err = PTR_ERR(base);
-		dev_err(dev, "sun20i-d1-codec-analog: failed to ioremap resource: %ld (0x%lx)\n",
-			err, (unsigned long)err);
-		return err;
+		dev_err(&pdev->dev, "Failed to map the registers\n");
+		return PTR_ERR(base);
 	}
 
-	scodec->regmap = devm_regmap_init_mmio(dev, base,
-					   &sun20i_d1_codec_analog_regmap_config);
-	dev_info(dev, "sun20i-d1-codec-analog: regmap returned %pK, IS_ERR=%d\n",
-		 scodec->regmap, IS_ERR(scodec->regmap));
-	if (IS_ERR(scodec->regmap)) {
-		long err = PTR_ERR(scodec->regmap);
-		dev_err(dev, "sun20i-d1-codec-analog: failed to init regmap: %ld (0x%lx)\n",
-			err, (unsigned long)err);
-		return err;
+	regmap = devm_regmap_init_mmio(&pdev->dev, base,
+				       &sun20i_d1_codec_regmap_config);
+	if (IS_ERR(regmap)) {
+		dev_err(&pdev->dev, "Failed to create regmap\n");
+		return PTR_ERR(regmap);
 	}
 
-	scodec->clk = devm_clk_get(dev, NULL);
-	dev_info(dev, "sun20i-d1-codec-analog: devm_clk_get returned %pK, IS_ERR=%d\n",
-		 scodec->clk, IS_ERR(scodec->clk));
-	if (IS_ERR(scodec->clk)) {
-		long err = PTR_ERR(scodec->clk);
-		dev_err(dev, "sun20i-d1-codec-analog: devm_clk_get(NULL) failed: %ld (0x%lx)\n",
-			err, (unsigned long)err);
-		return err;
+	/* Bring-up hack: force-enable analog DAC channels and ramp so we can
+	 * verify if silence is due to DAPM not toggling these bits. Remove once
+	 * DAPM paths work. */
+	regmap_update_bits(regmap, SUN20I_D1_ADDA_DAC,
+			 BIT(SUN20I_D1_ADDA_DAC_DACL_EN) |
+			 BIT(SUN20I_D1_ADDA_DAC_DACR_EN),
+			 BIT(SUN20I_D1_ADDA_DAC_DACL_EN) |
+			 BIT(SUN20I_D1_ADDA_DAC_DACR_EN));
+	regmap_update_bits(regmap, SUN20I_D1_ADDA_RAMP,
+			 BIT(SUN20I_D1_ADDA_RAMP_RD_EN),
+			 BIT(SUN20I_D1_ADDA_RAMP_RD_EN));
+	/* Set a mid headphone gain (value 3) to ensure audible output */
+	regmap_update_bits(regmap, SUN20I_D1_ADDA_HP2,
+			 0x7 << SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN,
+			 0x3 << SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN);
+
+	{
+		unsigned int v_dac = 0, v_ramp = 0, v_hp2 = 0;
+		regmap_read(regmap, SUN20I_D1_ADDA_DAC, &v_dac);
+		regmap_read(regmap, SUN20I_D1_ADDA_RAMP, &v_ramp);
+		regmap_read(regmap, SUN20I_D1_ADDA_HP2, &v_hp2);
+		dev_info(&pdev->dev,
+			 "analog force-enable: DAC=0x%08x RAMP=0x%08x HP2=0x%08x\n",
+			 v_dac, v_ramp, v_hp2);
 	}
 
-	dev_info(dev, "sun20i-d1-codec-analog: got clk %pK\n", scodec->clk);
-
-	ret = clk_prepare_enable(scodec->clk);
-	if (ret) {
-		dev_err(dev, "sun20i-d1-codec-analog: clk_prepare_enable failed: %d\n",
-			ret);
-		return ret;
-	}
-
-	platform_set_drvdata(pdev, scodec);
-
-	/* Register as an ASoC component so the top-level codec driver
-	 * can find this auxiliary device via soc_find_component() and
-	 * avoid deferring card registration.
-	 */
-	static const struct snd_soc_component_driver sun20i_d1_analog_component = {
-		.controls = sun20i_d1_codec_analog_controls,
-		.num_controls = ARRAY_SIZE(sun20i_d1_codec_analog_controls),
-		.dapm_widgets = sun20i_d1_codec_analog_widgets,
-		.num_dapm_widgets = ARRAY_SIZE(sun20i_d1_codec_analog_widgets),
-		.dapm_routes = sun20i_d1_codec_analog_routes,
-		.num_dapm_routes = ARRAY_SIZE(sun20i_d1_codec_analog_routes),
-	};
-
-	ret = devm_snd_soc_register_component(dev, &sun20i_d1_analog_component,
-						NULL, 0);
-	if (ret) {
-		dev_err(dev, "sun20i-d1-codec-analog: failed to register ASoC component: %d\n", ret);
-		clk_disable_unprepare(scodec->clk);
-		return ret;
-	}
-
-	dev_info(dev, "sun20i-d1-codec-analog: probe complete\n");
-
-	return 0;
+	return devm_snd_soc_register_component(&pdev->dev,
+					       &sun20i_d1_codec_analog_cmpnt_drv,
+					       NULL, 0);
 }
-
-static void sun20i_d1_codec_analog_remove(struct platform_device *pdev)
-{
-	struct sun20i_d1_codec_analog *scodec = platform_get_drvdata(pdev);
-
-	clk_disable_unprepare(scodec->clk);
-}
-
-static const struct of_device_id sun20i_d1_codec_analog_of_match[] = {
-	{ .compatible = "allwinner,sun20i-d1-codec-analog" },
-	{}
-};
-MODULE_DEVICE_TABLE(of, sun20i_d1_codec_analog_of_match);
 
 static struct platform_driver sun20i_d1_codec_analog_driver = {
-	.probe = sun20i_d1_codec_analog_probe,
-	.remove = sun20i_d1_codec_analog_remove,
 	.driver = {
 		.name = "sun20i-d1-codec-analog",
 		.of_match_table = sun20i_d1_codec_analog_of_match,
 	},
+	.probe = sun20i_d1_codec_analog_probe,
 };
 module_platform_driver(sun20i_d1_codec_analog_driver);
 
-MODULE_DESCRIPTION("Allwinner D1 Analog Codec Driver");
+MODULE_DESCRIPTION("Allwinner internal codec analog controls driver for D1/T113s (analog)");
 MODULE_AUTHOR("Maksim Kiselev <bigunclemax@gmail.com>");
 MODULE_LICENSE("GPL");
