@@ -312,6 +312,7 @@
                                  <&ccu CLK_AUDIO_DAC>;
                         clock-names = "apb", "adc", "dac";
                         resets = <&ccu RST_BUS_AUDIO>;
+                        /* DMA: revertimos a <7,7> (patrón observado en parches originales) */
                         dmas = <&dma 7>, <&dma 7>;
                         dma-names = "rx", "tx";
                         allwinner,codec-analog-controls = <&codec_analog>;

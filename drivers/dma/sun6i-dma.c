@@ -592,6 +592,13 @@ static int set_config(struct sun6i_dma_dev *sdev,
 	u32 src_maxburst, dst_maxburst;
 	s8 src_width, dst_width, src_burst, dst_burst;
 
+	/* Instrumentación de diagnóstico para el caso 'Invalid DMA configuration' */
+	dev_dbg(sdev->slave.dev,
+		"set_config: dir=%d raw src_addr_width=%u dst_addr_width=%u src_maxburst=%u dst_maxburst=%u\n",
+		direction,
+		sconfig->src_addr_width, sconfig->dst_addr_width,
+		sconfig->src_maxburst, sconfig->dst_maxburst);
+
 	src_addr_width = sconfig->src_addr_width;
 	dst_addr_width = sconfig->dst_addr_width;
 	src_maxburst = sconfig->src_maxburst;
@@ -612,14 +619,32 @@ static int set_config(struct sun6i_dma_dev *sdev,
 		return -EINVAL;
 	}
 
-	if (!(BIT(src_addr_width) & sdev->slave.src_addr_widths))
+	dev_dbg(sdev->slave.dev,
+		"set_config: adjusted src_addr_width=%u dst_addr_width=%u src_maxburst=%u dst_maxburst=%u masks src_w=0x%x dst_w=0x%x src_burst_mask=0x%x dst_burst_mask=0x%x\n",
+		src_addr_width, dst_addr_width, src_maxburst, dst_maxburst,
+		sdev->slave.src_addr_widths, sdev->slave.dst_addr_widths,
+		sdev->cfg->src_burst_lengths, sdev->cfg->dst_burst_lengths);
+
+	if (!(BIT(src_addr_width) & sdev->slave.src_addr_widths)) {
+		dev_err(sdev->slave.dev, "Invalid DMA configuration: src_addr_width=%u mask=0x%x\n",
+			src_addr_width, sdev->slave.src_addr_widths);
 		return -EINVAL;
-	if (!(BIT(dst_addr_width) & sdev->slave.dst_addr_widths))
+	}
+	if (!(BIT(dst_addr_width) & sdev->slave.dst_addr_widths)) {
+		dev_err(sdev->slave.dev, "Invalid DMA configuration: dst_addr_width=%u mask=0x%x\n",
+			dst_addr_width, sdev->slave.dst_addr_widths);
 		return -EINVAL;
-	if (!(BIT(src_maxburst) & sdev->cfg->src_burst_lengths))
+	}
+	if (!(BIT(src_maxburst) & sdev->cfg->src_burst_lengths)) {
+		dev_err(sdev->slave.dev, "Invalid DMA configuration: src_maxburst=%u mask=0x%x\n",
+			src_maxburst, sdev->cfg->src_burst_lengths);
 		return -EINVAL;
-	if (!(BIT(dst_maxburst) & sdev->cfg->dst_burst_lengths))
+	}
+	if (!(BIT(dst_maxburst) & sdev->cfg->dst_burst_lengths)) {
+		dev_err(sdev->slave.dev, "Invalid DMA configuration: dst_maxburst=%u mask=0x%x\n",
+			dst_maxburst, sdev->cfg->dst_burst_lengths);
 		return -EINVAL;
+	}
 
 	src_width = convert_buswidth(src_addr_width);
 	dst_width = convert_buswidth(dst_addr_width);
