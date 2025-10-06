@@ -65,6 +65,129 @@
 		vin-supply = <&reg_3v3>;
 	};
 
+	/* GPS Power Control */
+	reg_gps_power: regulator-gps-power {
+		compatible = "regulator-fixed";
+		regulator-name = "gps-power";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&tca9535 0 GPIO_ACTIVE_HIGH>; /* gps-on-off */
+		enable-active-high;
+		regulator-boot-off;
+		vin-supply = <&reg_3v3>;
+	};
+
+	reg_gps_antenna: regulator-gps-antenna {
+		compatible = "regulator-fixed";
+		regulator-name = "gps-antenna";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&tca9535 2 GPIO_ACTIVE_HIGH>; /* gps-ant-power */
+		enable-active-high;
+		regulator-boot-off;
+		vin-supply = <&reg_3v3>;
+	};
+
+	/* Audio Power Control */
+	reg_audio_power: regulator-audio-power {
+		compatible = "regulator-fixed";
+		regulator-name = "audio-power";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&tca9535 3 GPIO_ACTIVE_HIGH>; /* audio-power */
+		enable-active-high;
+		regulator-boot-off;
+		vin-supply = <&reg_3v3>;
+	};
+
+	reg_audio_mute: regulator-audio-mute {
+		compatible = "regulator-fixed";
+		regulator-name = "audio-mute";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&tca9535 4 GPIO_ACTIVE_LOW>; /* audio-mute */
+		enable-active-low;
+		regulator-boot-on;
+		vin-supply = <&reg_3v3>;
+	};
+
+	reg_audio_mode_d: regulator-audio-mode-d {
+		compatible = "regulator-fixed";
+		regulator-name = "audio-mode-d";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&tca9535 5 GPIO_ACTIVE_HIGH>; /* audio-mode-d */
+		enable-active-high;
+		regulator-boot-on;
+		vin-supply = <&reg_3v3>;
+	};
+
+	/* USB Power Control */
+	reg_usb_a_power: regulator-usb-a-power {
+		compatible = "regulator-fixed";
+		regulator-name = "usb-a-power";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&tca9535 15 GPIO_ACTIVE_HIGH>; /* usb-a-en */
+		enable-active-high;
+		regulator-boot-off;
+		vin-supply = <&reg_vcc5v>;
+	};
+
+	reg_usb_c_power: regulator-usb-c-power {
+		compatible = "regulator-fixed";
+		regulator-name = "usb-c-power";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&tca9535 12 GPIO_ACTIVE_HIGH>; /* usb-c-en */
+		enable-active-high;
+		regulator-boot-off;
+		vin-supply = <&reg_vcc5v>;
+	};
+
+	/* Userspace consumers for GPIO control */
+	gps_power_consumer: gps-power-consumer {
+		compatible = "regulator-output";
+		regulator-name = "gps-power-consumer";
+		vout-supply = <&reg_gps_power>;
+	};
+
+	gps_antenna_consumer: gps-antenna-consumer {
+		compatible = "regulator-output";
+		regulator-name = "gps-antenna-consumer";
+		vout-supply = <&reg_gps_antenna>;
+	};
+
+	audio_power_consumer: audio-power-consumer {
+		compatible = "regulator-output";
+		regulator-name = "audio-power-consumer";
+		vout-supply = <&reg_audio_power>;
+	};
+
+	audio_mute_consumer: audio-mute-consumer {
+		compatible = "regulator-output";
+		regulator-name = "audio-mute-consumer";
+		vout-supply = <&reg_audio_mute>;
+	};
+
+	audio_mode_d_consumer: audio-mode-d-consumer {
+		compatible = "regulator-output";
+		regulator-name = "audio-mode-d-consumer";
+		vout-supply = <&reg_audio_mode_d>;
+	};
+
+	usb_a_power_consumer: usb-a-power-consumer {
+		compatible = "regulator-output";
+		regulator-name = "usb-a-power-consumer";
+		vout-supply = <&reg_usb_a_power>;
+	};
+
+	usb_c_power_consumer: usb-c-power-consumer {
+		compatible = "regulator-output";
+		regulator-name = "usb-c-power-consumer";
+		vout-supply = <&reg_usb_c_power>;
+	};
+
 	wifi_pwrseq: wifi-pwrseq {
 		compatible = "mmc-pwrseq-simple";
                 post-power-on-delay-ms = <200>;
@@ -156,8 +279,8 @@
 
                 key-power {
                         label = "Power Button";
-                        gpios = <&pio 4 11 GPIO_ACTIVE_LOW>; // PE11 (ideal si es R_PIO)
-                        linux,code = <KEY_POWER>;            // 116
+                        gpios = <&pio 4 11 GPIO_ACTIVE_LOW>; // PE11
+                        linux,code = <KEY_WAKEUP>;
                         wakeup-source;
                         debounce-interval = <50>;
                 };
@@ -181,6 +304,22 @@
                         gpios = <&tca9535 8 GPIO_ACTIVE_LOW>; // TCA9535 pin 8
                         linux,code = <KEY_UP>;
                         autorepeat;
+                };
+
+                usb-a-fault {
+                        label = "USB-A Fault";
+                        gpios = <&tca9535 14 GPIO_ACTIVE_LOW>; /* usb-a-fault */
+                        linux,code = <KEY_F13>; /* Código único para USB-A */
+                        debounce-interval = <100>;
+                        wakeup-source;
+                };
+                
+                usb-c-fault {
+                        label = "USB-C Fault";
+                        gpios = <&tca9535 13 GPIO_ACTIVE_LOW>; /* usb-c-fault */
+                        linux,code = <KEY_F14>; /* Código único para USB-C */
+                        debounce-interval = <100>;
+                        wakeup-source;
                 };
         };
 
@@ -395,6 +534,11 @@
 	status = "okay";
 };
 
+&rtc {
+        wakeup-source;
+        status = "okay";
+};
+
 &wdt {
         status = "okay";
 };
@@ -485,8 +629,7 @@
                 interrupt-controller;
                 #interrupt-cells = <2>;
                 ti,enable-auto-increment; // Añadir soporte AI
-                vdd-supply = <&reg_3v3>;
-                vddio-supply = <&reg_3v3>;
+                vcc-supply = <&reg_3v3>;
                 
                 status = "okay";
                 wakeup-source;
@@ -513,37 +656,13 @@
                 #clock-cells = <0>;
         };
 
-        // bme280@76 {
-        //         compatible = "bosch,bme280";
-        //         reg = <0x76>;
-        //         status = "okay";
-        //         vddd-supply = <&reg_3v3>;  // Digital supply
-        //         vdda-supply = <&reg_3v3>;  // Analog supply
-        // };
-
-        // icm20948@68 {
-        //         compatible = "invensense,mpu9250";
-        //         reg = <0x68>;
-        //         interrupt-parent = <&pio>;
-        //         interrupts = <4 4 IRQ_TYPE_EDGE_RISING>; /* PE4 */
-        //         status = "okay";
-        //         vdd-supply = <&reg_3v3>;
-        //         vddio-supply = <&reg_3v3>;
-        //         
-        //         /* Configuración opcional de magnetómetro AK09916 */
-        //         mount-matrix = "1", "0", "0",
-        //                 "0", "1", "0",
-        //                 "0", "0", "1";
-        //     
-        //         i2c-gate {
-        //                 #address-cells = <1>;
-        //                 #size-cells = <0>;
-        //                 magnetometer@c {
-        //                 compatible = "asahi-kasei,ak8975";
-        //                 reg = <0x0c>;
-        //                 };
-        //         };
-        // };
+        bme280@76 {
+                compatible = "bosch,bme280";
+                reg = <0x76>;
+                status = "okay";
+                vddd-supply = <&reg_3v3>;  // Digital supply
+                vdda-supply = <&reg_3v3>;  // Analog supply
+        };
 
         // max30102@57 {
         //         compatible = "maxim,max30102";
@@ -555,13 +674,13 @@
         //         maxim,ir-led-current-microamp = <7000>;
         // };
 
-        // ina219@40 {
-        //         compatible = "ti,ina219";
-        //         reg = <0x40>;
-        //         #io-channel-cells = <1>;
-        //         status = "okay";
-        //         shunt-resistor = <100000>; /* 100000 micro-ohms = 0.1 ohm */
-        // };
+        ina219@40 {
+                compatible = "ti,ina219";
+                reg = <0x40>;
+                #io-channel-cells = <1>;
+                status = "okay";
+                shunt-resistor = <100000>; /* 100000 micro-ohms = 0.1 ohm */
+        };
         
         bh1750: light-sensor@23 {
                 compatible = "rohm,bh1750";

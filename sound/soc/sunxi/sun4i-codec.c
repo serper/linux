@@ -1086,6 +1086,12 @@ static const struct snd_kcontrol_new sun20i_d1_codec_codec_controls[] = {
 	SOC_SINGLE_TLV("ADC3 Capture Volume", SUN20I_D1_CODEC_ADC_VOL_CTRL1,
 		       SUN20I_D1_CODEC_ADC_VOL_CTRL1_ADC3_VOL, 0xff, 0,
 		       sun20i_d1_codec_dvol_scale),
+
+	// /* Habilitación explícita de canales ADC digitales */
+	// SOC_SINGLE("ADC1 Capture Channel", SUN20I_D1_CODEC_ADC_DIG_CTRL,
+	// 			SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC1_CH_EN, 1, 0),
+	// SOC_SINGLE("ADC3 Capture Channel", SUN20I_D1_CODEC_ADC_DIG_CTRL,
+	// 			SUN20I_D1_CODEC_ADC_DIG_CTRL_ADC3_CH_EN, 1, 0),
 };
 
 static const struct snd_soc_dapm_widget sun20i_d1_codec_codec_widgets[] = {
@@ -1196,9 +1202,9 @@ static const struct snd_soc_dapm_route sun20i_d1_codec_card_routes[] = {
 	{ "Digital DAC", NULL, "Codec Playback" },
 	{ "Left DAC", NULL, "Codec Out" },
 	{ "Right DAC", NULL, "Codec Out" },
-	{ "Speaker", NULL, "Left DAC" },
-	{ "Speaker", NULL, "Right DAC" },
-	{ "Speaker", NULL, "RAMP Enable" },
+	{ "LINEOUT", NULL, "Left DAC" },
+	{ "LINEOUT", NULL, "Right DAC" },
+	{ "LINEOUT", NULL, "RAMP Enable" },
 
 	/* Capture path: ADC3 -> Digital ADC */
 	{ "MIC1 Pre-Amplifier", NULL, "Mic1" },
@@ -1537,6 +1543,7 @@ MODULE_AUTHOR("Emilio López <emilio@elopez.com.ar>");
 MODULE_AUTHOR("Jon Smirl <jonsmirl@gmail.com>");
 MODULE_AUTHOR("Maxime Ripard <maxime.ripard@free-electrons.com>");
 MODULE_AUTHOR("Chen-Yu Tsai <wens@csie.org>");
-MODULE_AUTHOR("Ryan Walklin <ryan@testtoast.com");
+MODULE_AUTHOR("Ryan Walklin <ryan@testtoast.com>");
 MODULE_AUTHOR("Mesih Kilinc <mesikilinc@gmail.com>");
+MODULE_AUTHOR("Sergio Perez <sergio@pereznus.es>");
 MODULE_LICENSE("GPL");

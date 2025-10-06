@@ -17,6 +17,28 @@
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/tlv.h>
+#include <sound/control.h>
+
+static int sun20i_hp_get(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *comp = snd_kcontrol_chip(kctl);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(comp);
+	int on = snd_soc_dapm_get_pin_status(dapm, "LINEOUT");
+	ucontrol->value.integer.value[0] = on ? 1 : 0;
+	return 0;
+}
+
+static int sun20i_hp_put(struct snd_kcontrol *kctl, struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *comp = snd_kcontrol_chip(kctl);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(comp);
+	if (ucontrol->value.integer.value[0])
+		snd_soc_dapm_enable_pin(dapm, "LINEOUT");
+	else
+		snd_soc_dapm_disable_pin(dapm, "LINEOUT");
+	snd_soc_dapm_sync(dapm);
+	return 0;
+}
 
 /* Codec analog control register offsets and bit fields */
 #define SUN20I_D1_ADDA_ADC1			(0x00)
@@ -45,7 +67,7 @@
 
 static const DECLARE_TLV_DB_RANGE(sun20i_d1_codec_adc_gain_scale,
 	0, 0, TLV_DB_SCALE_ITEM(TLV_DB_GAIN_MUTE, 0, 1),
-	1, 3, TLV_DB_SCALE_ITEM(600, 0, 0),
+	1, 3, TLV_DB_SCALE_ITEM(600, 0, 	0),
 	4, 4, TLV_DB_SCALE_ITEM(900, 0, 0),
 	5, 31, TLV_DB_SCALE_ITEM(1000, 100, 0),
 );
@@ -53,7 +75,7 @@ static const DECLARE_TLV_DB_RANGE(sun20i_d1_codec_adc_gain_scale,
 static const DECLARE_TLV_DB_SCALE(sun20i_d1_codec_hp_vol_scale, -4200, 600, 0);
 
 static const struct snd_kcontrol_new sun20i_d1_codec_controls[] = {
-	SOC_SINGLE_TLV("Headphone Playback Volume", SUN20I_D1_ADDA_HP2,
+	SOC_SINGLE_TLV("Lineout Playback Volume", SUN20I_D1_ADDA_HP2,
 		     SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN, 0x7, 1,
 		     sun20i_d1_codec_hp_vol_scale),
 	SOC_SINGLE_TLV("ADC1 Gain Capture Volume", SUN20I_D1_ADDA_ADC1,
@@ -65,13 +87,27 @@ static const struct snd_kcontrol_new sun20i_d1_codec_controls[] = {
 	SOC_SINGLE_TLV("ADC3 Gain Capture Volume", SUN20I_D1_ADDA_ADC3,
 		     SUN20I_D1_ADDA_ADC_PGA_GAIN, 0x1f, 0,
 		     sun20i_d1_codec_adc_gain_scale),
-};
 
-static const struct snd_kcontrol_new sun20i_d1_codec_mixer_controls[] = {
-	SOC_DAPM_DOUBLE_R("Line In Switch",
-			  SUN20I_D1_ADDA_ADC1,
-			  SUN20I_D1_ADDA_ADC2,
-			  SUN20I_D1_ADDA_ADC_LINEINLEN, 1, 0),
+    SOC_SINGLE_EXT("Lineout Playback Switch", SND_SOC_NOPM, 0, 1, 0,
+                   sun20i_hp_get, sun20i_hp_put),
+
+	/* De-pop ramp explícito */
+	SOC_SINGLE("De-pop Ramp Switch", SUN20I_D1_ADDA_RAMP,
+				SUN20I_D1_ADDA_RAMP_RD_EN, 1, 0),
+
+	/* Mic bias on/off manual (además de DAPM) */
+	SOC_SINGLE("Mic Bias Capture Switch", SUN20I_D1_ADDA_MICBIAS,
+				SUN20I_D1_ADDA_MICBIAS_MMICBIASEN, 1, 0),
+
+	/* Controles simples de ADC1/ADC2 analógicos */
+	SOC_SINGLE("ADC1 PGA Capture Switch", SUN20I_D1_ADDA_ADC1,
+				SUN20I_D1_ADDA_ADC_PGA_EN, 1, 0),
+	SOC_SINGLE("ADC2 PGA Capture Switch", SUN20I_D1_ADDA_ADC2,
+				SUN20I_D1_ADDA_ADC_PGA_EN, 1, 0),
+	SOC_SINGLE("ADC1 Single-Ended Capture Switch", SUN20I_D1_ADDA_ADC1,
+				SUN20I_D1_ADDA_ADC_MIC_SIN_EN, 1, 0),
+	SOC_SINGLE("ADC2 Single-Ended Capture Switch", SUN20I_D1_ADDA_ADC2,
+				SUN20I_D1_ADDA_ADC_MIC_SIN_EN, 1, 0),
 };
 
 static const char * const sun20i_d1_codec_mic3_src_enum_text[] = {
@@ -105,9 +141,7 @@ static const struct snd_soc_dapm_widget sun20i_d1_codec_widgets[] = {
 			 SUN20I_D1_ADDA_ADC_EN, 0),
 
 	/* Headphone output */
-	SND_SOC_DAPM_OUTPUT("HP"),
-	/* Optional Speaker output for board using speaker pin */
-	SND_SOC_DAPM_OUTPUT("Speaker"),
+	SND_SOC_DAPM_OUTPUT("LINEOUT"),
 	SND_SOC_DAPM_SUPPLY("RAMP Enable", SUN20I_D1_ADDA_RAMP,
 			    SUN20I_D1_ADDA_RAMP_RD_EN, 0, NULL, 0),
 
@@ -126,18 +160,16 @@ static const struct snd_soc_dapm_widget sun20i_d1_codec_widgets[] = {
 
 static const struct snd_soc_dapm_route sun20i_d1_codec_routes[] = {
 	/* Headphone/Speaker routes */
-	{ "HP", NULL, "Left DAC" },
-	{ "HP", NULL, "Right DAC" },
-	{ "HP", NULL, "RAMP Enable" },
-	{ "Speaker", NULL, "Left DAC" },
-	{ "Speaker", NULL, "Right DAC" },
-	{ "Speaker", NULL, "RAMP Enable" },
+	{ "LINEOUT", NULL, "Left DAC" },
+	{ "LINEOUT", NULL, "Right DAC" },
+	{ "LINEOUT", NULL, "RAMP Enable" },
 
 	/* Mic3 capture chain */
 	{ "MIC3 Source Capture Route", "Differential", "MIC3" },
 	{ "MIC3 Source Capture Route", "Single", "MIC3" },
 	{ "Mic3 Amplifier", NULL, "MIC3 Source Capture Route" },
 	{ "ADC3", NULL, "Mic3 Amplifier" },
+	{ "Mic3 Amplifier", NULL, "MBIAS" },
 };
 
 static const struct snd_soc_component_driver sun20i_d1_codec_analog_cmpnt_drv = {
@@ -180,35 +212,12 @@ static int sun20i_d1_codec_analog_probe(struct platform_device *pdev)
 		return PTR_ERR(regmap);
 	}
 
-	/* Bring-up hack: force-enable analog DAC channels and ramp so we can
-	 * verify if silence is due to DAPM not toggling these bits. Remove once
-	 * DAPM paths work. */
-	regmap_update_bits(regmap, SUN20I_D1_ADDA_DAC,
-			 BIT(SUN20I_D1_ADDA_DAC_DACL_EN) |
-			 BIT(SUN20I_D1_ADDA_DAC_DACR_EN),
-			 BIT(SUN20I_D1_ADDA_DAC_DACL_EN) |
-			 BIT(SUN20I_D1_ADDA_DAC_DACR_EN));
-	regmap_update_bits(regmap, SUN20I_D1_ADDA_RAMP,
-			 BIT(SUN20I_D1_ADDA_RAMP_RD_EN),
-			 BIT(SUN20I_D1_ADDA_RAMP_RD_EN));
-	/* Set a mid headphone gain (value 3) to ensure audible output */
-	regmap_update_bits(regmap, SUN20I_D1_ADDA_HP2,
-			 0x7 << SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN,
-			 0x3 << SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN);
-
-	{
-		unsigned int v_dac = 0, v_ramp = 0, v_hp2 = 0;
-		regmap_read(regmap, SUN20I_D1_ADDA_DAC, &v_dac);
-		regmap_read(regmap, SUN20I_D1_ADDA_RAMP, &v_ramp);
-		regmap_read(regmap, SUN20I_D1_ADDA_HP2, &v_hp2);
-		dev_info(&pdev->dev,
-			 "analog force-enable: DAC=0x%08x RAMP=0x%08x HP2=0x%08x\n",
-			 v_dac, v_ramp, v_hp2);
-	}
+	if (!regmap)
+		return -ENODEV;
 
 	return devm_snd_soc_register_component(&pdev->dev,
-					       &sun20i_d1_codec_analog_cmpnt_drv,
-					       NULL, 0);
+		&sun20i_d1_codec_analog_cmpnt_drv, 
+		NULL, 0);
 }
 
 static struct platform_driver sun20i_d1_codec_analog_driver = {
@@ -221,5 +230,5 @@ static struct platform_driver sun20i_d1_codec_analog_driver = {
 module_platform_driver(sun20i_d1_codec_analog_driver);
 
 MODULE_DESCRIPTION("Allwinner internal codec analog controls driver for D1/T113s (analog)");
-MODULE_AUTHOR("Maksim Kiselev <bigunclemax@gmail.com>");
+MODULE_AUTHOR("Sergio Perez <sergio@pereznus.es>");
 MODULE_LICENSE("GPL");
