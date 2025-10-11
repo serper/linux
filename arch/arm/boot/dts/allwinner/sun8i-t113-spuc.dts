@@ -205,50 +205,6 @@
                 status = "okay";
         };
 
-        // panel {
-        //         compatible = "bananapi,s070wv20-ct16", "simple-panel";
-        //         connector-type = <7>;
-        //         power-supply = <&reg_vcc5v>;
-        //         width-mm = <108>;
-        //         height-mm = <65>;
-        //         backlight = <&backlight>;
-        //         status = "okay";
-
-        //         display-timings {
-        //                 native-mode = <&timing0>;
-        //                 timing0: timing0 {
-        //                         clock-frequency = <25000000>;
-        //                         hactive = <800>;
-        //                         vactive = <480>;
-        //                         hsync-len = <8>;
-        //                         hback-porch = <8>;
-        //                         hfront-porch = <8>;
-        //                         vsync-len = <8>;
-        //                         vback-porch = <8>;
-        //                         vfront-porch = <8>;
-        //                         hsync-active = <0>;
-        //                         vsync-active = <0>;
-        //                 };
-        //         };
-
-        //         port {
-        //                 panel_input: endpoint {
-        //                         remote-endpoint = <&tcon_lcd0_out_panel>;
-        //                 };
-        //         };
-        // };
-        // panel {
-	// 	compatible = "bananapi,s070wv20-ct16", "simple-panel";
-        //         backlight = <&backlight>;
-        //         status = "okay";
-        // 
-	// 	port {
-	// 		panel_input: endpoint {
-	// 			remote-endpoint = <&tcon_lcd0_out_panel>;
-	// 		};
-	// 	};
-	// };
-
         panel {
                 compatible = "serper3d,qt5000h40r79l";
                 backlight = <&backlight>;
@@ -350,19 +306,6 @@
 };
 
 &codec {
-        allwinner,audio-routing =
-                "Speaker", "Left DAC",
-                "Speaker", "Right DAC",
-                "Speaker", "RAMP Enable",
-                "MIC3", "Mic3 Amplifier",
-                "Mic3 Amplifier", "MIC3 Source Capture Route",
-                "MIC3 Source Capture Route", "ADC3",
-                "MIC3", "MBIAS";
-
-        widgets =
-                "Speaker", "Speaker",
-                "Microphone", "MIC3";
-
         status = "okay";
 };
 
@@ -396,6 +339,7 @@
     bus-width = <4>;
     mmc-pwrseq = <&wifi_pwrseq>;
     cap-sd-highspeed;
+    max-frequency = <50000000>;
     status = "okay";
 
     rtl8821cs: sdio_wifi@1 {
@@ -420,6 +364,7 @@
     no-1-8-v;
     full-pwr-cycle;
     disable-wp;
+    non-removable;
 };
 
 &ohci1 {
@@ -524,7 +469,7 @@
 };
 
 /* The USB-C socket has its CC pins pulled to GND, so is hardwired as a UFP. */
-&usb_otg {
+&usbotg {
 	dr_mode = "peripheral";
 	status = "okay";
 };

@@ -30,7 +30,7 @@
                         reg = <0x0>;
                         clocks = <&ccu CLK_CPUX>;
                         clock-names = "cpu";
-                        enable-method = "psci";
+                        enable-method = "allwinner,sun8iw20p1";
                         operating-points-v2 = <&cpu_opp_table>;
                         // cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
                         #cooling-cells = <2>;
@@ -42,20 +42,19 @@
                         reg = <0x1>;
                         clocks = <&ccu CLK_CPUX>;
                         clock-names = "cpu";
-                        enable-method = "psci";
+                        enable-method = "allwinner,sun8iw20p1";
                         operating-points-v2 = <&cpu_opp_table>;
                         // cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
                         #cooling-cells = <2>;
                 };
 
-                /* Comandato temporalmente hasta validar PSCI */
+                /* Comentado temporalmente hasta validar PSCI */
                 /*
                 idle-states {
-			entry-method = "arm,psci";
+			entry-method = "s2idle";
 
 			CPU_SLEEP: cpu-sleep {
 				compatible = "arm,idle-state";
-				arm,psci-suspend-param = <0x0010000>;
 				entry-latency-us = <46>;
 				exit-latency-us = <59>;
 				min-residency-us = <3570>;
@@ -64,7 +63,6 @@
 
 			CLUSTER_SLEEP: cluster-sleep {
 				compatible = "arm,idle-state";
-				arm,psci-suspend-param = <0x1010000>;
 				entry-latency-us = <47>;
 				exit-latency-us = <74>;
 				min-residency-us = <5000>;
@@ -72,12 +70,6 @@
 			};
 		};
                 */
-        };
-
-        psci {
-                compatible = "arm,psci-1.0", "arm,psci-0.2";
-                method = "smc";
-                // Comentado mientras se testea PSCI: system-suspend-supported;
         };
 
         cpu_opp_table: cpu-opp-table {
@@ -613,7 +605,7 @@
 
                 crypto: crypto@3040000 {
                         compatible = "allwinner,sun20i-d1-crypto";
-                        reg = <0x3040000 0x800>;
+                        reg = <0x3040000 0x1000>;
                         interrupts = <SOC_PERIPHERAL_IRQ(52) IRQ_TYPE_LEVEL_HIGH>;
                         clocks = <&ccu CLK_BUS_CE>,
                                  <&ccu CLK_CE>,
@@ -722,7 +714,7 @@
                         #size-cells = <0>;
                 };
 
-                usb_otg: usb@4100000 {
+                usbotg: usb@4100000 {
                         compatible = "allwinner,sun20i-d1-musb",
                                      "allwinner,sun8i-a33-musb";
                         reg = <0x4100000 0x400>;
