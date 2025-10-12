@@ -332,23 +332,26 @@
 };
 
 &mmc1 {
-    pinctrl-0 = <&mmc1_pins>;
-    pinctrl-names = "default";
-    vmmc-supply = <&reg_3v3>;
-    non-removable;
-    bus-width = <4>;
-    mmc-pwrseq = <&wifi_pwrseq>;
-    cap-sd-highspeed;
-    max-frequency = <50000000>;
-    status = "okay";
+	pinctrl-0 = <&mmc1_pins>;
+	pinctrl-names = "default";
+	vmmc-supply = <&reg_3v3>;
+	non-removable;
+	bus-width = <4>;
+	mmc-pwrseq = <&wifi_pwrseq>;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	wakeup-source;
+	max-frequency = <75000000>;
+	post-power-on-delay-ms = <200>;
+	status = "okay";
 
-    rtl8821cs: sdio_wifi@1 {
-        reg = <1>;
-        compatible = "realtek,rtl8821cs-sdio";
-        interrupt-parent = <&pio>;
-        interrupts = <6 10 IRQ_TYPE_LEVEL_HIGH>;
-        interrupt-names = "host-wake";
-    };
+	rtl8821cs: wifi@1 {
+		reg = <1>;
+		interrupt-parent = <&pio>;
+		interrupts = <6 10 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "host-wake";
+	};
 };
 
 &mmc2 {
@@ -443,14 +446,6 @@
         pinctrl-names = "default";
         status = "okay";
 
-        // bluetooth {
-        //         compatible = "realtek,rtl8821cs-bt";
-        //         device-wake-gpios = <&pio 6 13 GPIO_ACTIVE_HIGH>; /* PG13 */
-        //         enable-gpios = <&pio 6 15 GPIO_ACTIVE_HIGH>; /* PG15 */
-        //         host-wake-gpios = <&pio 6 14 GPIO_ACTIVE_HIGH>; /* PG14 */
-        //         max-speed = <1500000>;
-        //         uart-has-rtscts;
-        // };
         bluetooth {
                 compatible = "realtek,rtl8821cs-bt", "realtek,rtl8723bs-bt";
                 device-wake-gpios = <&pio 6 13 GPIO_ACTIVE_HIGH>; /* PG13 */
@@ -469,7 +464,7 @@
 };
 
 /* The USB-C socket has its CC pins pulled to GND, so is hardwired as a UFP. */
-&usbotg {
+&usb_otg {
 	dr_mode = "peripheral";
 	status = "okay";
 };
@@ -490,6 +485,10 @@
 
 &de {
         status = "okay";
+};
+
+&ve {
+    status = "okay";
 };
 
 &pwm {
