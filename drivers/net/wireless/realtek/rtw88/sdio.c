@@ -981,9 +981,12 @@ static void rtw_sdio_rxfifo_recv(struct rtw_dev *rtwdev, u32 rx_len)
 
 	bufsz = sdio_align_size(rtwsdio->sdio_func, rx_len);
 
-	skb = dev_alloc_skb(bufsz);
+	/* Reserve NET_IP_ALIGN for proper DMA alignment on ARM platforms */
+	skb = dev_alloc_skb(bufsz + NET_IP_ALIGN);
 	if (!skb)
 		return;
+
+	skb_reserve(skb, NET_IP_ALIGN);
 
 	ret = rtw_sdio_read_port(rtwdev, skb->data, bufsz);
 	if (ret) {
