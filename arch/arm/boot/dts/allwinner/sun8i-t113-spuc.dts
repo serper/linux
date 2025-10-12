@@ -190,7 +190,6 @@
 
 	wifi_pwrseq: wifi-pwrseq {
 		compatible = "mmc-pwrseq-simple";
-                post-power-on-delay-ms = <200>;
 		reset-gpios = <&pio 6 12 GPIO_ACTIVE_LOW>; /* PG12 */
 	};
 
@@ -338,19 +337,13 @@
 	non-removable;
 	bus-width = <4>;
 	mmc-pwrseq = <&wifi_pwrseq>;
-	cap-sd-highspeed;
-	cap-sdio-irq;
-	keep-power-in-suspend;
-	wakeup-source;
-	max-frequency = <75000000>;
-	post-power-on-delay-ms = <200>;
+	broken-cd;
+	disable-wp;
+	max-frequency = <50000000>;  /* SD high-speed: 50MHz */
 	status = "okay";
 
 	rtl8821cs: wifi@1 {
 		reg = <1>;
-		interrupt-parent = <&pio>;
-		interrupts = <6 10 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-names = "host-wake";
 	};
 };
 
