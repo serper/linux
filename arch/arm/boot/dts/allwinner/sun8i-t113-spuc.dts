@@ -344,6 +344,9 @@
 
 	rtl8821cs: wifi@1 {
 		reg = <1>;
+		interrupt-parent = <&pio>;
+		interrupts = <6 10 IRQ_TYPE_LEVEL_LOW>;  /* PG10, LEVEL_LOW */
+		interrupt-names = "host-wake";
 	};
 };
 
