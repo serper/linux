@@ -396,6 +396,21 @@ static int g2d_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *
 }
 static int g2d_try_fmt(struct file *filp, void *priv, struct v4l2_format *f)
 {
+	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
+	if (!fmt)
+		return -EINVAL;
+
+	// clamp tamaños
+	if (!f->fmt.pix.width)  f->fmt.pix.width  = 16;
+	if (!f->fmt.pix.height) f->fmt.pix.height = 16;
+
+	// bytes por línea e imagen
+	f->fmt.pix.bytesperline = (f->fmt.pix.width * (fmt->depth / 8));
+	f->fmt.pix.sizeimage = f->fmt.pix.bytesperline * f->fmt.pix.height;
+	f->fmt.pix.field = V4L2_FIELD_NONE;
+	return 0;
+}
+
 static int g2d_g_fmt_out(struct file *filp, void *priv, struct v4l2_format *f)
 {
 	struct sunxi_g2d_ctx *ctx = priv;
@@ -407,25 +422,6 @@ static int g2d_g_fmt_cap(struct file *filp, void *priv, struct v4l2_format *f)
 {
 	struct sunxi_g2d_ctx *ctx = priv;
 	f->fmt.pix = ctx->cap_fmt;
-	return 0;
-}
-	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
-	if (!fmt)
-static int g2d_try_fmt(struct file *filp, void *priv, struct v4l2_format *f)
-{
-	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
-	if (!fmt)
-		return -EINVAL;
-		return -EINVAL;
-
-	// clamp tamaños
-	if (!f->fmt.pix.width)  f->fmt.pix.width  = 16;
-	if (!f->fmt.pix.height) f->fmt.pix.height = 16;
-
-	// obliga a alineación si quieres (p.ej. múltiplos de 2)
-	f->fmt.pix.bytesperline = (f->fmt.pix.width * (fmt->depth/8));
-	f->fmt.pix.sizeimage = f->fmt.pix.bytesperline * f->fmt.pix.height;
-	f->fmt.pix.field = V4L2_FIELD_NONE;
 	return 0;
 }
 
@@ -447,10 +443,7 @@ static int g2d_s_fmt_cap(struct file *filp, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
-static int g2d_reqbufs(struct file *filp, void *priv, struct v4l2_requestbuffers *rb)
-{
-	return 0; // vb2 ioctl helpers harán el trabajo real
-}
+/* no custom reqbufs; vb2 helpers se encargan */
 
 static const struct v4l2_ioctl_ops g2d_ioctl_ops = {
 	.vidioc_querycap                = g2d_querycap,
