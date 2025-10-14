@@ -489,6 +489,10 @@
     status = "okay";
 };
 
+&g2d {
+    status = "okay";
+};
+
 &pwm {
         status = "okay";
 };
