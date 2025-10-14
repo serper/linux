@@ -605,6 +605,7 @@
                         clocks = <&ccu CLK_BUS_G2D>;
                         clock-names = "bus";
                         resets = <&ccu RST_BUS_G2D>;
+                        reset-names = "bus";
                         status = "disabled";
                 };
 
