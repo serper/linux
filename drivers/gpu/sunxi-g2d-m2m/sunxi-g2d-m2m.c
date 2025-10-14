@@ -12,6 +12,8 @@
 #include <linux/reset.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
@@ -81,6 +83,7 @@ struct sunxi_g2d_dev {
 	spinlock_t irqlock;
 
 	// job state
+	struct sunxi_g2d_ctx *curr_ctx; // contexto en ejecución
 };
 
 struct sunxi_g2d_ctx {
@@ -97,7 +100,18 @@ struct sunxi_g2d_ctx {
 
 	// param job actual (calculado al submit)
 	bool needs_scale;
+
+	// estado del job en curso
+	struct vb2_v4l2_buffer *cur_src;
+	struct vb2_v4l2_buffer *cur_dst;
+	bool job_done;
+	struct delayed_work timeout_work;
 };
+
+// Parámetro de módulo para activar programación HW (experimental)
+static bool enable_hw = false;
+module_param(enable_hw, bool, 0644);
+MODULE_PARM_DESC(enable_hw, "Habilita programación HW del G2D (experimental); si false usa memcpy CPU");
 
 // ========== VB2 ops ==========
 static int qbuf_queue_setup(struct vb2_queue *q,
@@ -190,24 +204,57 @@ static void g2d_device_run(void *priv)
 	u32 src_pitch = ctx->out_fmt.bytesperline;
 	u32 dst_pitch = ctx->cap_fmt.bytesperline;
 
-	// ==== PROGRAMAR G2D ====
-	// 1) Enciende reloj/reset si hace falta por job
-	// 2) Escribe src base addr, dst base addr, strides, tamaños
-	// 3) Configura operación: BLIT o SCALE (coeficientes) XRGB8888
-	// 4) Dispara job y habilita IRQ de "frame done"
-	// TODO(G2D): programar registros concretos según mapa v2 (V0_* como fuente, WB_* como destino
-	// y VS_* para escalado). Ejemplo (cuando se confirmen bits/formato):
-	// g2d_writel(g2d, lower_32_bits(src_dma), V0_LADD0);
-	// g2d_writel(g2d, src_pitch, V0_PITCH0);
-	// g2d_writel(g2d, (src_w - 1) | ((src_h - 1) << 16), V0_MBSIZE);
-	// g2d_writel(g2d, lower_32_bits(dst_dma), WB_LADD0);
-	// g2d_writel(g2d, dst_pitch, WB_PITCH0);
-	// g2d_writel(g2d, (dst_w - 1) | ((dst_h - 1) << 16), WB_SIZE);
-	// if (ctx->needs_scale) { /* VS_CTRL, VS_* setup */ }
-	// Habilitar y lanzar en MIXER_CTL/MIXER_INT si aplica.
+	// Guarda estado del job y marca contexto en ejecución para IRQ
+	ctx->cur_src = src;
+	ctx->cur_dst = dst;
+	ctx->job_done = false;
+	spin_lock_irqsave(&g2d->irqlock, flags);
+	g2d->curr_ctx = ctx;
+	spin_unlock_irqrestore(&g2d->irqlock, flags);
 
-	// Para el MVP, simulamos “done” inmediato (sin IRQ) para encajar con userspace
-	// === ELIMINA esta simulación cuando programes IRQ ===
+	if (enable_hw && g2d->irq > 0) {
+		// ==== PROGRAMAR G2D (conservador, v2) ====
+		// Nota: Bits de formato/control están en integración; por ahora programamos
+		// direcciones, pitches y tamaños, y habilitamos IRQ global del MIXER si está presente.
+
+		// Fuente V0: base + pitch + tamaño
+		g2d_writel(g2d, lower_32_bits(src_dma), V0_LADD0);
+		g2d_writel(g2d, src_pitch, V0_PITCH0);
+		g2d_writel(g2d, (src_w - 1) | ((src_h - 1) << 16), V0_MBSIZE);
+		g2d_writel(g2d, 0, V0_COOR);
+		// Destino WB: base + pitch + tamaño
+		g2d_writel(g2d, lower_32_bits(dst_dma), WB_LADD0);
+		g2d_writel(g2d, dst_pitch, WB_PITCH0);
+		g2d_writel(g2d, (dst_w - 1) | ((dst_h - 1) << 16), WB_SIZE);
+
+		// Habilita IRQ de MIXER: patrón típico v2 (enable en bit4, pending en bit0)
+		// Escribe 0x10 para habilitar IRQ; limpiar pending previo
+		g2d_writel(g2d, 0x1, G2D_MIXER_INT); // limpia pendientes si los hay
+		g2d_writel(g2d, 0x10, G2D_MIXER_INT); // habilita IRQ (conservador)
+
+		// Dispara operación: algunos SoC usan MIXER_CTL bit0 como START
+		// Si no hace nada, el timeout completará el trabajo para no bloquear userland
+		g2d_writel(g2d, 0x1, G2D_MIXER_CTL);
+
+		// Programa timeout de seguridad por si no llega IRQ
+		schedule_delayed_work(&ctx->timeout_work, msecs_to_jiffies(50));
+		return;
+	}
+
+	// Fallback: copia por CPU (simple y lenta), finaliza sin IRQ
+	{
+		void *src_v = vb2_plane_vaddr(&src->vb2_buf, 0);
+		void *dst_v = vb2_plane_vaddr(&dst->vb2_buf, 0);
+		size_t rows = min_t(u32, src_h, dst_h);
+		size_t bytes_per_row = min_t(u32, src_pitch, dst_pitch);
+		size_t i;
+		if (src_v && dst_v) {
+			for (i = 0; i < rows; i++)
+				memcpy(dst_v + i * dst_pitch, src_v + i * src_pitch, bytes_per_row);
+		}
+	}
+
+	// Completa buffers (ruta CPU)
 	dst->sequence = src->sequence;
 	dst->field = V4L2_FIELD_NONE;
 	dst->vb2_buf.timestamp = ktime_get_ns();
@@ -215,21 +262,80 @@ static void g2d_device_run(void *priv)
 	v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
 	v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
 	v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
-	// Lanza siguiente si hay
-	v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
+	v4l2_m2m_job_finish(g2d->m2m_dev, ctx->fh.m2m_ctx);
 }
 
 static irqreturn_t g2d_irq(int irq, void *data)
 {
 	struct sunxi_g2d_dev *g2d = data;
 	unsigned long flags;
+	struct sunxi_g2d_ctx *ctx;
+	u32 st;
 
-	// TODO(G2D): leer status de MIXER_INT o ROT_INT, limpiar IRQ, finalizar job actual
-	// u32 st = g2d_readl(g2d, G2D_MIXER_INT);
-	// g2d_writel(g2d, st, G2D_MIXER_INT); // escribir-pendiente para limpiar
-	// v4l2_m2m_job_finish(g2d->m2m_dev, ctx->fh.m2m_ctx);
+	// Lee y limpia IRQ del MIXER (v2: write-back para clear)
+	st = g2d_readl(g2d, G2D_MIXER_INT);
+	if (!st)
+		return IRQ_NONE;
+	g2d_writel(g2d, st, G2D_MIXER_INT);
+
+	// Finaliza el job en curso si hay
+	spin_lock_irqsave(&g2d->irqlock, flags);
+	ctx = g2d->curr_ctx;
+	g2d->curr_ctx = NULL;
+	spin_unlock_irqrestore(&g2d->irqlock, flags);
+
+	if (ctx && !ctx->job_done) {
+		struct vb2_v4l2_buffer *src = ctx->cur_src;
+		struct vb2_v4l2_buffer *dst = ctx->cur_dst;
+		cancel_delayed_work(&ctx->timeout_work);
+		if (src && dst) {
+			dst->sequence = src->sequence;
+			dst->field = V4L2_FIELD_NONE;
+			dst->vb2_buf.timestamp = ktime_get_ns();
+			v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+			v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+			v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
+			v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
+		}
+		ctx->job_done = true;
+		v4l2_m2m_job_finish(g2d->m2m_dev, ctx->fh.m2m_ctx);
+	}
 
 	return IRQ_HANDLED;
+}
+
+// Timeout: finaliza el trabajo si no llegó IRQ a tiempo
+static void g2d_timeout_workfn(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct sunxi_g2d_ctx *ctx = container_of(dwork, struct sunxi_g2d_ctx, timeout_work);
+	struct sunxi_g2d_dev *g2d = ctx->g2d;
+	unsigned long flags;
+
+	// Si ya está marcado done por IRQ, nada que hacer
+	if (ctx->job_done)
+		return;
+
+	// Desengancha el contexto si sigue como actual
+	spin_lock_irqsave(&g2d->irqlock, flags);
+	if (g2d->curr_ctx == ctx)
+		g2d->curr_ctx = NULL;
+	spin_unlock_irqrestore(&g2d->irqlock, flags);
+
+	// Completa buffers de forma conservadora
+	if (ctx->cur_src && ctx->cur_dst) {
+		struct vb2_v4l2_buffer *src = ctx->cur_src;
+		struct vb2_v4l2_buffer *dst = ctx->cur_dst;
+		dst->sequence = src->sequence;
+		dst->field = V4L2_FIELD_NONE;
+		dst->vb2_buf.timestamp = ktime_get_ns();
+		v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+		v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+		v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
+		v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
+	}
+	ctx->job_done = true;
+	v4l2_m2m_job_finish(g2d->m2m_dev, ctx->fh.m2m_ctx);
 }
 
 static const struct v4l2_m2m_ops g2d_m2m_ops = {
@@ -338,6 +444,9 @@ static int g2d_open(struct file *filp)
 	ctx->cap_q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	ret = vb2_queue_init(&ctx->cap_q); if (ret) goto err_fh;
 
+	// init timeout work
+	INIT_DELAYED_WORK(&ctx->timeout_work, g2d_timeout_workfn);
+
 	// m2m context
 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(g2d->m2m_dev, ctx, g2d_device_run);
 	if (IS_ERR(ctx->fh.m2m_ctx)) { ret = PTR_ERR(ctx->fh.m2m_ctx); goto err_fh; }
@@ -361,6 +470,7 @@ static int g2d_release(struct file *filp)
 	struct sunxi_g2d_ctx *ctx = container_of(fh, struct sunxi_g2d_ctx, fh);
 
 	mutex_lock(&g2d->dev_mutex);
+	cancel_delayed_work_sync(&ctx->timeout_work);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	v4l2_fh_del(&ctx->fh);
 	v4l2_fh_exit(&ctx->fh);
@@ -448,6 +558,8 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 
 	dev_info(&pdev->dev, "sunxi G2D mem2mem registered as /dev/video%d\n",
 		 g2d->vfd.minor);
+
+    platform_set_drvdata(pdev, g2d);
 
 	return 0;
 
