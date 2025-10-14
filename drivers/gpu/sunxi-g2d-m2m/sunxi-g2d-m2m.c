@@ -217,7 +217,7 @@ static void g2d_device_run(void *priv)
 	g2d->curr_ctx = ctx;
 	spin_unlock_irqrestore(&g2d->irqlock, flags);
 
-	if (enable_hw && g2d->irq > 0) {
+	if (enable_hw && g2d->irq > 0 && !ctx->needs_scale) {
 		// ==== PROGRAMAR G2D (conservador, v2) ====
 		// Nota: Bits de formato/control están en integración; por ahora programamos
 		// direcciones, pitches y tamaños, y habilitamos IRQ global del MIXER si está presente.
@@ -280,7 +280,7 @@ static irqreturn_t g2d_irq(int irq, void *data)
 
 	// Lee y limpia IRQ del MIXER (v2: write-back para clear)
 	st = g2d_readl(g2d, G2D_MIXER_INT);
-	if (!st)
+	if (!(st & G2D_MIXER_INT_PEND))
 		return IRQ_NONE;
 	g2d_writel(g2d, st, G2D_MIXER_INT);
 
