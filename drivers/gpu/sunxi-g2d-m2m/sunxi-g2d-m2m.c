@@ -19,6 +19,9 @@
 
 #define DRV_NAME "sunxi-g2d-m2m"
 
+// G2D register map (v2 style) extracted from BSP
+#include "sunxi-g2d-regs.h"
+
 // ========= DT binding =========
 // Placeholder compatibles; ajusta según tu DTS/BSP
 static const struct of_device_id sunxi_g2d_of_match[] = {
@@ -29,9 +32,18 @@ static const struct of_device_id sunxi_g2d_of_match[] = {
 MODULE_DEVICE_TABLE(of, sunxi_g2d_of_match);
 
 // ========= HW regs base =========
-// TODO(G2D): define aquí offsets de registros, bits de IRQ, start, cfg pipes, scale,
-// src/dst stride, formatos, etc. copiados/adaptados del BSP/Tina.
-#define G2D_REG_SIZE   0x10000
+// Tamaño de la ventana MMIO (conservador para bloques TOP..VSU)
+#define G2D_REG_SIZE   0x40000
+
+static inline void g2d_writel(struct sunxi_g2d_dev *g2d, u32 val, u32 reg)
+{
+	iowrite32(val, g2d->mmio + reg);
+}
+
+static inline u32 g2d_readl(struct sunxi_g2d_dev *g2d, u32 reg)
+{
+	return ioread32(g2d->mmio + reg);
+}
 
 struct sunxi_g2d_fmt {
 	u32 fourcc;
@@ -183,11 +195,16 @@ static void g2d_device_run(void *priv)
 	// 2) Escribe src base addr, dst base addr, strides, tamaños
 	// 3) Configura operación: BLIT o SCALE (coeficientes) XRGB8888
 	// 4) Dispara job y habilita IRQ de "frame done"
-	// TODO(G2D): programar registros concretos
-	// iowrite32(..., g2d->mmio + REG_SRC_ADDR);
-	// iowrite32(..., g2d->mmio + REG_DST_ADDR);
-	// iowrite32(..., g2d->mmio + REG_CTRL);
-	// iowrite32(..., g2d->mmio + REG_START);
+	// TODO(G2D): programar registros concretos según mapa v2 (V0_* como fuente, WB_* como destino
+	// y VS_* para escalado). Ejemplo (cuando se confirmen bits/formato):
+	// g2d_writel(g2d, lower_32_bits(src_dma), V0_LADD0);
+	// g2d_writel(g2d, src_pitch, V0_PITCH0);
+	// g2d_writel(g2d, (src_w - 1) | ((src_h - 1) << 16), V0_MBSIZE);
+	// g2d_writel(g2d, lower_32_bits(dst_dma), WB_LADD0);
+	// g2d_writel(g2d, dst_pitch, WB_PITCH0);
+	// g2d_writel(g2d, (dst_w - 1) | ((dst_h - 1) << 16), WB_SIZE);
+	// if (ctx->needs_scale) { /* VS_CTRL, VS_* setup */ }
+	// Habilitar y lanzar en MIXER_CTL/MIXER_INT si aplica.
 
 	// Para el MVP, simulamos “done” inmediato (sin IRQ) para encajar con userspace
 	// === ELIMINA esta simulación cuando programes IRQ ===
@@ -207,7 +224,9 @@ static irqreturn_t g2d_irq(int irq, void *data)
 	struct sunxi_g2d_dev *g2d = data;
 	unsigned long flags;
 
-	// TODO(G2D): leer status, limpiar IRQ, finalizar job actual:
+	// TODO(G2D): leer status de MIXER_INT o ROT_INT, limpiar IRQ, finalizar job actual
+	// u32 st = g2d_readl(g2d, G2D_MIXER_INT);
+	// g2d_writel(g2d, st, G2D_MIXER_INT); // escribir-pendiente para limpiar
 	// v4l2_m2m_job_finish(g2d->m2m_dev, ctx->fh.m2m_ctx);
 
 	return IRQ_HANDLED;
@@ -376,6 +395,10 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	g2d->mmio = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(g2d->mmio)) return PTR_ERR(g2d->mmio);
+
+	if (resource_size(res) < G2D_REG_SIZE)
+		dev_warn(&pdev->dev, "g2d reg size (0x%pa) < expected (0x%x) for v2 map; DTS may need update\n",
+				 &res->end, G2D_REG_SIZE);
 
 	/* Use named clock + optional reset following common sunxi patterns */
 	g2d->clk = devm_clk_get(&pdev->dev, "bus");
