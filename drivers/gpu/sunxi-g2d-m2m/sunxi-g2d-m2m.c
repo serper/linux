@@ -40,8 +40,8 @@ static const struct of_device_id sunxi_g2d_of_match[] = {
 MODULE_DEVICE_TABLE(of, sunxi_g2d_of_match);
 
 // ========= HW regs base =========
-// Tamaño de la ventana MMIO (conservador para bloques TOP..VSU)
-#define G2D_REG_SIZE   0x40000
+// Tamaño de la ventana MMIO útil (TOP..VSU); evita solapar crypto (ver DTS)
+#define G2D_REG_SIZE   0x10000
 
 /* MMIO helpers operate on the mapped base directly to avoid incomplete type use */
 static inline void g2d_writel(void __iomem *mmio, u32 val, u32 reg)
