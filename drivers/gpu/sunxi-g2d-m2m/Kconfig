@@ -1,0 +1,11 @@
+config SUNXI_G2D_M2M
+	tristate "Allwinner Sunxi G2D memory-to-memory 2D engine driver"
+ 	depends on OF && MALI || ARCH_SUNXI || CPU_CORTEX_A
+ 	help
+	  This adds a minimal M2M driver for the Allwinner sunxi G2D 2D engine
+	  intended for embedded use on sun8i platforms. It provides a userspace
+	  interface for simple 2D blit/format conversion operations. The driver
+	  is a placeholder/skeleton to be extended with platform specifics,
+	  clocks, resets, and dma configuration.
+
+	  Say Y to build it into the kernel or M to build as a module.

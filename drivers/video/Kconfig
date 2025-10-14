@@ -89,4 +89,6 @@ endif
 
 source "drivers/gpu/trace/Kconfig"
 
+source "drivers/gpu/sunxi-g2d-m2m/Kconfig"
+
 endmenu

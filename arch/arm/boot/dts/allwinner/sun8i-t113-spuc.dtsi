@@ -597,6 +597,17 @@
                         #dma-cells = <1>;
                 };
 
+                /* Sunxi G2D 2D Engine (M2M) - placeholder node for sunxi-g2d-m2m driver */
+                g2d: g2d@3003000 {
+                        compatible = "allwinner,sun8i-g2d", "allwinner,sun8i-g2d-v1";
+                        reg = <0x3003000 0x1000>;
+                        interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>;
+                        clocks = <&ccu CLK_BUS_G2D>;
+                        clock-names = "bus";
+                        resets = <&ccu RST_BUS_G2D>;
+                        status = "disabled";
+                };
+
                 sid: efuse@3006000 {
                         compatible = "allwinner,sun20i-d1-sid";
                         reg = <0x3006000 0x1000>;

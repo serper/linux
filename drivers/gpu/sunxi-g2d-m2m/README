@@ -1,0 +1,14 @@
+sunxi-g2d-m2m
+=================
+
+Minimal skeleton driver for the Allwinner Sunxi G2D memory-to-memory engine.
+
+Device tree binding (basic):
+
+compatible: "allwinner,sun8i-g2d"
+reg: registers
+interrupts: optional IRQ
+clocks: optional clock
+
+This README is a placeholder. Extend the driver to implement format
+conversions, DMA, and synchronization for the specific SoC variant.
