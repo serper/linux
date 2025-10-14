@@ -29,6 +29,16 @@
 #define G2D_MIXER_INT  (0x04 + G2D_MIXER)
 #define G2D_MIXER_CLK  (0x08 + G2D_MIXER)
 
+/* G2D_MIXER_INT bits (v2 pattern, from BSP): */
+#ifndef BIT
+#define BIT(nr) (1UL << (nr))
+#endif
+#define G2D_MIXER_INT_PEND   BIT(0)  /* pending status */
+#define G2D_MIXER_INT_EN     BIT(4)  /* enable */
+
+/* G2D_MIXER_CTL bits */
+#define G2D_MIXER_CTL_START  BIT(0)
+
 // Video layer (V0) — source input for M2M path
 #define V0_ATTCTL      (0x00 + G2D_V0)
 #define V0_MBSIZE      (0x04 + G2D_V0)

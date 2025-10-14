@@ -14,6 +14,9 @@
 #include <linux/io.h>
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
+#include <linux/minmax.h>
+#include <linux/bitops.h>
+#include <linux/string.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
@@ -25,9 +28,11 @@
 #include "sunxi-g2d-regs.h"
 
 // ========= DT binding =========
-// Placeholder compatibles; ajusta según tu DTS/BSP
 static const struct of_device_id sunxi_g2d_of_match[] = {
-	{ .compatible = "allwinner,t113-g2d" }, // TODO: ajusta al compatible real
+	{ .compatible = "allwinner,t113-g2d" },
+	{ .compatible = "allwinner,sun8i-g2d" },
+	{ .compatible = "allwinner,sun8i-g2d-v1" },
+	{ .compatible = "allwinner,sun8i-g2d-v2" },
 	{ .compatible = "allwinner,sunxi-g2d" },
 	{}
 };
@@ -229,12 +234,13 @@ static void g2d_device_run(void *priv)
 
 		// Habilita IRQ de MIXER: patrón típico v2 (enable en bit4, pending en bit0)
 		// Escribe 0x10 para habilitar IRQ; limpiar pending previo
-		g2d_writel(g2d, 0x1, G2D_MIXER_INT); // limpia pendientes si los hay
-		g2d_writel(g2d, 0x10, G2D_MIXER_INT); // habilita IRQ (conservador)
+		/* limpia pendientes y habilita IRQ */
+		g2d_writel(g2d, G2D_MIXER_INT_PEND, G2D_MIXER_INT);
+		g2d_writel(g2d, G2D_MIXER_INT_EN, G2D_MIXER_INT);
 
 		// Dispara operación: algunos SoC usan MIXER_CTL bit0 como START
 		// Si no hace nada, el timeout completará el trabajo para no bloquear userland
-		g2d_writel(g2d, 0x1, G2D_MIXER_CTL);
+		g2d_writel(g2d, G2D_MIXER_CTL_START, G2D_MIXER_CTL);
 
 		// Programa timeout de seguridad por si no llega IRQ
 		schedule_delayed_work(&ctx->timeout_work, msecs_to_jiffies(50));
@@ -343,6 +349,23 @@ static const struct v4l2_m2m_ops g2d_m2m_ops = {
 };
 
 // ========== IOCTLs ==========
+static int g2d_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+	f->pixelformat = V4L2_PIX_FMT_XRGB32;
+	strscpy(f->description, "XRGB8888", sizeof(f->description));
+	return 0;
+}
+
+static int g2d_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+	f->pixelformat = V4L2_PIX_FMT_XRGB32;
+	strscpy(f->description, "XRGB8888", sizeof(f->description));
+	return 0;
+}
 static int g2d_try_fmt(struct file *filp, void *priv, struct v4l2_format *f)
 {
 	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
@@ -385,8 +408,8 @@ static int g2d_reqbufs(struct file *filp, void *priv, struct v4l2_requestbuffers
 
 static const struct v4l2_ioctl_ops g2d_ioctl_ops = {
 	.vidioc_querycap                = v4l2_m2m_ioctl_querycap,
-	.vidioc_enum_fmt_vid_cap        = v4l2_ioctl_enum_fmt_vid_cap,   // opcional: limita a XRGB8888
-	.vidioc_enum_fmt_vid_out        = v4l2_ioctl_enum_fmt_vid_out,
+	.vidioc_enum_fmt_vid_cap        = g2d_enum_fmt_cap,
+	.vidioc_enum_fmt_vid_out        = g2d_enum_fmt_out,
 	.vidioc_g_fmt_vid_out           = v4l2_m2m_ioctl_g_fmt_vid_out,
 	.vidioc_s_fmt_vid_out           = g2d_s_fmt_out,
 	.vidioc_try_fmt_vid_out         = g2d_try_fmt,
