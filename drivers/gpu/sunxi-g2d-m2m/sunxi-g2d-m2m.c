@@ -20,6 +20,7 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
+#include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-dma-contig.h>
 
 #define DRV_NAME "sunxi-g2d-m2m"
@@ -42,17 +43,15 @@ MODULE_DEVICE_TABLE(of, sunxi_g2d_of_match);
 // Tamaño de la ventana MMIO (conservador para bloques TOP..VSU)
 #define G2D_REG_SIZE   0x40000
 
-/* Forward decls to satisfy inline MMIO helpers */
-struct sunxi_g2d_dev;
-
-static inline void g2d_writel(struct sunxi_g2d_dev *g2d, u32 val, u32 reg)
+/* MMIO helpers operate on the mapped base directly to avoid incomplete type use */
+static inline void g2d_writel(void __iomem *mmio, u32 val, u32 reg)
 {
-	iowrite32(val, g2d->mmio + reg);
+    iowrite32(val, mmio + reg);
 }
 
-static inline u32 g2d_readl(struct sunxi_g2d_dev *g2d, u32 reg)
+static inline u32 g2d_readl(void __iomem *mmio, u32 reg)
 {
-	return ioread32(g2d->mmio + reg);
+    return ioread32(mmio + reg);
 }
 
 struct sunxi_g2d_fmt {
@@ -222,24 +221,24 @@ static void g2d_device_run(void *priv)
 		// direcciones, pitches y tamaños, y habilitamos IRQ global del MIXER si está presente.
 
 		// Fuente V0: base + pitch + tamaño
-		g2d_writel(g2d, lower_32_bits(src_dma), V0_LADD0);
-		g2d_writel(g2d, src_pitch, V0_PITCH0);
-		g2d_writel(g2d, (src_w - 1) | ((src_h - 1) << 16), V0_MBSIZE);
-		g2d_writel(g2d, 0, V0_COOR);
+	g2d_writel(g2d->mmio, lower_32_bits(src_dma), V0_LADD0);
+	g2d_writel(g2d->mmio, src_pitch, V0_PITCH0);
+	g2d_writel(g2d->mmio, (src_w - 1) | ((src_h - 1) << 16), V0_MBSIZE);
+	g2d_writel(g2d->mmio, 0, V0_COOR);
 		// Destino WB: base + pitch + tamaño
-		g2d_writel(g2d, lower_32_bits(dst_dma), WB_LADD0);
-		g2d_writel(g2d, dst_pitch, WB_PITCH0);
-		g2d_writel(g2d, (dst_w - 1) | ((dst_h - 1) << 16), WB_SIZE);
+	g2d_writel(g2d->mmio, lower_32_bits(dst_dma), WB_LADD0);
+	g2d_writel(g2d->mmio, dst_pitch, WB_PITCH0);
+	g2d_writel(g2d->mmio, (dst_w - 1) | ((dst_h - 1) << 16), WB_SIZE);
 
 		// Habilita IRQ de MIXER: patrón típico v2 (enable en bit4, pending en bit0)
 		// Escribe 0x10 para habilitar IRQ; limpiar pending previo
 		/* limpia pendientes y habilita IRQ */
-		g2d_writel(g2d, G2D_MIXER_INT_PEND, G2D_MIXER_INT);
-		g2d_writel(g2d, G2D_MIXER_INT_EN, G2D_MIXER_INT);
+	g2d_writel(g2d->mmio, G2D_MIXER_INT_PEND, G2D_MIXER_INT);
+	g2d_writel(g2d->mmio, G2D_MIXER_INT_EN, G2D_MIXER_INT);
 
 		// Dispara operación: algunos SoC usan MIXER_CTL bit0 como START
 		// Si no hace nada, el timeout completará el trabajo para no bloquear userland
-		g2d_writel(g2d, G2D_MIXER_CTL_START, G2D_MIXER_CTL);
+	g2d_writel(g2d->mmio, G2D_MIXER_CTL_START, G2D_MIXER_CTL);
 
 		// Programa timeout de seguridad por si no llega IRQ
 		schedule_delayed_work(&ctx->timeout_work, msecs_to_jiffies(50));
@@ -412,6 +411,11 @@ static int g2d_g_fmt_cap(struct file *filp, void *priv, struct v4l2_format *f)
 }
 	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
 	if (!fmt)
+static int g2d_try_fmt(struct file *filp, void *priv, struct v4l2_format *f)
+{
+	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
+	if (!fmt)
+		return -EINVAL;
 		return -EINVAL;
 
 	// clamp tamaños
@@ -455,10 +459,7 @@ static const struct v4l2_ioctl_ops g2d_ioctl_ops = {
 	.vidioc_g_fmt_vid_out           = g2d_g_fmt_out,
 	.vidioc_s_fmt_vid_out           = g2d_s_fmt_out,
 	.vidioc_try_fmt_vid_out         = g2d_try_fmt,
-	.vidioc_g_fmt_vid_cap           = g2d_g_fmt_cap,
-	.vidioc_s_fmt_vid_cap           = g2d_s_fmt_cap,
-	.vidioc_try_fmt_vid_cap         = g2d_try_fmt,
-
+	/* no custom reqbufs needed; use v4l2_m2m ioctl helpers */
 	.vidioc_reqbufs                 = v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf                = v4l2_m2m_ioctl_querybuf,
 	.vidioc_qbuf                    = v4l2_m2m_ioctl_qbuf,
