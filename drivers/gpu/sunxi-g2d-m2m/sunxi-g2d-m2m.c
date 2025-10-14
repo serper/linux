@@ -42,6 +42,9 @@ MODULE_DEVICE_TABLE(of, sunxi_g2d_of_match);
 // Tamaño de la ventana MMIO (conservador para bloques TOP..VSU)
 #define G2D_REG_SIZE   0x40000
 
+/* Forward decls to satisfy inline MMIO helpers */
+struct sunxi_g2d_dev;
+
 static inline void g2d_writel(struct sunxi_g2d_dev *g2d, u32 val, u32 reg)
 {
 	iowrite32(val, g2d->mmio + reg);
@@ -158,13 +161,9 @@ static int qbuf_buf_prepare(struct vb2_buffer *vb)
 static void qbuf_buf_queue(struct vb2_buffer *vb)
 {
 	struct sunxi_g2d_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
-	struct sunxi_g2d_dev *g2d = ctx->g2d;
 
 	// Cola M2M estándar: pasa el buffer a v4l2_m2m
-	if (vb->vb2_queue->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
-		v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vb);
-	else
-		v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vb);
+	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
 
 	// Intenta arrancar job si hay OUT+CAP encolados
 	v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
@@ -347,8 +346,38 @@ static void g2d_timeout_workfn(struct work_struct *work)
 static const struct v4l2_m2m_ops g2d_m2m_ops = {
 	.device_run = g2d_device_run,
 };
+// v4l2-mem2mem (antiguas) requieren queue_init callback
+static int g2d_queue_init(void *priv, struct vb2_queue *out, struct vb2_queue *cap)
+{
+	struct sunxi_g2d_ctx *ctx = priv;
+
+	memset(out, 0, sizeof(*out));
+	out->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	out->io_modes = VB2_MMAP;
+	out->drv_priv = ctx;
+	out->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
+	out->ops = &qbuf_qops;
+	out->mem_ops = &vb2_dma_contig_memops;
+	out->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	out->lock = &ctx->g2d->dev_mutex;
+	out->dev = ctx->g2d->dev;
+	if (vb2_queue_init(out))
+		return -EINVAL;
+
+	memset(cap, 0, sizeof(*cap));
+	*cap = *out;
+	cap->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	return vb2_queue_init(cap);
+}
 
 // ========== IOCTLs ==========
+static int g2d_querycap(struct file *filp, void *priv, struct v4l2_capability *cap)
+{
+	strscpy(cap->driver, DRV_NAME, sizeof(cap->driver));
+	strscpy(cap->card, "sunxi-g2d-m2m", sizeof(cap->card));
+	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s", DRV_NAME);
+	return 0;
+}
 static int g2d_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
 	if (f->index)
@@ -368,6 +397,19 @@ static int g2d_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *
 }
 static int g2d_try_fmt(struct file *filp, void *priv, struct v4l2_format *f)
 {
+static int g2d_g_fmt_out(struct file *filp, void *priv, struct v4l2_format *f)
+{
+	struct sunxi_g2d_ctx *ctx = priv;
+	f->fmt.pix = ctx->out_fmt;
+	return 0;
+}
+
+static int g2d_g_fmt_cap(struct file *filp, void *priv, struct v4l2_format *f)
+{
+	struct sunxi_g2d_ctx *ctx = priv;
+	f->fmt.pix = ctx->cap_fmt;
+	return 0;
+}
 	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
 	if (!fmt)
 		return -EINVAL;
@@ -407,13 +449,13 @@ static int g2d_reqbufs(struct file *filp, void *priv, struct v4l2_requestbuffers
 }
 
 static const struct v4l2_ioctl_ops g2d_ioctl_ops = {
-	.vidioc_querycap                = v4l2_m2m_ioctl_querycap,
+	.vidioc_querycap                = g2d_querycap,
 	.vidioc_enum_fmt_vid_cap        = g2d_enum_fmt_cap,
 	.vidioc_enum_fmt_vid_out        = g2d_enum_fmt_out,
-	.vidioc_g_fmt_vid_out           = v4l2_m2m_ioctl_g_fmt_vid_out,
+	.vidioc_g_fmt_vid_out           = g2d_g_fmt_out,
 	.vidioc_s_fmt_vid_out           = g2d_s_fmt_out,
 	.vidioc_try_fmt_vid_out         = g2d_try_fmt,
-	.vidioc_g_fmt_vid_cap           = v4l2_m2m_ioctl_g_fmt_vid_cap,
+	.vidioc_g_fmt_vid_cap           = g2d_g_fmt_cap,
 	.vidioc_s_fmt_vid_cap           = g2d_s_fmt_cap,
 	.vidioc_try_fmt_vid_cap         = g2d_try_fmt,
 
@@ -451,30 +493,14 @@ static int g2d_open(struct file *filp)
 	ctx->cap_fmt.width = 320; ctx->cap_fmt.height = 180;
 	ctx->cap_fmt.bytesperline = 320*4; ctx->cap_fmt.sizeimage = 320*180*4;
 
-	// vb2 queues
-	ctx->out_q.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	ctx->out_q.io_modes = VB2_MMAP;
-	ctx->out_q.drv_priv = ctx;
-	ctx->out_q.buf_struct_size = sizeof(struct vb2_v4l2_buffer);
-	ctx->out_q.ops = &qbuf_qops;
-	ctx->out_q.mem_ops = &vb2_dma_contig_memops;
-	ctx->out_q.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	ctx->out_q.lock = &g2d->dev_mutex;
-	ctx->out_q.dev = g2d->dev;
-	ret = vb2_queue_init(&ctx->out_q); if (ret) goto err_fh;
-
-	ctx->cap_q = ctx->out_q;
-	ctx->cap_q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	ret = vb2_queue_init(&ctx->cap_q); if (ret) goto err_fh;
-
 	// init timeout work
 	INIT_DELAYED_WORK(&ctx->timeout_work, g2d_timeout_workfn);
 
-	// m2m context
-	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(g2d->m2m_dev, ctx, g2d_device_run);
+	// m2m context (las colas se inicializan vía queue_init)
+	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(g2d->m2m_dev, ctx, g2d_queue_init);
 	if (IS_ERR(ctx->fh.m2m_ctx)) { ret = PTR_ERR(ctx->fh.m2m_ctx); goto err_fh; }
 
-	v4l2_fh_add(&ctx->fh);
+	v4l2_fh_add(&ctx->fh, filp);
 	mutex_unlock(&g2d->dev_mutex);
 	return 0;
 
@@ -495,7 +521,7 @@ static int g2d_release(struct file *filp)
 	mutex_lock(&g2d->dev_mutex);
 	cancel_delayed_work_sync(&ctx->timeout_work);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
-	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_del(&ctx->fh, filp);
 	v4l2_fh_exit(&ctx->fh);
 	kfree(ctx);
 	mutex_unlock(&g2d->dev_mutex);
@@ -597,7 +623,7 @@ err_clk:
 	return ret;
 }
 
-static int sunxi_g2d_remove(struct platform_device *pdev)
+static void sunxi_g2d_remove(struct platform_device *pdev)
 {
 	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
 
@@ -607,7 +633,6 @@ static int sunxi_g2d_remove(struct platform_device *pdev)
 	if (!IS_ERR(g2d->rst))
 		reset_control_assert(g2d->rst);
 	clk_disable_unprepare(g2d->clk);
-	return 0;
 }
 
 static struct platform_driver sunxi_g2d_driver = {
