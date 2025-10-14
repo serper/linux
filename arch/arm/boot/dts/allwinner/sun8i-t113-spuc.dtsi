@@ -28,9 +28,9 @@
                         reg = <0x0>;
                         clocks = <&ccu CLK_CPUX>;
                         clock-names = "cpu";
-                        // enable-method = "allwinner,sun8iw20p1";
+                        clock-frequency = <24000000>;
                         operating-points-v2 = <&cpu_opp_table>;
-                        // cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
+                        cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
                         #cooling-cells = <2>;
                 };
 
@@ -40,16 +40,14 @@
                         reg = <0x1>;
                         clocks = <&ccu CLK_CPUX>;
                         clock-names = "cpu";
-                        // enable-method = "allwinner,sun8iw20p1";
+                        clock-frequency = <24000000>;
                         operating-points-v2 = <&cpu_opp_table>;
-                        // cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
+                        cpu-idle-states = <&CPU_SLEEP &CLUSTER_SLEEP>;
                         #cooling-cells = <2>;
                 };
 
-                /* Comentado temporalmente hasta validar PSCI */
-                /*
                 idle-states {
-			entry-method = "s2idle";
+			entry-method = "arm,psci";
 
 			CPU_SLEEP: cpu-sleep {
 				compatible = "arm,idle-state";
@@ -67,12 +65,9 @@
 				local-timer-stop;
 			};
 		};
-                */
         };
 
         cpu_opp_table: cpu-opp-table {
-                /* compatible = "allwinner,sun20i-d1-operating-points",
-                             "allwinner,sun50i-h6-operating-points"; */
                 compatible = "operating-points-v2";
                 
                 nvmem-cells = <&cpu_speed_grade>;
@@ -110,6 +105,15 @@
                 };
         };
         
+        psci {
+                compatible = "arm,psci-1.0", "arm,psci-0.2"; 
+                method = "smc";
+                // cpu_suspend = <0xc4000001>;
+                // cpu_off = <0x84000002>;
+                // cpu_on = <0xc4000003>;
+                system-suspend-supported;
+        };
+
         gic: interrupt-controller@1c81000 {
                 compatible = "arm,gic-400";
                 reg = <0x03021000 0x1000>,
