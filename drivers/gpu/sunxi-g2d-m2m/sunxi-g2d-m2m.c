@@ -3812,6 +3812,18 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	
 	/* ============================================================================ */
 
+	/*
+	 * CRITICAL: Configure RCQ_IRQ_CTL to route MIXER interrupts to CPU in DIRECT mode
+	 * Without this, MIXER_INT interrupts will NOT reach the CPU!
+	 * From fillrect v1.0.0: G2D_RCQ_IRQ_SEL (bit 0): 0=RCQ mode, 1=Direct mode
+	 */
+	dev_info(&pdev->dev, "RCQ_IRQ_CTL before: 0x%08x\n",
+		 __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL));
+	__g2d_writel(g2d->mmio, G2D_RCQ_IRQ_SEL, G2D_RCQ_IRQ_CTL);  /* Enable direct mode IRQs */
+	wmb();
+	dev_info(&pdev->dev, "RCQ_IRQ_CTL after: 0x%08x (should be 0x01 for DIRECT mode)\n",
+		 __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL));
+
 	/* Habilita la IRQ de FINISH del MIXER y limpia pending (W1C) */
 	g2d_writel_dev(g2d, G2D_MIXER_INT_FINISH_IRQ_EN, G2D_MIXER_INT);
 	g2d_writel_dev(g2d, G2D_MIXER_INT_IRQ_PENDING, G2D_MIXER_INT);
