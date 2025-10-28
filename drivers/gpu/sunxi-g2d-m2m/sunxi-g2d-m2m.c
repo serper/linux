@@ -27,6 +27,29 @@
 #include <media/videobuf2-dma-contig.h>
 
 #define DRV_NAME "sunxi-g2d-m2m"
+#define DRV_VERSION "0.1.1"
+
+/* runtime toggle for issuing BSP-style CMDQ start from driver tests */
+bool cmdq_start;
+/* runtime toggle: allow touching TOP (SCLK/HCLK/AHB) from tests */
+static bool rcq_top_touch;
+module_param_named(rcq_top_touch, rcq_top_touch, bool, 0644);
+MODULE_PARM_DESC(rcq_top_touch, "If set, tests perform BSP-style CCU/TOP bring-up for the mixer gate before issuing RCQ ops (use with care)");
+
+/* Safety switch: RCQ_HEAD_LEN normally signals the number of headers, which is
+ * what the T113 BSP and downstream documentation expect. Setting the module
+ * parameter to 0 forces experimental byte-length semantics for diagnostics.
+ */
+static bool rcq_headlen_use_count = true;
+module_param_named(rcq_headlen_use_count, rcq_headlen_use_count, bool, 0644);
+MODULE_PARM_DESC(rcq_headlen_use_count, "RCQ_HEAD_LEN field semantics: 1 = header count (default, matches BSP), 0 = bytes for experiments");
+
+/* Guardia: evita escribir sub-bloques (MIXER/BLD/V0/WB/...) vía RCQ cuando los
+ * TOP gates están abiertos (SCLK/HCLK/AHB!=0). Hemos observado cuelgues en ese
+ * estado en T113. Se puede desactivar estableciendo a 0 bajo responsabilidad. */
+static bool rcq_guard_top_open = true;
+module_param_named(rcq_guard_top_open, rcq_guard_top_open, bool, 0644);
+MODULE_PARM_DESC(rcq_guard_top_open, "Guard RCQ sub-block writes if TOP gates are open to avoid hangs (default=1)");
 
 // G2D register map (v2 style) extracted from BSP
 #include "sunxi-g2d-regs.h"
@@ -41,7 +64,7 @@ struct sunxi_g2d_variant {
 
 static const struct sunxi_g2d_variant t113_variant = {
 	.use_rcq = true,
-	.bias_subblocks = 0x28000,  /* T113 RCQ layout */
+	.bias_subblocks = 0x28000,  /* T113 RCQ: sub-blocks at +0x28000 offset */
 };
 
 static const struct sunxi_g2d_variant default_variant = {
@@ -55,6 +78,7 @@ static const struct of_device_id sunxi_g2d_of_match[] = {
 	{ .compatible = "allwinner,sun8i-g2d-v1", .data = &default_variant },
 	{ .compatible = "allwinner,sun8i-g2d-v2", .data = &default_variant },
 	{ .compatible = "allwinner,sunxi-g2d", .data = &default_variant },
+	{ .compatible = "allwinner,sunxi-g2d-rcq", .data = &default_variant },
 	{}
 };
 MODULE_DEVICE_TABLE(of, sunxi_g2d_of_match);
@@ -86,6 +110,10 @@ struct sunxi_g2d_dev {
 	struct clk *clk_mbus;
 	struct reset_control *rst;
 	int irq;
+
+	/* sysfs-controlled CMDQ helpers (safe write path) */
+	u32 sysfs_cmdq_addr;
+	bool sysfs_addr_valid;
 
 	struct v4l2_device v4l2_dev;
 	struct video_device vfd;
@@ -187,17 +215,178 @@ static inline u32 g2d_readl_dev(struct sunxi_g2d_dev *g2d, u32 reg)
 	return val;
 }
 
+/* ======================
+ * TOP minimal enable (safe): mirrors BSP open for MIXER/ROT
+ * Provides a guarded sysfs that only flips the minimal gate/reset bits
+ * required by the RCQ engine to operate on v2 IP (T113/D1), without
+ * blasting unrelated TOP fields. Requires explicit 0xA5A5 confirmation.
+ * ====================== */
+static int g2d_top_enable_mixer(struct platform_device *pdev,
+	struct sunxi_g2d_dev *g2d, const char *tag)
+{
+	u32 sclk_before, hclk_before, ahb_before;
+	u32 sclk_after, hclk_after, ahb_after;
+	u32 bgr_before = 0, clk_before = 0;
+	u32 bgr_after = 0, clk_after = 0;
+	u32 clk_val;
+
+	if (!g2d || !g2d->mmio)
+		return -ENODEV;
+
+	if (!tag)
+		tag = "top";
+
+	if (!g2d->ccu) {
+		dev_warn(g2d->dev, "%s: CCU base not mapped, cannot enable TOP gates\n",
+			tag);
+		return -ENODEV;
+	}
+
+	bgr_before = readl(g2d->ccu + G2D_BGR_REG);
+	clk_before = readl(g2d->ccu + G2D_CLK_REG);
+
+	/* CCU sequence: assert reset, de-assert, then enable gating and clock */
+	writel(0x0, g2d->ccu + G2D_BGR_REG);
+	udelay(5);
+	writel(G2D_BGR_RST, g2d->ccu + G2D_BGR_REG);
+	udelay(20);
+	writel(G2D_BGR_RST | G2D_BGR_GATING, g2d->ccu + G2D_BGR_REG);
+	udelay(20);
+
+	clk_val = readl(g2d->ccu + G2D_CLK_REG) | G2D_CLK_GATING;
+	writel(clk_val, g2d->ccu + G2D_CLK_REG);
+	udelay(20);
+
+	bgr_after = readl(g2d->ccu + G2D_BGR_REG);
+	clk_after = readl(g2d->ccu + G2D_CLK_REG);
+
+	/* TOP gating: enable mixer bit only, keep rotator closed */
+	sclk_before = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+	hclk_before = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+	ahb_before  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+
+	__g2d_writel(g2d->mmio,
+			 (sclk_before | G2D_SCLK_GATE_MIXER) & ~G2D_SCLK_GATE_ROT,
+			 G2D_SCLK_GATE);
+	__g2d_writel(g2d->mmio,
+			 (hclk_before | G2D_HCLK_GATE_MIXER) & ~G2D_HCLK_GATE_ROT,
+			 G2D_HCLK_GATE);
+
+	/* Pulse AHB reset for mixer only */
+	__g2d_writel(g2d->mmio, 0x0, G2D_AHB_RESET);
+	udelay(10);
+	__g2d_writel(g2d->mmio, G2D_AHB_MIXER_RESET, G2D_AHB_RESET);
+	udelay(50);
+
+	sclk_after = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+	hclk_after = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+	ahb_after  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+
+	dev_info(g2d->dev,
+		 "%s: CCU BGR=0x%08x->0x%08x CLK=0x%08x->0x%08x\n",
+		 tag, bgr_before, bgr_after, clk_before, clk_after);
+	dev_info(g2d->dev,
+		 "%s: TOP SCLK=0x%08x->0x%08x HCLK=0x%08x->0x%08x AHB=0x%08x->0x%08x\n",
+		 tag, sclk_before, sclk_after, hclk_before, hclk_after,
+		 ahb_before, ahb_after);
+
+	return 0;
+}
+
+static ssize_t top_open_safe_store(struct device *dev,
+								   struct device_attribute *attr,
+								   const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long magic = 0;
+
+	if (kstrtoul(buf, 0, &magic))
+		return -EINVAL;
+
+	if (magic != 0xA5A5) {
+		dev_warn(g2d->dev, "top_open_safe: rejected (write 0xA5A5 to proceed)\n");
+		return -EPERM;
+	}
+
+	return g2d_top_enable_mixer(pdev, g2d, "top_open_safe") ? -EIO : count;
+}
+static DEVICE_ATTR_WO(top_open_safe);
+
+/* Cierra/gatea el TOP de forma conservadora: pone SCLK/HCLK/RESET a 0
+ * (equivale a g2d_hw_close() del PoC). Útil para revertir top_open_safe
+ * o intentar salir de un estado peligroso antes de nuevas pruebas.
+ * Requiere escribir 0xA5A6 para evitar usos accidentales.
+ */
+static ssize_t top_close_safe_store(struct device *dev,
+								   struct device_attribute *attr,
+								   const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long magic = 0;
+	u32 sclk_before, hclk_before, ahb_before;
+
+	if (kstrtoul(buf, 0, &magic))
+		return -EINVAL;
+	if (magic != 0xA5A6) {
+		dev_warn(g2d->dev, "top_close_safe: rejected (write 0xA5A6 to proceed)\n");
+		return -EPERM;
+	}
+
+	sclk_before = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+	hclk_before = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+	ahb_before  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+	dev_info(g2d->dev,
+			 "top_close_safe: BEFORE SCLK=0x%08x HCLK=0x%08x AHB=0x%08x\n",
+			 sclk_before, hclk_before, ahb_before);
+
+	/* Cierra todo: escribe 0 a gates y reset (como g2d_hw_close del PoC) */
+	__g2d_writel(g2d->mmio, 0x0, G2D_SCLK_GATE);
+	__g2d_writel(g2d->mmio, 0x0, G2D_HCLK_GATE);
+	__g2d_writel(g2d->mmio, 0x0, G2D_AHB_RESET);
+
+	dev_info(g2d->dev,
+			 "top_close_safe: AFTER  SCLK=0x%08x HCLK=0x%08x AHB=0x%08x\n",
+			 __g2d_readl(g2d->mmio, G2D_SCLK_GATE),
+			 __g2d_readl(g2d->mmio, G2D_HCLK_GATE),
+			 __g2d_readl(g2d->mmio, G2D_AHB_RESET));
+	return count;
+}
+static DEVICE_ATTR_WO(top_close_safe);
+
+/* Helper: BSP-style CMDQ start with small retry if RCQ doesn't move */
+/* RCQ helper: en el RCQ del T113 los offsets se codifican exactamente igual que
+ * el mapa de registros directo (mismo TOP base). No existe una "ventana RCQ"
+ * adicional: cada cabecera usa reg_offset = registro - base_TOP.
+ * Para T113 RCQ, los sub-bloques están desplazados +0x28000.
+ */
+static inline u32 g2d_rcq_reg_off(struct sunxi_g2d_dev *g2d, u32 reg)
+{
+	u32 result = reg + g2d->bias_subblocks;
+	/* Debug: verify bias is being applied (remove after verification) */
+	if (g2d->bias_subblocks != 0 && reg == 0x0800) {
+		pr_info("g2d_rcq_reg_off: reg=0x%04x bias=0x%05x -> result=0x%05x\n",
+			reg, g2d->bias_subblocks, result);
+	}
+	return result;
+}
+
+static inline u32 g2d_rcq_headlen_field(u32 header_count, u32 header_bytes)
+{
+	return rcq_headlen_use_count ? header_count : header_bytes;
+}
+
 /* Program the RCQ header pointer/length pair.
  * Mirrors the legacy BSP helper g2d_top_set_rcq_head().
  */
 static inline void g2d_rcq_load_head(struct sunxi_g2d_dev *g2d,
-	dma_addr_t dma, u32 len_bytes)
+	dma_addr_t dma, u32 header_count, u32 header_bytes)
 {
-	u32 len = len_bytes & G2D_RCQ_HEAD_LEN_MASK;
-
 	g2d_writel_dev(g2d, lower_32_bits(dma), G2D_RCQ_HEAD_LOW);
 	g2d_writel_dev(g2d, upper_32_bits(dma), G2D_RCQ_HEAD_HIGH);
-	g2d_writel_dev(g2d, len, G2D_RCQ_HEAD_LEN);
+	g2d_writel_dev(g2d, g2d_rcq_headlen_field(header_count, header_bytes),
+		G2D_RCQ_HEAD_LEN);
 }
 
 struct g2d_rcq_hw_head {
@@ -464,6 +653,9 @@ struct g2d_rcq_head {
 #define RCQ_ALIGN_BYTES 32
 #define ALIGN_32(x) ALIGN(x, RCQ_ALIGN_BYTES)
 
+/* Forward decls for helpers used early */
+static inline u32 g2d_mixer_start_mask(void);
+
 /* Test fillrect via RCQ - T113 requires BSP-style RCQ with headers+data blocks */
 static void g2d_hw_fillrect_rcq(struct platform_device *pdev,
 	struct sunxi_g2d_dev *g2d)
@@ -483,7 +675,7 @@ static void g2d_hw_fillrect_rcq(struct platform_device *pdev,
 	u32 *reg_data = NULL;
 	dma_addr_t reg_data_dma = 0;
 	size_t reg_data_size;
-	u32 header_count = 5;  /* 5 headers: V0, BLD, ROP, WB, MIXER */
+	u32 header_count = 4;  /* 4 headers: V0, BLD, WB, MIXER (sin ROP para simplificar) */
 	u32 reg_idx = 0;
 	
 	void *dst_surface = NULL;
@@ -507,8 +699,8 @@ static void g2d_hw_fillrect_rcq(struct platform_device *pdev,
 	memset(dst_surface, 0x00, surf_bytes);
 	wb_hadd = (u32)((dst_dma >> 24) & 0xFF);
 	
-	/* Allocate RCQ headers (32-byte aligned) - we need 5 headers (V0, BLD, ROP, WB, MIXER) */
-	header_count = 5;
+	/* Allocate RCQ headers (32-byte aligned) - 9 headers (ver bloques contiguos más abajo) */
+	header_count = 9;
 	rcq_headers = dmam_alloc_coherent(g2d->dev, 
 					   ALIGN_32(header_count * sizeof(*rcq_headers)),
 					   &rcq_headers_dma, GFP_KERNEL);
@@ -518,8 +710,8 @@ static void g2d_hw_fillrect_rcq(struct platform_device *pdev,
 	}
 	memset(rcq_headers, 0, ALIGN_32(header_count * sizeof(*rcq_headers)));
 	
-	/* Allocate register data block (32-byte aligned) - ~25 registers for complete fillrect */
-	reg_data_size = ALIGN_32(30 * sizeof(u32));
+	/* Allocate register data block (32-byte aligned) - ~32 regs + padding for 32B alignment per block */
+	reg_data_size = ALIGN_32(64 * sizeof(u32));
 	reg_data = dmam_alloc_coherent(g2d->dev, reg_data_size,
 					&reg_data_dma, GFP_KERNEL);
 	if (!reg_data) {
@@ -531,102 +723,184 @@ static void g2d_hw_fillrect_rcq(struct platform_device *pdev,
 	dev_info(&pdev->dev, "fillrect_rcq: dst=0x%08x hdr=0x%08x data=0x%08x\n",
 		 (u32)dst_dma, (u32)rcq_headers_dma, (u32)reg_data_dma);
 	
-	/* ========== Fill register data block - COMPLETE fillrect setup ========== */
-	/*
-	 * BSP RCQ format: The data block contains consecutive u32 values that will
-	 * be written to consecutive registers starting from reg_offset in the header.
-	 * 
-	 * For a complete fillrect, we need to configure multiple blocks.
-	 * We'll create multiple headers, one per register block.
-	 * 
-	 * NOTE: For simplicity, we'll pack everything into one data block with
-	 * multiple headers pointing to different sections.
+	/* ========== Fill register data block - headers por bloques contiguos ==========
+	 * Cada header escribe registros contiguos y ascendentes desde reg_offset.
+	 * Layout mínimo seguro para fillrect:
+	 *  0) V0_ATTCTL @0x800: ATTCTL, MBSIZE, COOR (3 regs)
+	 *  1) V0_FILLC @0x824: FILLC (1 reg)
+	 *  2) BLD_EN_CTL @0x400: EN_CTL (1 reg)
+	 *  3) BLD_CH_ISIZE0 @0x410: ISIZE0, OFFSET0 (2 regs)
+	 *  4) BLD_CTL @0x480: CTL, OUT_SIZE, OUT_COLOR (3 regs)
+	 *  5) WB_ATT @0x3000: ATT (1 reg)
+	 *  6) WB_SIZE @0x3004: SIZE (1 reg)
+	 *  7) WB_LADD0 @0x3014: LADD0, HADD0, PITCH0 (3 regs)
+	 *  8) MIXER_CLK @0x108: CLK, INT, CTL (3 regs; último header)
 	 */
 	
 	reg_idx = 0;
+	/* Cursor en bytes para garantizar bloques alineados a 32 bytes.
+	 * Además, compensa si reg_data_dma no está ya alineada a 32B. */
+	#define ALIGN32(x) (((x) + 31) & ~31)
+	size_t base_off = (size_t)(ALIGN32(reg_data_dma) - reg_data_dma);
+	size_t cur = base_off;
 	
-	/* === V0 Layer Configuration (fill color source) === */
-	/* V0 registers start at 0x800, we need: FILLC, ATTCTL, MBSIZE, COOR */
-	u32 v0_start_idx = reg_idx;
-	reg_data[reg_idx++] = fill_color;        /* V0_FILLC @ 0x824 */
-	reg_data[reg_idx++] = 0x00000411;        /* V0_ATTCTL @ 0x800: EN|FILLCOLOR_EN|fmt=XRGB8888 */
-	reg_data[reg_idx++] = 0x001F001F;        /* V0_MBSIZE @ 0x804: 32x32 */
-	reg_data[reg_idx++] = 0x00000000;        /* V0_COOR @ 0x808: (0,0) */
+	/* === V0_ATTCTL block (ATTCTL, MBSIZE, COOR) === */
+	size_t v0_att_off = ALIGN32(cur); cur = v0_att_off;
+	u32 v0_att_idx = v0_att_off / sizeof(u32);
+	reg_data[v0_att_idx + 0] = 0x00000411;        /* V0_ATTCTL @ 0x800: EN|FILLCOLOR_EN|fmt=XRGB8888 */
+	reg_data[v0_att_idx + 1] = 0x001F001F;        /* V0_MBSIZE @ 0x804: 32x32 */
+	reg_data[v0_att_idx + 2] = 0x00000000;        /* V0_COOR @ 0x808: (0,0) */
+	cur = v0_att_off + 3 * sizeof(u32);
+
+	/* === V0_FILLC block (FILLC) === */
+	size_t v0_fillc_off = ALIGN32(cur); cur = v0_fillc_off;
+	u32 v0_fillc_idx = v0_fillc_off / sizeof(u32);
+	reg_data[v0_fillc_idx + 0] = fill_color;      /* V0_FILLC @ 0x824 */
+	cur = v0_fillc_off + 1 * sizeof(u32);
 	
-	/* === BLD Configuration (blender/router) === */
-	u32 bld_start_idx = reg_idx;
-	reg_data[reg_idx++] = 0x00000101;        /* BLD_EN_CTL @ 0x400: Pipe0 enabled */
-	reg_data[reg_idx++] = 0x00000000;        /* BLD_PREMUL_CTL @ 0x408 */
-	reg_data[reg_idx++] = 0x001F001F;        /* BLD_CH_ISIZE0 @ 0x410: 32x32 */
-	reg_data[reg_idx++] = 0x00000000;        /* BLD_CH_OFFSET0 @ 0x414: (0,0) */
-	reg_data[reg_idx++] = 0x001F001F;        /* BLD_OUT_SIZE @ 0x484: 32x32 */
-	reg_data[reg_idx++] = 0x00000000;        /* BLD_OUT_COLOR @ 0x488: RGB mode */
-	reg_data[reg_idx++] = 0x00000000;        /* BLD_CTL @ 0x480 */
-	reg_data[reg_idx++] = 0x001F001F;        /* BLD_SIZE @ 0x40C: 32x32 (BSP adds this) */
+	/* === BLD_EN_CTL block (EN_CTL) === */
+	size_t bld_en_off = ALIGN32(cur); cur = bld_en_off;
+	u32 bld_en_idx = bld_en_off / sizeof(u32);
+	reg_data[bld_en_idx + 0] = 0x00000101;        /* BLD_EN_CTL @ 0x400: Pipe0 enabled */
+	cur = bld_en_off + 1 * sizeof(u32);
+
+	/* === BLD_CH_ISIZE0 block (ISIZE0, OFFSET0) === */
+	size_t bld_ch0_off = ALIGN32(cur); cur = bld_ch0_off;
+	u32 bld_ch0_idx = bld_ch0_off / sizeof(u32);
+	reg_data[bld_ch0_idx + 0] = 0x001F001F;      /* BLD_CH_ISIZE0 @ 0x410: 32x32 */
+	reg_data[bld_ch0_idx + 1] = 0x00000000;      /* BLD_CH_OFFSET0 @ 0x414: (0,0) */
+	cur = bld_ch0_off + 2 * sizeof(u32);
+
+	/* === BLD_CTL block (CTL, OUT_SIZE, OUT_COLOR) === */
+	size_t bld_ctl_off = ALIGN32(cur); cur = bld_ctl_off;
+	u32 bld_ctl_idx = bld_ctl_off / sizeof(u32);
+	reg_data[bld_ctl_idx + 0] = 0x00000000;      /* BLD_CTL @ 0x480 */
+	reg_data[bld_ctl_idx + 1] = 0x001F001F;      /* BLD_OUT_SIZE @ 0x484: 32x32 */
+	reg_data[bld_ctl_idx + 2] = 0x00000000;      /* BLD_OUT_COLOR @ 0x488 */
+	cur = bld_ctl_off + 3 * sizeof(u32);
 	
-	/* === ROP Configuration (FIX #6: Try ROP_INDEX0=0 instead of 0x00061080) === */
-	u32 rop_start_idx = reg_idx;
-	reg_data[reg_idx++] = 0x00000F00;        /* ROP_CTL @ 0x480: ROP3 mode */
-	reg_data[reg_idx++] = 0x00000000;        /* ROP_INDEX0 @ 0x484: Try default 0 */
+	/* ROP omitido en primera prueba para evitar estados adicionales */
 	
-	/* === WB Configuration (writeback/destination) === */
-	u32 wb_start_idx = reg_idx;
-	reg_data[reg_idx++] = (u32)dst_dma;      /* WB_LADD0 @ 0x3014 */
-	reg_data[reg_idx++] = wb_hadd;           /* WB_HADD0 @ 0x3018 */
-	reg_data[reg_idx++] = pitch;             /* WB_PITCH0 @ 0x301C: 128 bytes */
-	reg_data[reg_idx++] = 0x001F001F;        /* WB_SIZE @ 0x3004: 32x32 */
-	reg_data[reg_idx++] = fmt_wb;            /* WB_ATT @ 0x3000: XRGB8888 */
+	/* === WB_ATT block === */
+	size_t wb_att_off = ALIGN32(cur); cur = wb_att_off;
+	u32 wb_att_idx = wb_att_off / sizeof(u32);
+	reg_data[wb_att_idx + 0] = WB_ATT_EN | (fmt_wb << WB_ATT_FMT_SHIFT); /* WB_ATT @ 0x3000 */
+	cur = wb_att_off + 1 * sizeof(u32);
+
+	/* === WB_SIZE block === */
+	size_t wb_size_off = ALIGN32(cur); cur = wb_size_off;
+	u32 wb_size_idx = wb_size_off / sizeof(u32);
+	reg_data[wb_size_idx + 0] = 0x001F001F;        /* WB_SIZE @ 0x3004: 32x32 */
+	cur = wb_size_off + 1 * sizeof(u32);
+
+	/* === WB addresses block (LADD0, HADD0, PITCH0) === */
+	size_t wb_addr_off = ALIGN32(cur); cur = wb_addr_off;
+	u32 wb_addr_idx = wb_addr_off / sizeof(u32);
+	reg_data[wb_addr_idx + 0] = (u32)dst_dma;      /* WB_LADD0 @ 0x3014 */
+	reg_data[wb_addr_idx + 1] = wb_hadd;           /* WB_HADD0 @ 0x3018 */
+	reg_data[wb_addr_idx + 2] = pitch;             /* WB_PITCH0 @ 0x301C */
+	cur = wb_addr_off + 3 * sizeof(u32);
 	
-	/* === MIXER Control (FIX #5: MIXER_CLK as first RCQ entry) === */
-	u32 mixer_start_idx = reg_idx;
-	reg_data[reg_idx++] = 0x00000001;        /* MIXER_CLK @ 0x108: Enable internal sub-block clocks */
-	reg_data[reg_idx++] = G2D_MIXER_INT_FINISH_IRQ_EN;  /* MIXER_INT @ 0x10C */
-	reg_data[reg_idx++] = G2D_MIXER_CTL_START;          /* MIXER_CTL @ 0x110 */
+	/* === MIXER Control (MIXER como último header; START al final) === */
+	size_t mix_off = ALIGN32(cur); cur = mix_off;
+	u32 mixer_start_idx = mix_off / sizeof(u32);
+	reg_data[mixer_start_idx + 0] = 0x00000001;                 /* MIXER_CLK @ 0x108 */
+	reg_data[mixer_start_idx + 1] = G2D_MIXER_INT_FINISH_IRQ_EN;/* MIXER_INT @ 0x10C */
+	reg_data[mixer_start_idx + 2] = g2d_mixer_start_mask();     /* MIXER_CTL @ 0x110 */
+	cur = mix_off + 3 * sizeof(u32);
 	
-	dev_info(&pdev->dev, "fillrect_rcq: filled %u register values (V0:%u BLD:%u ROP:%u WB:%u MIXER:%u)\n",
-		 reg_idx, v0_start_idx, bld_start_idx, rop_start_idx, wb_start_idx, mixer_start_idx);
+	dev_info(&pdev->dev, "fillrect_rcq: prepared contiguous blocks: V0_ATT(3), V0_FILLC(1), BLD_EN(1), BLD_CH0(2), BLD_CTL(3), WB_ATT(1), WB_SIZE(1), WB_ADDR(3), MIXER(3)\n");
 	
-	/* ========== Setup RCQ headers (BSP format) - one per register block ========== */
-	
-	/* Header 0: V0 Layer (4 registers starting at V0_FILLC) */
-	rcq_headers[0].low_addr = (u32)(reg_data_dma + v0_start_idx * sizeof(u32));
-	rcq_headers[0].dw0.bits.len = 4 * sizeof(u32);
-	rcq_headers[0].dw0.bits.high_addr = (u8)upper_32_bits(reg_data_dma);
+	/* ========== Setup RCQ headers por bloque contiguo ========== */
+	/* Note: header_count will be set to 10 (even) after adding dummy header */
+	/* 0: V0_ATTCTL (3 regs @0x800) */
+	rcq_headers[0].low_addr = (u32)(reg_data_dma + v0_att_off);
+	rcq_headers[0].dw0.bits.len = 3 * sizeof(u32);
+	rcq_headers[0].dw0.bits.high_addr = (u8)(((reg_data_dma + v0_att_off) >> 24) & 0xFF);
 	rcq_headers[0].dirty.bits.dirty = 1;
 	rcq_headers[0].dirty.bits.n_header_len = 0;
-	rcq_headers[0].reg_offset = g2d_calc_off(g2d, V0_FILLC);  /* Start at V0_FILLC */
-	
-	/* Header 1: BLD (8 registers starting at BLD_EN_CTL) */
-	rcq_headers[1].low_addr = (u32)(reg_data_dma + bld_start_idx * sizeof(u32));
-	rcq_headers[1].dw0.bits.len = 8 * sizeof(u32);
-	rcq_headers[1].dw0.bits.high_addr = (u8)upper_32_bits(reg_data_dma);
+	rcq_headers[0].reg_offset = g2d_rcq_reg_off(g2d, V0_ATTCTL);
+
+	/* 1: V0_FILLC (1 reg @0x824) */
+	rcq_headers[1].low_addr = (u32)(reg_data_dma + v0_fillc_off);
+	rcq_headers[1].dw0.bits.len = 1 * sizeof(u32);
+	rcq_headers[1].dw0.bits.high_addr = (u8)(((reg_data_dma + v0_fillc_off) >> 24) & 0xFF);
 	rcq_headers[1].dirty.bits.dirty = 1;
 	rcq_headers[1].dirty.bits.n_header_len = 0;
-	rcq_headers[1].reg_offset = g2d_calc_off(g2d, BLD_EN_CTL);
-	
-	/* Header 2: ROP (2 registers starting at ROP_CTL) */
-	rcq_headers[2].low_addr = (u32)(reg_data_dma + rop_start_idx * sizeof(u32));
-	rcq_headers[2].dw0.bits.len = 2 * sizeof(u32);
-	rcq_headers[2].dw0.bits.high_addr = (u8)upper_32_bits(reg_data_dma);
+	rcq_headers[1].reg_offset = g2d_rcq_reg_off(g2d, V0_FILLC);
+
+	/* 2: BLD_EN_CTL (1 reg @0x400) */
+	rcq_headers[2].low_addr = (u32)(reg_data_dma + bld_en_off);
+	rcq_headers[2].dw0.bits.len = 1 * sizeof(u32);
+	rcq_headers[2].dw0.bits.high_addr = (u8)(((reg_data_dma + bld_en_off) >> 24) & 0xFF);
 	rcq_headers[2].dirty.bits.dirty = 1;
 	rcq_headers[2].dirty.bits.n_header_len = 0;
-	rcq_headers[2].reg_offset = g2d_calc_off(g2d, ROP_CTL);
-	
-	/* Header 3: WB (5 registers starting at WB_LADD0) */
-	rcq_headers[3].low_addr = (u32)(reg_data_dma + wb_start_idx * sizeof(u32));
-	rcq_headers[3].dw0.bits.len = 5 * sizeof(u32);
-	rcq_headers[3].dw0.bits.high_addr = (u8)upper_32_bits(reg_data_dma);
+	rcq_headers[2].reg_offset = g2d_rcq_reg_off(g2d, BLD_EN_CTL);
+
+	/* 3: BLD_CH_ISIZE0 (2 regs @0x410) */
+	rcq_headers[3].low_addr = (u32)(reg_data_dma + bld_ch0_off);
+	rcq_headers[3].dw0.bits.len = 2 * sizeof(u32);
+	rcq_headers[3].dw0.bits.high_addr = (u8)(((reg_data_dma + bld_ch0_off) >> 24) & 0xFF);
 	rcq_headers[3].dirty.bits.dirty = 1;
 	rcq_headers[3].dirty.bits.n_header_len = 0;
-	rcq_headers[3].reg_offset = g2d_calc_off(g2d, WB_LADD0);
-	
-	/* Header 4: MIXER (3 registers starting at MIXER_CLK) */
-	rcq_headers[4].low_addr = (u32)(reg_data_dma + mixer_start_idx * sizeof(u32));
+	rcq_headers[3].reg_offset = g2d_rcq_reg_off(g2d, BLD_CH_ISIZE0);
+
+	/* 4: BLD_CTL (3 regs @0x480) */
+	rcq_headers[4].low_addr = (u32)(reg_data_dma + bld_ctl_off);
 	rcq_headers[4].dw0.bits.len = 3 * sizeof(u32);
-	rcq_headers[4].dw0.bits.high_addr = (u8)upper_32_bits(reg_data_dma);
+	rcq_headers[4].dw0.bits.high_addr = (u8)(((reg_data_dma + bld_ctl_off) >> 24) & 0xFF);
 	rcq_headers[4].dirty.bits.dirty = 1;
 	rcq_headers[4].dirty.bits.n_header_len = 0;
-	rcq_headers[4].reg_offset = g2d_calc_off(g2d, G2D_MIXER_CLK);
+	rcq_headers[4].reg_offset = g2d_rcq_reg_off(g2d, BLD_CTL);
+
+	/* 5: WB_ATT (1 reg @0x3000) */
+	rcq_headers[5].low_addr = (u32)(reg_data_dma + wb_att_off);
+	rcq_headers[5].dw0.bits.len = 1 * sizeof(u32);
+	rcq_headers[5].dw0.bits.high_addr = (u8)(((reg_data_dma + wb_att_off) >> 24) & 0xFF);
+	rcq_headers[5].dirty.bits.dirty = 1;
+	rcq_headers[5].dirty.bits.n_header_len = 0;
+	rcq_headers[5].reg_offset = g2d_rcq_reg_off(g2d, WB_ATT);
+
+	/* 6: WB_SIZE (1 reg @0x3004) */
+	rcq_headers[6].low_addr = (u32)(reg_data_dma + wb_size_off);
+	rcq_headers[6].dw0.bits.len = 1 * sizeof(u32);
+	rcq_headers[6].dw0.bits.high_addr = (u8)(((reg_data_dma + wb_size_off) >> 24) & 0xFF);
+	rcq_headers[6].dirty.bits.dirty = 1;
+	rcq_headers[6].dirty.bits.n_header_len = 0;
+	rcq_headers[6].reg_offset = g2d_rcq_reg_off(g2d, WB_SIZE);
+
+	/* 7: WB_LADD0 (3 regs @0x3014) */
+	rcq_headers[7].low_addr = (u32)(reg_data_dma + wb_addr_off);
+	rcq_headers[7].dw0.bits.len = 3 * sizeof(u32);
+	rcq_headers[7].dw0.bits.high_addr = (u8)(((reg_data_dma + wb_addr_off) >> 24) & 0xFF);
+	rcq_headers[7].dirty.bits.dirty = 1;
+	rcq_headers[7].dirty.bits.n_header_len = 0;
+	rcq_headers[7].reg_offset = g2d_rcq_reg_off(g2d, WB_LADD0);
+
+	/* 8: MIXER_CLK (3 regs @0x108) */
+	rcq_headers[8].low_addr = (u32)(reg_data_dma + mix_off);
+	rcq_headers[8].dw0.bits.len = 3 * sizeof(u32);
+	rcq_headers[8].dw0.bits.high_addr = (u8)(((reg_data_dma + mix_off) >> 24) & 0xFF);
+	rcq_headers[8].dirty.bits.dirty = 1;
+	rcq_headers[8].dirty.bits.n_header_len = 0;
+	rcq_headers[8].reg_offset = g2d_rcq_reg_off(g2d, G2D_MIXER_CLK);
+
+	/* 9: DUMMY header (RCQ_HEAD_LEN must be EVEN multiple) */
+	rcq_headers[9].low_addr = (u32)(reg_data_dma + mix_off);  /* Reuse same data */
+	rcq_headers[9].dw0.bits.len = 0;  /* Zero length = NOP */
+	rcq_headers[9].dw0.bits.high_addr = 0;
+	rcq_headers[9].dirty.bits.dirty = 0;  /* NOT dirty = skip */
+	rcq_headers[9].dirty.bits.n_header_len = 0;
+	rcq_headers[9].reg_offset = 0;
+	
+	/* Update header count to 10 (even number) */
+	header_count = 10;
+	
+	/* DEBUG: Verify bias_subblocks is non-zero */
+	dev_info(&pdev->dev, "fillrect_rcq: g2d->bias_subblocks=0x%05x (should be 0x28000)\n",
+		 g2d->bias_subblocks);
+	dev_info(&pdev->dev, "fillrect_rcq: header[0].reg_offset=0x%05x (should be 0x28800)\n",
+		 rcq_headers[0].reg_offset);
 	
 	dev_info(&pdev->dev, "fillrect_rcq: Setup %u RCQ headers:\n", header_count);
 	for (i = 0; i < header_count; i++) {
@@ -636,42 +910,156 @@ static void g2d_hw_fillrect_rcq(struct platform_device *pdev,
 			 rcq_headers[i].dw0.bits.len);
 	}
 	
-	/* ========== Program and activate RCQ ========== */
+	/* ========== Program and activate RCQ (BSP sequence) ========== */
+    
+	/* BSP RCQ usage: CCU must be enabled, but TOP gates stay CLOSED.
+	 * RCQ engine writes to memory snapshots, then hardware fetches them.
+	 * Opening TOP gates causes conflict between CPU writes and RCQ engine. */
 	
-	/* NOTE: NOT resetting via G2D_AHB_RESET to preserve RCQ state from probe init */
-	dev_info(&pdev->dev, "fillrect_rcq: Skipping AHB reset to preserve RCQ state\n");
+	/* Step 1: Ensure CCU is enabled (needed for RCQ engine itself) */
+	if (g2d->ccu) {
+		u32 bgr_before = readl(g2d->ccu + G2D_BGR_REG);
+		u32 clk_before = readl(g2d->ccu + G2D_CLK_REG);
+		
+		dev_info(&pdev->dev, "fillrect_rcq: CCU state: BGR=0x%08x CLK=0x%08x\n",
+			 bgr_before, clk_before);
+		
+		/* CCU should already be enabled from probe, but verify */
+		if (!(bgr_before & G2D_BGR_GATING)) {
+			dev_warn(&pdev->dev, "fillrect_rcq: CCU was disabled, enabling now\n");
+			writel(0x0, g2d->ccu + G2D_BGR_REG);
+			udelay(5);
+			writel(G2D_BGR_RST, g2d->ccu + G2D_BGR_REG);
+			udelay(20);
+			writel(G2D_BGR_RST | G2D_BGR_GATING, g2d->ccu + G2D_BGR_REG);
+			udelay(20);
+			
+			u32 clk_val = readl(g2d->ccu + G2D_CLK_REG) | G2D_CLK_GATING;
+			writel(clk_val, g2d->ccu + G2D_CLK_REG);
+			udelay(20);
+		}
+	}
 	
-	/* Program RCQ head pointer - points to HEADER array, not data */
-	__g2d_writel(g2d->mmio, (u32)rcq_headers_dma, G2D_RCQ_HEAD_LOW);
-	__g2d_writel(g2d->mmio, upper_32_bits(rcq_headers_dma), G2D_RCQ_HEAD_HIGH);
+	/* Step 2: Verify TOP gates are CLOSED for RCQ operation */
+	{
+		u32 sclk = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+		u32 hclk = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+		u32 ahb  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+		
+		dev_info(&pdev->dev, "fillrect_rcq: TOP gates: SCLK=0x%08x HCLK=0x%08x AHB=0x%08x\n",
+			 sclk, hclk, ahb);
+		
+		/* For RCQ, TOP must be closed. If open, close them. */
+		if ((sclk | hclk | ahb) != 0) {
+			dev_info(&pdev->dev, "fillrect_rcq: TOP gates open, closing for RCQ operation\n");
+			__g2d_writel(g2d->mmio, 0x0, G2D_SCLK_GATE);
+			__g2d_writel(g2d->mmio, 0x0, G2D_HCLK_GATE);
+			__g2d_writel(g2d->mmio, 0x0, G2D_AHB_RESET);
+			udelay(10);
+			
+			dev_info(&pdev->dev, "fillrect_rcq: TOP gates closed: SCLK=0x%08x HCLK=0x%08x AHB=0x%08x\n",
+				 __g2d_readl(g2d->mmio, G2D_SCLK_GATE),
+				 __g2d_readl(g2d->mmio, G2D_HCLK_GATE),
+				 __g2d_readl(g2d->mmio, G2D_AHB_RESET));
+		}
+	}
 	
-	/* RCQ_HEAD_LEN = number of HEADERS (not bytes!) according to BSP */
-	__g2d_writel(g2d->mmio, header_count, G2D_RCQ_HEAD_LEN);
+	/* === T113 RCQ SEQUENCE: Use RAW iowrite32 for RCQ regs (bypass calc_off) === */
 	
-	dev_info(&pdev->dev, "fillrect_rcq: RCQ HEAD_LOW=0x%08x HEAD_HIGH=0x%08x LEN=%u (headers)\n",
-		 __g2d_readl(g2d->mmio, G2D_RCQ_HEAD_LOW),
-		 __g2d_readl(g2d->mmio, G2D_RCQ_HEAD_HIGH),
-		 __g2d_readl(g2d->mmio, G2D_RCQ_HEAD_LEN));
+	/* STEP 1: Disable RCQ before programming (g2d_top_rcq_update_en(0))
+	 * Use raw iowrite32 to bypass any offset calculation */
+	dev_info(&pdev->dev, "=== STEP 1: About to write RCQ_CTRL=0 at offset 0x%04x ===\n", G2D_RCQ_CTRL);
+	dev_info(&pdev->dev, "fillrect_rcq: Step 1 - Disable RCQ (raw iowrite32, TOP closed)\n");
+	iowrite32(0, g2d->mmio + G2D_RCQ_CTRL);
+	dev_info(&pdev->dev, "=== STEP 1a: RCQ_CTRL written, reading back... ===\n");
+	dev_info(&pdev->dev, "RCQ_CTRL readback = 0x%08x\n", ioread32(g2d->mmio + G2D_RCQ_CTRL));
 	
-	/* FIX #4: Properly enable and clear RCQ IRQ */
-	__g2d_writel(g2d->mmio, 0, G2D_RCQ_IRQ_CTL);  // Disable first
-	__g2d_writel(g2d->mmio, G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH, 
-		     G2D_RCQ_STATUS);  // Clear status bits
-	__g2d_writel(g2d->mmio, G2D_RCQ_IRQ_TASK_END_EN | G2D_RCQ_IRQ_CFG_FINISH_EN, 
-		     G2D_RCQ_IRQ_CTL);  // Enable IRQs without SEL
+	dev_info(&pdev->dev, "=== STEP 1b: About to write RCQ_IRQ_CTL=0 at offset 0x%04x ===\n", G2D_RCQ_IRQ_CTL);
+	iowrite32(0, g2d->mmio + G2D_RCQ_IRQ_CTL);
+	dev_info(&pdev->dev, "=== STEP 1c: RCQ_IRQ_CTL written, reading back... ===\n");
+	dev_info(&pdev->dev, "RCQ_IRQ_CTL readback = 0x%08x\n", ioread32(g2d->mmio + G2D_RCQ_IRQ_CTL));
+	wmb();
+	udelay(5);
+	dev_info(&pdev->dev, "=== STEP 1 completed safely ===\n");
 	
-	dev_info(&pdev->dev, "fillrect_rcq: RCQ_IRQ_CTL=0x%08x RCQ_STATUS before: 0x%08x\n",
-		 __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL),
-		 __g2d_readl(g2d->mmio, G2D_RCQ_STATUS));
+	/* STEP 2: Clear status bits (W1C) */
+	dev_info(&pdev->dev, "=== STEP 2: About to clear RCQ_STATUS at offset 0x%04x ===\n", G2D_RCQ_STATUS);
+	dev_info(&pdev->dev, "fillrect_rcq: Step 2 - Clear RCQ_STATUS\n");
+	iowrite32(G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH, 
+		  g2d->mmio + G2D_RCQ_STATUS);
+	dev_info(&pdev->dev, "RCQ_STATUS after clear = 0x%08x\n", ioread32(g2d->mmio + G2D_RCQ_STATUS));
+	wmb();
+	dev_info(&pdev->dev, "=== STEP 2 completed safely ===\n");
 	
-	/* Activate RCQ with UPDATE bit */
-	__g2d_writel(g2d->mmio, G2D_RCQ_CTRL_UPDATE, G2D_RCQ_CTRL);
-	udelay(10);
+	/* STEP 3: Program header address and length (g2d_top_set_rcq_head) */
+	dev_info(&pdev->dev, "=== STEP 3: About to program RCQ header pointers ===\n");
+	dev_info(&pdev->dev, "fillrect_rcq: Step 3 - Program RCQ header address/length\n");
+	iowrite32((u32)rcq_headers_dma, g2d->mmio + G2D_RCQ_HEAD_LOW);
+	dev_info(&pdev->dev, "HEAD_LOW written = 0x%08x, readback = 0x%08x\n", 
+		 (u32)rcq_headers_dma, ioread32(g2d->mmio + G2D_RCQ_HEAD_LOW));
+	iowrite32(upper_32_bits(rcq_headers_dma), g2d->mmio + G2D_RCQ_HEAD_HIGH);
+	dev_info(&pdev->dev, "HEAD_HIGH written = 0x%08x, readback = 0x%08x\n", 
+		 upper_32_bits(rcq_headers_dma), ioread32(g2d->mmio + G2D_RCQ_HEAD_HIGH));
+
+	{
+		u32 header_slots = G2D_RCQ_HEADER_ALIGN(header_count);
+		u32 header_bytes = header_slots * sizeof(*rcq_headers);
+		u32 head_len_field = g2d_rcq_headlen_field(header_count, header_bytes);
+
+		/* Verify LEN is even (should always be with dummy header added) */
+		if (head_len_field & 1) {
+			dev_err(&pdev->dev, "ERROR: RCQ_HEAD_LEN is ODD (%u) - this should never happen!\n", 
+				 head_len_field);
+			goto free_headers;
+		}
+		
+		iowrite32(head_len_field, g2d->mmio + G2D_RCQ_HEAD_LEN);
+		dev_info(&pdev->dev, "HEAD_LEN written = %u, readback = 0x%08x\n", 
+			 head_len_field, ioread32(g2d->mmio + G2D_RCQ_HEAD_LEN));
+		wmb();
+		dev_info(&pdev->dev, "=== STEP 3 completed safely ===\n");
+		
+		dev_info(&pdev->dev, "fillrect_rcq: HEAD_LOW=0x%08x HIGH=0x%08x LEN=%u (%s) [%u headers]\n",
+			 (u32)rcq_headers_dma, upper_32_bits(rcq_headers_dma),
+			 head_len_field, rcq_headlen_use_count ? "headers" : "bytes",
+			 header_count);
+	}
 	
-	dev_info(&pdev->dev, "fillrect_rcq: RCQ activated! CTRL=0x%08x STATUS=0x%08x\n",
-		 __g2d_readl(g2d->mmio, G2D_RCQ_CTRL),
-		 __g2d_readl(g2d->mmio, G2D_RCQ_STATUS));
+	/* STEP 4: Enable IRQ with rcq_sel=1 (force RCQ mode) + task_end_irq_en */
+	dev_info(&pdev->dev, "=== STEP 4: About to enable RCQ_IRQ_CTL ===\n");
+	dev_info(&pdev->dev, "fillrect_rcq: Step 4 - Enable RCQ_IRQ_CTL (sel=1, task_end=1)\n");
+	iowrite32(G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN, g2d->mmio + G2D_RCQ_IRQ_CTL);
+	dev_info(&pdev->dev, "RCQ_IRQ_CTL written = 0x%08x, readback = 0x%08x\n",
+		 G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN,
+		 ioread32(g2d->mmio + G2D_RCQ_IRQ_CTL));
+	wmb();
+	dev_info(&pdev->dev, "=== STEP 4 completed safely ===\n");
 	
+	/* STEP 5: Activate RCQ with UPDATE bit (self-clearing) - CRITICAL! */
+	dev_info(&pdev->dev, "=== STEP 5: CRITICAL - About to trigger RCQ_CTRL.UPDATE ===\n");
+	dev_info(&pdev->dev, "=== System state before UPDATE: TOP closed, CCU enabled ===\n");
+	dev_info(&pdev->dev, "=== If system hangs after this, RCQ_CTRL access is fatal ===\n");
+	dev_info(&pdev->dev, "fillrect_rcq: Step 5 - Trigger RCQ_CTRL.UPDATE=1 (raw iowrite)\n");
+	iowrite32(G2D_RCQ_CTRL_UPDATE, g2d->mmio + G2D_RCQ_CTRL);  /* Only UPDATE, not EN */
+	dev_info(&pdev->dev, "=== STEP 5a: RCQ_CTRL.UPDATE written, still alive! ===\n");
+	wmb();
+	udelay(1);
+	dev_info(&pdev->dev, "=== STEP 5b: wmb() + udelay(1) completed ===\n");
+	
+	dev_info(&pdev->dev, "=== STEP 5c: About to read back registers... ===\n");
+	dev_info(&pdev->dev, "fillrect_rcq: RCQ activated - IRQ_CTL=0x%08x STATUS=0x%08x CTRL=0x%08x\n",
+		 ioread32(g2d->mmio + G2D_RCQ_IRQ_CTL),
+		 ioread32(g2d->mmio + G2D_RCQ_STATUS),
+		 ioread32(g2d->mmio + G2D_RCQ_CTRL));
+	dev_info(&pdev->dev, "=== STEP 5 completed - No hang! ===\n");
+	
+	/* Debug: verify DMA memory is accessible and contains expected data */
+	dev_info(&pdev->dev, "fillrect_rcq: First header check: [0].low=0x%08x [0].dw0=0x%08x [0].dirty=0x%08x [0].offset=0x%04x\n",
+		 rcq_headers[0].low_addr, rcq_headers[0].dw0.dwval,
+		 rcq_headers[0].dirty.dwval, rcq_headers[0].reg_offset);
+	dev_info(&pdev->dev, "fillrect_rcq: First data check: reg_data[0]=0x%08x reg_data[1]=0x%08x reg_data[2]=0x%08x\n",
+		 reg_data[0], reg_data[1], reg_data[2]);
+
 	/* FIX #7: Enhanced polling with detailed STATUS logging */
 	timeout = jiffies + msecs_to_jiffies(100);
 	while (time_before(jiffies, timeout)) {
@@ -731,7 +1119,7 @@ free_headers:
 free_dst:
 	dmam_free_coherent(g2d->dev, surf_bytes, dst_surface, dst_dma);
 	
-	dev_info(&pdev->dev, "=== fillrect_rcq: End ===\n");
+	dev_info(&pdev->dev, "=== fillrect_rcq: End (TOP stayed closed) ===\n");
 }
 
 /* Pequeña prueba de estímulo RCQ: carga un header ficticio, habilita IRQ y
@@ -747,7 +1135,7 @@ static void g2d_rcq_kick_hw(struct platform_device *pdev,
 	const u32 bytes_per_pixel = 4; /* XRGB8888 */
 	const u32 pitch = test_w * bytes_per_pixel;
 	const size_t surf_bytes = pitch * test_h;
-	const u32 fmt_hw = 0x08; /* según tabla g_formats (XRGB8888) */
+	const u32 fmt_hw = 0x04; /* XRGB8888 */
 	struct g2d_rcq_hw_head *head;
 	void *virt;
 	void *src_surface = NULL, *dst_surface = NULL;
@@ -756,7 +1144,6 @@ static void g2d_rcq_kick_hw(struct platform_device *pdev,
 	u32 irq_ctl_before, irq_ctl_after;
 	u32 status_before, status_after;
 	u32 pending;
-	u32 header_len_bytes;
 	/* Start bit lives at bit 31 per HW docs */
 	u32 ctl_word = g2d_readl_dev(g2d, G2D_MIXER_CTL) | G2D_MIXER_CTL_START;
 	/* ACK pending IRQ (bit0) and enable finish interrupt (bit4) */
@@ -770,13 +1157,15 @@ static void g2d_rcq_kick_hw(struct platform_device *pdev,
 	} cmds[24];
 	unsigned int cmd_cnt = 0;
 	u32 size_word = (test_w - 1) | ((test_h - 1) << 16);
-	u32 v0_att = V0_ATTCTL_EN | (fmt_hw << V0_ATTCTL_FMT_SHIFT);
+	u32 v0_att = V0_ATTCTL_EN | V0_ATTCTL_FILLCOLOR_EN |
+                 (fmt_hw << V0_ATTCTL_FMT_SHIFT);
 	u32 wb_att = WB_ATT_EN | (fmt_hw << WB_ATT_FMT_SHIFT);
 	u32 v0_hadd;
 	u32 wb_hadd;
 	size_t header_bytes;
 	size_t payload_offsets[ARRAY_SIZE(cmds)];
 	u32 payload_vals[ARRAY_SIZE(cmds)];
+	unsigned int header_count;
 	unsigned int header_slots;
 	unsigned int i;
 
@@ -817,75 +1206,76 @@ static void g2d_rcq_kick_hw(struct platform_device *pdev,
 	wb_hadd = (u32)((dst_dma >> 24) & 0xFF);
 
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, G2D_MIXER_CLK),
+		.reg = G2D_MIXER_CLK,
 		.val = g2d_readl_dev(g2d, G2D_MIXER_CLK),
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, BLD_OUT_SIZE),
+		.reg = BLD_OUT_SIZE,
 		.val = size_word,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, BLD_CH_ISIZE0),
+		.reg = BLD_CH_ISIZE0,
 		.val = size_word,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, BLD_EN_CTL),
+		.reg = BLD_EN_CTL,
 		.val = BLD_PIPE0_EN,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, V0_LADD0),
+		.reg = V0_LADD0,
 		.val = lower_32_bits(src_dma),
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, V0_HADD),
+		.reg = V0_HADD,
 		.val = v0_hadd,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, V0_PITCH0),
+		.reg = V0_PITCH0,
 		.val = pitch,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, V0_MBSIZE),
+		.reg = V0_MBSIZE,
 		.val = size_word,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, V0_COOR),
+		.reg = V0_COOR,
 		.val = 0,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, V0_ATTCTL),
+		.reg = V0_ATTCTL,
 		.val = v0_att,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, WB_LADD0),
+		.reg = WB_LADD0,
 		.val = lower_32_bits(dst_dma),
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, WB_HADD0),
+		.reg = WB_HADD0,
 		.val = wb_hadd,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, WB_PITCH0),
+		.reg = WB_PITCH0,
 		.val = pitch,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, WB_SIZE),
+		.reg = WB_SIZE,
 		.val = size_word,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, WB_ATT),
+		.reg = WB_ATT,
 		.val = wb_att,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, G2D_MIXER_INT),
+		.reg = G2D_MIXER_INT,
 		.val = int_word,
 	};
 	cmds[cmd_cnt++] = (typeof(cmds[0])) {
-		.reg = g2d_calc_off(g2d, G2D_MIXER_CTL),
+		.reg = G2D_MIXER_CTL,
 		.val = ctl_word,
 	};
 
-	header_slots = G2D_RCQ_HEADER_ALIGN(cmd_cnt);
+	header_count = cmd_cnt;
+	header_slots = G2D_RCQ_HEADER_ALIGN(header_count);
 	header_bytes = header_slots * sizeof(*head);
 	head = virt;
 	memset(head, 0, header_bytes);
@@ -915,11 +1305,10 @@ static void g2d_rcq_kick_hw(struct platform_device *pdev,
 		head[i].len_high_addr = (payload_len & G2D_RCQ_LEN_MASK24) |
 				       ((upper_32_bits(payload_dma) & 0xFF) << 24);
 		head[i].dirty_next_len = G2D_RCQ_DIRTY_BIT;
-		head[i].reg_offset = cmds[i].reg;
+		head[i].reg_offset = g2d_rcq_reg_off(g2d, cmds[i].reg);
 	}
 
-	header_len_bytes = header_slots * sizeof(*head);
-	g2d_rcq_load_head(g2d, dma, header_len_bytes);
+	g2d_rcq_load_head(g2d, dma, header_count, header_bytes);
 
 	irq_ctl_before = g2d_readl_dev(g2d, G2D_RCQ_IRQ_CTL);
 	status_before = g2d_readl_dev(g2d, G2D_RCQ_STATUS);
@@ -931,23 +1320,31 @@ static void g2d_rcq_kick_hw(struct platform_device *pdev,
 	g2d_writel_dev(g2d, G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH,
 		G2D_RCQ_STATUS);
 
-	g2d_writel_dev(g2d, G2D_RCQ_CTRL_UPDATE, G2D_RCQ_CTRL);
+	g2d_writel_dev(g2d, G2D_RCQ_CTRL_EN, G2D_RCQ_CTRL);
+	wmb();
+	g2d_writel_dev(g2d, G2D_RCQ_CTRL_EN | G2D_RCQ_CTRL_UPDATE, G2D_RCQ_CTRL);
 	usleep_range(50, 100);
 
 	status_after = g2d_readl_dev(g2d, G2D_RCQ_STATUS);
 	irq_ctl_after = g2d_readl_dev(g2d, G2D_RCQ_IRQ_CTL);
 
-	dev_info(&pdev->dev,
-		 "RCQ kick: head=0x%08x%08x len=%u bytes status_before=0x%08x status_after=0x%08x frame_cnt=%u irq_ctl=0x%08x->0x%08x cmds=%u reg0=0x%08x val0=0x%08x reg1=0x%08x val1=0x%08x\n",
-		 g2d_readl_dev(g2d, G2D_RCQ_HEAD_HIGH),
-		 g2d_readl_dev(g2d, G2D_RCQ_HEAD_LOW),
-		 g2d_readl_dev(g2d, G2D_RCQ_HEAD_LEN) & G2D_RCQ_HEAD_LEN_MASK,
-		 status_before, status_after,
-		 (status_after & G2D_RCQ_STATUS_FRAME_CNT_MASK) >>
-		 G2D_RCQ_STATUS_FRAME_CNT_SHIFT,
-		 irq_ctl_before, irq_ctl_after, cmd_cnt,
-		 cmds[0].reg, payload_vals[0],
-		 cmds[1].reg, payload_vals[1]);
+	{
+		u32 len_field = g2d_readl_dev(g2d, G2D_RCQ_HEAD_LEN) &
+			G2D_RCQ_HEAD_LEN_MASK;
+		const char *len_unit = rcq_headlen_use_count ? "headers" : "bytes";
+
+		dev_info(&pdev->dev,
+			 "RCQ kick: head=0x%08x%08x len_field=%u %s status_before=0x%08x status_after=0x%08x frame_cnt=%u irq_ctl=0x%08x->0x%08x cmds=%u reg0=0x%08x val0=0x%08x reg1=0x%08x val1=0x%08x\n",
+			 g2d_readl_dev(g2d, G2D_RCQ_HEAD_HIGH),
+			 g2d_readl_dev(g2d, G2D_RCQ_HEAD_LOW),
+			 len_field, len_unit,
+			 status_before, status_after,
+			 (status_after & G2D_RCQ_STATUS_FRAME_CNT_MASK) >>
+			 G2D_RCQ_STATUS_FRAME_CNT_SHIFT,
+			 irq_ctl_before, irq_ctl_after, cmd_cnt,
+			 g2d_rcq_reg_off(g2d, cmds[0].reg), payload_vals[0],
+			 g2d_rcq_reg_off(g2d, cmds[1].reg), payload_vals[1]);
+	}
 
 	/* Limpia pending si algo se activó */
 	pending = status_after &
@@ -956,7 +1353,7 @@ static void g2d_rcq_kick_hw(struct platform_device *pdev,
 		g2d_writel_dev(g2d, pending, G2D_RCQ_STATUS);
 
 	/* Limpia UPDATE y deja IRQ como estaban originalmente */
-	g2d_writel_dev(g2d, 0, G2D_RCQ_CTRL);
+	g2d_writel_dev(g2d, 0, G2D_RCQ_CTRL); /* leave disabled after test */
 	g2d_writel_dev(g2d, irq_ctl_before, G2D_RCQ_IRQ_CTL);
 
 free_dst:
@@ -1035,6 +1432,15 @@ static bool self_test;
 module_param(self_test, bool, 0644);
 MODULE_PARM_DESC(self_test, "Si es 1, vuelca lecturas de MMIO en probe para verificar mapeo/clocking");
 
+/* Parámetro de seguridad: si está a 1, permite que el módulo escriba TOP gates
+ * peligrosas durante el autodiagnóstico. Por defecto está desactivado para evitar
+ * bloquear placas en producción; úsese solo cuando haya consola serial o control
+ * físico del dispositivo.
+ */
+static bool self_test_write;
+module_param(self_test_write, bool, 0644);
+MODULE_PARM_DESC(self_test_write, "Si es 1, permite que la prueba `self_test` escriba TOP gates (valor por defecto: 0)");
+
 // Parámetro opcional para intentar detectar registros RCQ escribiendo patrones
 static bool rcq_probe;
 module_param(rcq_probe, bool, 0644);
@@ -1049,6 +1455,1200 @@ MODULE_PARM_DESC(rcq_kick, "Si es 1 (y self_test también), programa un header R
 static bool fillrect_test;
 module_param(fillrect_test, bool, 0644);
 MODULE_PARM_DESC(fillrect_test, "Si es 1 (y self_test también), ejecuta test de fillrect con MIXER directo");
+
+/* Parámetro opcional: intenta ejecutar la secuencia BSP-style CMDQ (G2D_CONTROL/CMDQ_ADDR/STS/CTL)
+ * cuando se haya cargado un RCQ HEAD. Útil para reproducir exactamente el arranque que usa Tina/BSP.
+ */
+module_param(cmdq_start, bool, 0644);
+MODULE_PARM_DESC(cmdq_start, "Habilita experimentos CMDQ manuales vía sysfs (no se usa automáticamente en el flujo RCQ)");
+
+/* Alterna el bit de start del MIXER: algunos SoC usan bit0 en lugar de bit31. */
+static bool mixer_start_bit0;
+module_param(mixer_start_bit0, bool, 0644);
+MODULE_PARM_DESC(mixer_start_bit0, "Si es 1, usa bit0 para MIXER_CTL_START en lugar de bit31");
+
+static inline u32 g2d_mixer_start_mask(void)
+{
+	return mixer_start_bit0 ? BIT(0) : BIT(31);
+}
+
+/* Safety confirmation number: to perform TOP writes during probe the user must
+ * explicitly provide this magic value via module param `confirm_probe_top_magic`.
+ * This prevents accidental hangs by requiring a second explicit confirmation.
+ */
+static unsigned int confirm_probe_top_magic;
+module_param(confirm_probe_top_magic, uint, 0644);
+MODULE_PARM_DESC(confirm_probe_top_magic, "Magic value required to permit probe TOP writes (set to 0xA5A5 to confirm)");
+
+/* Safe sysfs helpers: allow operator to write CMDQ_ADDR via sysfs only after
+ * validation. This helps avoid hangs when userspace directly pokes MMIO.
+ */
+static ssize_t cmdq_addr_show(struct device *dev,
+							 struct device_attribute *attr, char *buf)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+
+	return scnprintf(buf, PAGE_SIZE, "0x%08x\n", g2d ? g2d->sysfs_cmdq_addr : 0);
+}
+
+static bool in_cma_reserved_region(u32 addr)
+{
+	/* Based on your dmesg: cma reserved 48 MiB at 0x44c00000 */
+	const u32 cma_base = 0x44C00000;
+	const u32 cma_size = 48 * 1024 * 1024;
+	return (addr >= cma_base) && (addr < (cma_base + cma_size));
+}
+
+static ssize_t cmdq_addr_store(struct device *dev,
+							  struct device_attribute *attr,
+							  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+
+	if (!g2d)
+		return -ENODEV;
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	/* Validate address sits inside reserved CMA region to reduce risk */
+	if (!in_cma_reserved_region((u32)val)) {
+		dev_warn(g2d->dev, "cmdq_addr_store: address 0x%08lx not inside CMA reserved region - rejected\n", val);
+		return -EINVAL;
+	}
+
+	g2d->sysfs_cmdq_addr = (u32)val;
+	g2d->sysfs_addr_valid = true;
+	dev_info(g2d->dev, "cmdq_addr_store: validated and stored 0x%08x\n", g2d->sysfs_cmdq_addr);
+	return count;
+}
+
+static ssize_t cmdq_start_store(struct device *dev,
+							   struct device_attribute *attr,
+							   const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+
+	if (!g2d)
+		return -ENODEV;
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	if (val == 0) {
+		dev_info(g2d->dev, "cmdq_start: ignored (value 0)\n");
+		return count;
+	}
+
+	if (!g2d->sysfs_addr_valid) {
+		dev_warn(g2d->dev, "cmdq_start: no validated cmdq_addr set via sysfs - abort\n");
+		return -EINVAL;
+	}
+
+	/* Enhanced debug: read/print RCQ/CMDQ state before issuing start */
+	{
+		u32 rcq_status = __g2d_readl(g2d->mmio, G2D_RCQ_STATUS);
+		u32 rcq_ctrl = __g2d_readl(g2d->mmio, G2D_RCQ_CTRL);
+		u32 rcq_head = __g2d_readl(g2d->mmio, G2D_RCQ_HEAD_LOW);
+		u32 cmdq_sts_before = __g2d_readl(g2d->mmio, G2D_CMDQ_STS);
+		u32 cmdq_addr_before = __g2d_readl(g2d->mmio, G2D_CMDQ_ADDR);
+		dev_info(g2d->dev, "cmdq_start: pre-start RCQ_STATUS=0x%08x RCQ_CTRL=0x%08x RCQ_HEAD=0x%08x CMDQ_ADDR=0x%08x CMDQ_STS=0x%08x\n",
+				 rcq_status, rcq_ctrl, rcq_head, cmdq_addr_before, cmdq_sts_before);
+	}
+
+	dev_info(g2d->dev, "cmdq_start: issuing BSP-style CMDQ start ADDR=0x%08x (with small delays)\n", g2d->sysfs_cmdq_addr);
+
+	/* BSP-order: CONTROL=0; drain; CMDQ_ADDR; CMDQ_STS; CMDQ_CTL
+	 * Add short sleeps between writes and readbacks for tracing. */
+	__g2d_writel(g2d->mmio, 0x0, G2D_CONTROL);
+	__g2d_readl(g2d->mmio, G2D_CONTROL); /* drain */
+	usleep_range(100, 200);
+
+	dev_info(g2d->dev, "cmdq_start: write CMDQ_ADDR=0x%08x\n", g2d->sysfs_cmdq_addr);
+	__g2d_writel(g2d->mmio, g2d->sysfs_cmdq_addr, G2D_CMDQ_ADDR);
+	usleep_range(100, 200);
+
+	dev_info(g2d->dev, "cmdq_start: write CMDQ_STS=0x100\n");
+	__g2d_writel(g2d->mmio, 0x100, G2D_CMDQ_STS);
+	usleep_range(100, 200);
+
+	dev_info(g2d->dev, "cmdq_start: write CMDQ_CTL=0x0 (reset)\n");
+	__g2d_writel(g2d->mmio, 0x0, G2D_CMDQ_CTL);
+	usleep_range(100, 200);
+
+	dev_info(g2d->dev, "cmdq_start: write CMDQ_CTL=0x103\n");
+	__g2d_writel(g2d->mmio, 0x103, G2D_CMDQ_CTL);
+	wmb();
+
+	/* Read back a selection of registers to help debugging */
+	{
+		u32 cmdq_sts_after = __g2d_readl(g2d->mmio, G2D_CMDQ_STS);
+		u32 cmdq_addr_after = __g2d_readl(g2d->mmio, G2D_CMDQ_ADDR);
+		u32 rcq_status_after = __g2d_readl(g2d->mmio, G2D_RCQ_STATUS);
+		dev_info(g2d->dev, "cmdq_start: post-start CMDQ_ADDR=0x%08x CMDQ_STS=0x%08x RCQ_STATUS=0x%08x\n",
+				 cmdq_addr_after, cmdq_sts_after, rcq_status_after);
+	}
+
+	/* clear the validation flag to require explicit re-validation for next run */
+	g2d->sysfs_addr_valid = false;
+
+	return count;
+}
+
+static DEVICE_ATTR(cmdq_addr, 0644, cmdq_addr_show, cmdq_addr_store);
+static DEVICE_ATTR_WO(cmdq_start);
+
+/* cmdq_pulse_now: arranca CMDQ usando el RCQ_HEAD actual y prueba varias
+ * combinaciones de CTL con pequeños delays. No escribe TOP. Uso:
+ *   echo 1 > cmdq_pulse_now
+ */
+static ssize_t cmdq_pulse_now_store(struct device *dev,
+									struct device_attribute *attr,
+									const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val = 0;
+	u32 head_low, head_high;
+	static const u32 ctl_seq[] = { 0x0, 0x103, 0x101, 0x100, 0x3, 0x1 };
+	int i;
+
+	if (!g2d)
+		return -ENODEV;
+	if (kstrtoul(buf, 0, &val) || val == 0)
+		return count; /* no-op si 0 */
+
+	head_low  = __g2d_readl(g2d->mmio, G2D_RCQ_HEAD_LOW);
+	head_high = __g2d_readl(g2d->mmio, G2D_RCQ_HEAD_HIGH);
+	if (head_low == 0) {
+		dev_warn(g2d->dev, "cmdq_pulse_now: RCQ_HEAD_LOW=0, nothing to dispatch\n");
+		return -EINVAL;
+	}
+
+	dev_info(g2d->dev, "cmdq_pulse_now: using RCQ_HEAD=0x%08x%08x\n", head_high, head_low);
+
+	/* CONTROL drain */
+	__g2d_writel(g2d->mmio, 0x0, G2D_CONTROL);
+	__g2d_readl(g2d->mmio, G2D_CONTROL);
+	usleep_range(100, 200);
+
+	/* Program ADDR and ACK STS */
+	__g2d_writel(g2d->mmio, head_low, G2D_CMDQ_ADDR);
+	usleep_range(50, 100);
+	__g2d_writel(g2d->mmio, 0x100, G2D_CMDQ_STS);
+	usleep_range(50, 100);
+
+	for (i = 0; i < ARRAY_SIZE(ctl_seq); i++) {
+		u32 ctl = ctl_seq[i];
+		__g2d_writel(g2d->mmio, ctl, G2D_CMDQ_CTL);
+		wmb();
+		usleep_range(200, 400);
+		{
+			u32 ctl_r = __g2d_readl(g2d->mmio, G2D_CMDQ_CTL);
+			u32 sts_r = __g2d_readl(g2d->mmio, G2D_CMDQ_STS);
+			u32 addr_r= __g2d_readl(g2d->mmio, G2D_CMDQ_ADDR);
+			u32 rcq_r = __g2d_readl(g2d->mmio, G2D_RCQ_STATUS);
+			dev_info(g2d->dev, "cmdq_pulse_now: CTL=0x%03x -> CTL=0x%08x STS=0x%08x ADDR=0x%08x RCQ_STATUS=0x%08x\n",
+					 ctl, ctl_r, sts_r, addr_r, rcq_r);
+			if (rcq_r != 0 || sts_r != 0)
+				break;
+		}
+	}
+
+	return count;
+}
+static DEVICE_ATTR_WO(cmdq_pulse_now);
+
+/* rcq_ctrl_explore: escribe un valor arbitrario a RCQ_CTRL (riesgoso).
+ * Requiere magic + valor en hex para proceder: echo "0xA5A5 0x13" > rcq_ctrl_explore
+ */
+static ssize_t rcq_ctrl_explore_store(struct device *dev,
+									  struct device_attribute *attr,
+									  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long magic = 0, val = 0;
+	u32 before;
+
+	if (!g2d)
+		return -ENODEV;
+	if (sscanf(buf, "%lx %lx", &magic, &val) < 2)
+		return -EINVAL;
+	if (magic != 0xA5A5) {
+		dev_warn(g2d->dev, "rcq_ctrl_explore: rejected (need 0xA5A5 magic)\n");
+		return -EPERM;
+	}
+
+	before = __g2d_readl(g2d->mmio, G2D_RCQ_CTRL);
+	__g2d_writel(g2d->mmio, (u32)val, G2D_RCQ_CTRL);
+	usleep_range(100, 200);
+	dev_info(g2d->dev, "rcq_ctrl_explore: CTRL 0x%08x -> 0x%08x\n",
+			 before, __g2d_readl(g2d->mmio, G2D_RCQ_CTRL));
+	dev_info(g2d->dev, "rcq_ctrl_explore: STATUS=0x%08x IRQ_CTL=0x%08x HEADLEN=0x%08x\n",
+			 __g2d_readl(g2d->mmio, G2D_RCQ_STATUS),
+			 __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL),
+			 __g2d_readl(g2d->mmio, G2D_RCQ_HEAD_LEN));
+	return count;
+}
+static DEVICE_ATTR_WO(rcq_ctrl_explore);
+/* Sysfs: allow touching TOP gates/reset explicitly at runtime */
+static ssize_t top_touch_store(struct device *dev,
+							  struct device_attribute *attr,
+							  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+	u32 sclk, hclk, ahb;
+
+	if (!g2d)
+		return -ENODEV;
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	/* En T113 (use_rcq=true) tocar TOP ha demostrado ser peligroso: por defecto
+	 * rechazamos 0xA5A5 y exigimos una confirmación aún más explícita (0xBEEF).
+	 * Se recomienda usar top_gate_min en su lugar, que opera sobre CCU. */
+	if (g2d->use_rcq && val == 0xA5A5) {
+		dev_warn(g2d->dev,
+				 "top_touch: REFUSED on T113 (use top_gate_min with 0xA5A5)\n");
+		return -EPERM;
+	}
+
+	if (val != 0xA5A5 && val != 0xBEEF) {
+		dev_warn(g2d->dev, "top_touch: rejected (write 0xA5A5 to proceed)\n");
+		return -EINVAL;
+	}
+	if (g2d->use_rcq && val == 0xBEEF)
+		dev_warn(g2d->dev, "top_touch: FORCING TOP on T113 (at your own risk)\n");
+
+	sclk = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+	hclk = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+	ahb  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+	__g2d_writel(g2d->mmio, sclk | G2D_SCLK_GATE_MIXER | G2D_SCLK_GATE_ROT, G2D_SCLK_GATE);
+	__g2d_writel(g2d->mmio, hclk | G2D_HCLK_GATE_MIXER | G2D_HCLK_GATE_ROT, G2D_HCLK_GATE);
+	__g2d_writel(g2d->mmio, ahb | G2D_AHB_MIXER_RESET | G2D_AHB_ROT_RESET, G2D_AHB_RESET);
+
+	sclk = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+	hclk = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+	ahb  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+	dev_info(g2d->dev, "top_touch: BEFORE SCLK=0x%08x HCLK=0x%08x AHB=0x%08x\n", sclk, hclk, ahb);
+
+	__g2d_writel(g2d->mmio, sclk | G2D_SCLK_GATE_MIXER | G2D_SCLK_GATE_ROT, G2D_SCLK_GATE);
+	__g2d_writel(g2d->mmio, hclk | G2D_HCLK_GATE_MIXER | G2D_HCLK_GATE_ROT, G2D_HCLK_GATE);
+	__g2d_writel(g2d->mmio, ahb | G2D_AHB_MIXER_RESET | G2D_AHB_ROT_RESET, G2D_AHB_RESET);
+	udelay(10);
+
+	sclk = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+	hclk = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+	ahb  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+	dev_info(g2d->dev, "top_touch: AFTER  SCLK=0x%08x HCLK=0x%08x AHB=0x%08x\n", sclk, hclk, ahb);
+
+	return count;
+}
+
+/*
+ * top_dump/cmdq_dump: atributos sysfs de diagnóstico SOLO LECTURA (activados por write)
+ * - No realizan escrituras a hardware.
+ * - Vuelcan registros TOP seguros, RCQ y CMDQ, y permiten un escaneo acotado
+ *   de ventanas candidatas alrededor de 0x100..0x300 para localizar CMDQ real en T113.
+ */
+static void g2d_dump_reg(struct sunxi_g2d_dev *g2d, u32 off)
+{
+	if (off < g2d->mmio_size) {
+		u32 val = __g2d_readl(g2d->mmio, off);
+		dev_info(g2d->dev, "TOP[0x%03x] = 0x%08x\n", off, val);
+	} else {
+		dev_info(g2d->dev, "TOP[0x%03x] = <oob>\n", off);
+	}
+}
+
+static void g2d_dump_range_compact(struct sunxi_g2d_dev *g2d, u32 start, u32 end)
+{
+	u32 off;
+	char line[160];
+	int pos = 0;
+	for (off = start; off < end; off += 16) {
+		u32 v0 = (off + 0  < g2d->mmio_size) ? __g2d_readl(g2d->mmio, off + 0)  : 0;
+		u32 v4 = (off + 4  < g2d->mmio_size) ? __g2d_readl(g2d->mmio, off + 4)  : 0;
+		u32 v8 = (off + 8  < g2d->mmio_size) ? __g2d_readl(g2d->mmio, off + 8)  : 0;
+		u32 vc = (off + 12 < g2d->mmio_size) ? __g2d_readl(g2d->mmio, off + 12) : 0;
+		pos = scnprintf(line, sizeof(line), "[%03x] %08x %08x %08x %08x",
+						off, v0, v4, v8, vc);
+		dev_info(g2d->dev, "%s\n", line);
+	}
+}
+
+static ssize_t top_dump_store(struct device *dev,
+							  struct device_attribute *attr,
+							  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long mode = 0;
+	if (!g2d)
+		return -ENODEV;
+	/* modo opcional, por defecto 0 */
+	kstrtoul(buf, 0, &mode);
+
+	dev_info(g2d->dev, "top_dump: MMIO size=0x%llx\n", (unsigned long long)g2d->mmio_size);
+	/* Dump seguro de TOP y RCQ */
+	g2d_dump_reg(g2d, G2D_SCLK_GATE);
+	g2d_dump_reg(g2d, G2D_HCLK_GATE);
+	g2d_dump_reg(g2d, G2D_AHB_RESET);
+	g2d_dump_reg(g2d, G2D_SCLK_DIV);
+	g2d_dump_reg(g2d, G2D_RCQ_CTRL);
+	g2d_dump_reg(g2d, G2D_RCQ_STATUS);
+	g2d_dump_reg(g2d, G2D_RCQ_IRQ_CTL);
+	g2d_dump_reg(g2d, G2D_RCQ_HEAD_LOW);
+	g2d_dump_reg(g2d, G2D_RCQ_HEAD_HIGH);
+	g2d_dump_reg(g2d, G2D_RCQ_HEAD_LEN);
+	/* CMDQ asumido (solo lectura) */
+	g2d_dump_reg(g2d, G2D_CMDQ_CTL);
+	g2d_dump_reg(g2d, G2D_CMDQ_STS);
+	g2d_dump_reg(g2d, G2D_CMDQ_ADDR);
+
+	if (mode >= 1) {
+		/* Escaneo compacto de posibles ventanas de CMDQ (read-only) */
+		dev_info(g2d->dev, "top_dump: scan [0x100..0x200)\n");
+		g2d_dump_range_compact(g2d, 0x100, 0x200);
+		dev_info(g2d->dev, "top_dump: scan [0x200..0x300)\n");
+		g2d_dump_range_compact(g2d, 0x200, 0x300);
+	}
+
+	return count;
+}
+
+static ssize_t cmdq_dump_store(struct device *dev,
+							   struct device_attribute *attr,
+							   const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long mode = 0;
+	if (!g2d)
+		return -ENODEV;
+	kstrtoul(buf, 0, &mode);
+
+	/* Dump focalizado de CMDQ (lectura) */
+	dev_info(g2d->dev, "cmdq_dump: CTL=0x%08x STS=0x%08x ADDR=0x%08x\n",
+			 (G2D_CMDQ_CTL   < g2d->mmio_size) ? __g2d_readl(g2d->mmio, G2D_CMDQ_CTL)   : 0,
+			 (G2D_CMDQ_STS   < g2d->mmio_size) ? __g2d_readl(g2d->mmio, G2D_CMDQ_STS)   : 0,
+			 (G2D_CMDQ_ADDR  < g2d->mmio_size) ? __g2d_readl(g2d->mmio, G2D_CMDQ_ADDR)  : 0);
+
+	if (mode >= 1) {
+		/* Heurística: mostrar offsets cuyo valor difiera del patrón espejo 0x40000010 */
+		u32 pattern = 0x40000010;
+		u32 off;
+		dev_info(g2d->dev, "cmdq_dump: scanning [0x100..0x300) diffs from 0x%08x\n", pattern);
+		for (off = 0x100; off < 0x300; off += 4) {
+			if (off >= g2d->mmio_size)
+				break;
+			u32 val = __g2d_readl(g2d->mmio, off);
+			if (val != pattern)
+				dev_info(g2d->dev, "  [0x%03x] = 0x%08x\n", off, val);
+		}
+	}
+
+	return count;
+}
+
+DEVICE_ATTR_WO(top_dump);
+DEVICE_ATTR_WO(cmdq_dump);
+
+static ssize_t top_scan_store(struct device *dev,
+							  struct device_attribute *attr,
+							  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long start = 0, end = 0x1000, max_lines = 256;
+	unsigned long printed = 0;
+	u32 off;
+	int n;
+
+	if (!g2d)
+		return -ENODEV;
+
+	/* Formato opcional: "start end [max]" en hex para start/end */
+	n = sscanf(buf, "%lx %lx %lu", &start, &end, &max_lines);
+	if (n <= 0) {
+		/* Sin parámetros: usa rango por defecto */
+		start = 0;
+		end = min_t(unsigned long, 0x1000UL, (unsigned long)g2d->mmio_size);
+	}
+
+	/* Normaliza y valida */
+	if (start >= g2d->mmio_size)
+		return -EINVAL;
+	if (end == 0 || end > g2d->mmio_size)
+		end = g2d->mmio_size;
+	if (end <= start)
+		return -EINVAL;
+	if (max_lines == 0)
+		max_lines = 256;
+
+	/* Alinea a palabra */
+	start &= ~0x3UL;
+	end &= ~0x3UL;
+
+	dev_info(g2d->dev, "top_scan: [0x%lx..0x%lx) step=4 excl={0x00000000,0x40000010} max=%lu\n",
+			 start, end, max_lines);
+
+	for (off = (u32)start; off < (u32)end; off += 4) {
+		u32 val = __g2d_readl(g2d->mmio, off);
+		if (val != 0x00000000 && val != 0x40000010 && !g2d_is_stub_value(val)) {
+			dev_info(g2d->dev, "SCAN[0x%03x] = 0x%08x\n", off, val);
+			if (++printed >= max_lines) {
+				dev_info(g2d->dev, "top_scan: limit reached (%lu lines)\n", max_lines);
+				break;
+			}
+		}
+	}
+
+	if (printed == 0)
+		dev_info(g2d->dev, "top_scan: no mismatches found in range\n");
+
+	return count;
+}
+
+DEVICE_ATTR_WO(top_scan);
+
+/* top_gate_min: habilitación mínima vía CCU (T113). No escribe en TOP MMIO.
+ * Uso: echo 0xA5A5 > top_gate_min
+ */
+static ssize_t top_gate_min_store(struct device *dev,
+								 struct device_attribute *attr,
+								 const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+	u32 bgr_before, clk_before, bgr_after, clk_after;
+
+	if (!g2d)
+		return -ENODEV;
+	if (!g2d->use_rcq || !g2d->ccu) {
+		dev_warn(g2d->dev, "top_gate_min: not available (legacy or no CCU)\n");
+		return -EINVAL;
+	}
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+	if (val != 0xA5A5) {
+		dev_warn(g2d->dev, "top_gate_min: rejected (write 0xA5A5 to proceed)\n");
+		return -EINVAL;
+	}
+
+	bgr_before = readl(g2d->ccu + G2D_BGR_REG);
+	clk_before = readl(g2d->ccu + G2D_CLK_REG);
+	dev_info(g2d->dev, "top_gate_min: CCU before BGR=0x%08x CLK=0x%08x\n", bgr_before, clk_before);
+
+	/* Secuencia conservadora (CCU): assert reset -> deassert -> gating on -> clock gating */
+	writel(0x0, g2d->ccu + G2D_BGR_REG);
+	udelay(10);
+	writel(G2D_BGR_RST, g2d->ccu + G2D_BGR_REG);
+	udelay(50);
+	writel(G2D_BGR_RST | G2D_BGR_GATING, g2d->ccu + G2D_BGR_REG);
+	udelay(50);
+
+	/* Clock: activa gating y deja src como esté configurado por el clock framework */
+	{
+		u32 clk = readl(g2d->ccu + G2D_CLK_REG);
+		clk |= G2D_CLK_GATING;
+		writel(clk, g2d->ccu + G2D_CLK_REG);
+		udelay(50);
+	}
+
+	bgr_after = readl(g2d->ccu + G2D_BGR_REG);
+	clk_after = readl(g2d->ccu + G2D_CLK_REG);
+	dev_info(g2d->dev, "top_gate_min: CCU after  BGR=0x%08x CLK=0x%08x\n", bgr_after, clk_after);
+
+	return count;
+}
+
+static DEVICE_ATTR_WO(top_gate_min);
+
+/*
+ * ccu_dump_g2d: volcado de registros CCU relevantes para G2D (solo lectura)
+ * - Muestra G2D_BGR_REG (0x63c), G2D_CLK_REG (0x630) y MBUS_GATE (0x804)
+ * - Usa g2d->ccu si está mapeado; de lo contrario, mapea temporalmente 0x02001000
+ */
+static ssize_t ccu_dump_g2d_store(struct device *dev,
+								  struct device_attribute *attr,
+								  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	void __iomem *ccu = g2d ? g2d->ccu : NULL;
+	bool temp_map = false;
+	u32 bus_gate = 0, g2d_clk = 0, mbus_gate = 0;
+
+	if (!ccu) {
+		ccu = ioremap(0x02001000, 0x1000);
+		temp_map = ccu != NULL;
+	}
+	if (!ccu)
+		return -ENODEV;
+
+	g2d_clk  = readl(ccu + 0x630);
+	bus_gate = readl(ccu + 0x63c);
+	mbus_gate = readl(ccu + 0x804);
+	dev_info(&pdev->dev, "CCU: G2D_CLK=0x%08x BUS_GATE=0x%08x MBUS_GATE=0x%08x\n",
+			 g2d_clk, bus_gate, mbus_gate);
+
+	if (temp_map)
+		iounmap(ccu);
+	return count;
+}
+
+DEVICE_ATTR_WO(ccu_dump_g2d);
+
+/*
+ * ccu_reset_cycle: realiza un ciclo de reset/gating vía CCU exclusivamente
+ * (sin tocar los registros TOP del IP). Requiere escribir 0xA5A5.
+ * Útil para garantizar que el bloque ha salido del reset y está gateado.
+ */
+static ssize_t ccu_reset_cycle_store(struct device *dev,
+									 struct device_attribute *attr,
+									 const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+
+	if (!g2d || !g2d->ccu)
+		return -ENODEV;
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+	if (val != 0xA5A5)
+		return -EINVAL;
+
+	/* Snapshot antes */
+	{
+		u32 bgr = readl(g2d->ccu + G2D_BGR_REG);
+		u32 clk = readl(g2d->ccu + G2D_CLK_REG);
+		dev_info(g2d->dev, "ccu_reset_cycle: BEFORE BGR=0x%08x CLK=0x%08x\n", bgr, clk);
+	}
+
+	/* Secuencia conservadora: assert -> deassert -> gating */
+	writel(0x0, g2d->ccu + G2D_BGR_REG);
+	udelay(10);
+	writel(G2D_BGR_RST, g2d->ccu + G2D_BGR_REG);
+	udelay(50);
+	writel(G2D_BGR_RST | G2D_BGR_GATING, g2d->ccu + G2D_BGR_REG);
+	udelay(50);
+
+	/* Asegura clock gating activo */
+	{
+		u32 clk = readl(g2d->ccu + G2D_CLK_REG);
+		clk |= G2D_CLK_GATING;
+		writel(clk, g2d->ccu + G2D_CLK_REG);
+		udelay(50);
+	}
+
+	/* Snapshot después */
+	{
+		u32 bgr = readl(g2d->ccu + G2D_BGR_REG);
+		u32 clk = readl(g2d->ccu + G2D_CLK_REG);
+		dev_info(g2d->dev, "ccu_reset_cycle: AFTER  BGR=0x%08x CLK=0x%08x\n", bgr, clk);
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_WO(ccu_reset_cycle);
+
+/*
+ * id_scan: lectura de un registro fijo (por defecto 0x010) a lo largo de un rango,
+ * para detectar alias/espejos de banco. Formato de entrada:
+ *   "start end [step] [reg_off]"  -- todos en hex, step/reg_off opcionales.
+ * Por defecto: start=0x0, end=min(mmio_size,0x1000), step=0x100, reg_off=0x10.
+ */
+static ssize_t id_scan_store(struct device *dev,
+							 struct device_attribute *attr,
+							 const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long start = 0, end = 0; /* se normalizan abajo */
+	unsigned long step = 0x100, reg_off = 0x10;
+	int n;
+
+	if (!g2d)
+		return -ENODEV;
+
+	n = sscanf(buf, "%lx %lx %lx %lx", &start, &end, &step, &reg_off);
+	if (n < 1) {
+		start = 0x0;
+		end = min_t(unsigned long, (unsigned long)g2d->mmio_size, 0x1000UL);
+		step = 0x100;
+		reg_off = 0x10;
+	} else {
+		if (end == 0 || end > g2d->mmio_size)
+			end = g2d->mmio_size;
+		if (step == 0)
+			step = 0x100;
+		/* Limitar reg_off dentro de ventana */
+		if (reg_off >= 0x10000)
+			reg_off = 0x10;
+	}
+
+	/* Alinear */
+	start &= ~0xFUL; /* bancos típicos a múltiplos de 16/256 */
+	end &= ~0xFUL;
+
+	dev_info(g2d->dev, "id_scan: base=[0x%lx..0x%lx) step=0x%lx reg_off=0x%lx (mmio_size=0x%llx)\n",
+			 start, end, step, reg_off, (unsigned long long)g2d->mmio_size);
+
+	for (; start < end; start += step) {
+		u32 off = (u32)start + (u32)reg_off;
+		u32 val = 0;
+		if (off < g2d->mmio_size)
+			val = __g2d_readl(g2d->mmio, off);
+		dev_info(g2d->dev, "  base+0x%03lx -> [0x%03x] = 0x%08x\n",
+				 start, off, val);
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_WO(id_scan);
+
+/*
+ * cmdq_hunt: búsqueda heurística de CMDQ_CTL/STS/ADDR en el espacio MMIO
+ * Formato: "start end [stride] [max] [minscore]" (hex para start/end/stride)
+ * - No escribe nada, solo lee y puntúa tríos de registros plausibles.
+ */
+static bool is_boring_val(u32 v)
+{
+	/* Valores que aparecen espejados o como relleno en esta IP/SoC */
+	return v == 0x00000000 ||
+		   v == 0x40000010 ||
+		   v == 0x10400000 || /* patrón observado repetidamente en T113 */
+		   g2d_is_stub_value(v);
+}
+
+static int score_cmdq_triple(u32 ctl, u32 sts, u32 addr)
+{
+	int score = 0;
+	/* ctl y sts no deben ser "aburridos" */
+	if (!is_boring_val(ctl)) score += 2;
+	if (!is_boring_val(sts)) score += 2;
+	/* addr a menudo es 0 al inicio; si no es aburrido pero pequeño, sumar */
+	if (!is_boring_val(addr)) score += 1;
+	/* bits mutuamente excluyentes entre ctl y sts sugieren registros de estado/ctrl distintos */
+	if ((ctl & sts) == 0 && (ctl | sts) != 0) score += 2;
+	/* baja entropía resta (p. ej., todo 0xFFFFFFFF o patrón repetitivo) */
+	if (ctl == 0xFFFFFFFF || sts == 0xFFFFFFFF) score -= 1;
+	/* si los tres son iguales, probablemente sea relleno/espejo */
+	if (ctl == sts && sts == addr) score -= 3;
+	/* si ctl==sts pero distinto de addr, penaliza ligeramente */
+	if (ctl == sts && ctl != addr) score -= 1;
+	return score;
+}
+
+static ssize_t cmdq_hunt_store(struct device *dev,
+							   struct device_attribute *attr,
+							   const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long start = 0x0, end = 0x40000, stride = 4, max = 64, minscore = 3;
+	u32 off;
+	int n;
+
+	if (!g2d)
+		return -ENODEV;
+
+	n = sscanf(buf, "%lx %lx %lx %lu %lu", &start, &end, &stride, &max, &minscore);
+	if (n <= 0) {
+		start = 0x0; end = min_t(unsigned long, 0x40000UL, (unsigned long)g2d->mmio_size);
+		stride = 4; max = 64; minscore = 3;
+	}
+	if (start >= g2d->mmio_size) return -EINVAL;
+	if (end == 0 || end > g2d->mmio_size) end = g2d->mmio_size;
+	if (end <= start) return -EINVAL;
+	if (stride == 0 || (stride & 3)) stride = 4;
+
+	dev_info(g2d->dev, "cmdq_hunt: [0x%lx..0x%lx) stride=%lu max=%lu minscore=%lu\n",
+			 start, end, stride, max, minscore);
+
+	{
+		bool printed_any = false;
+		for (off = (u32)start; off + 8 < (u32)end; off += stride) {
+		u32 v0 = __g2d_readl(g2d->mmio, off + 0);
+		u32 v4 = __g2d_readl(g2d->mmio, off + 4);
+		u32 v8 = __g2d_readl(g2d->mmio, off + 8);
+			int s = score_cmdq_triple(v0, v4, v8);
+			/* bonifica alineación típica de ventanas de registro (16 bytes) */
+			if ((off & 0xF) == 0)
+				s += 1;
+			/* bonifica si la ADDR parece apuntar a la región CMA reservada */
+			if (in_cma_reserved_region(v8))
+				s += 2;
+			if (s >= (int)minscore) {
+				dev_info(g2d->dev, "CAND at +0x%03x: CTL=0x%08x STS=0x%08x ADDR=0x%08x score=%d\n",
+						 off, v0, v4, v8, s);
+				printed_any = true;
+				if (--max == 0) break;
+			}
+		}
+		if (!printed_any)
+			dev_info(g2d->dev, "cmdq_hunt: no candidates found\n");
+	}
+
+	return count;
+}
+
+DEVICE_ATTR_WO(cmdq_hunt);
+
+static DEVICE_ATTR_WO(top_touch);
+
+/* Minimal RCQ ping: one header writing MIXER_INT (enable FINISH IRQ) */
+static ssize_t rcq_ping_store(struct device *dev,
+							 struct device_attribute *attr,
+							 const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	void *virt = NULL;
+	dma_addr_t dma = 0;
+	union {
+		/* Up to 3 headers used in mode 14 (CLK/INT/CTL) */
+		struct g2d_rcq_head head[3];
+		u8 raw[64];
+	} *blk;
+	dma_addr_t data_dma;
+	u32 *data;
+	u32 target_reg;
+	u32 payload_val;
+	u32 len_field;
+	u32 head_count = 1; /* number of headers we actually prepare */
+
+	unsigned long mode = 1;
+
+	if (!g2d)
+		return -ENODEV;
+
+	/* Optional: allow passing a small integer to switch behavior */
+	if (buf && buf[0])
+		kstrtoul(buf, 0, &mode);
+
+	/* Modes:
+	 * 1: default - write MIXER_INT (enable FINISH IRQ), len=4 bytes, HEAD_LEN=1 header
+	 * 2: same as 1 but HEAD_LEN=16 (bytes) to probe semantics
+	 * 3: write RCQ_IRQ_CTL via RCQ (to avoid MIXER path), len=4 bytes
+	 * 4: same as 3 but dw0.len=1 (try words semantics) to probe len interpretation
+	 * 5: write RCQ_IRQ_CTL=0x00 via RCQ (observable change: clear)
+	 * 6: write RCQ_IRQ_CTL=0x51 via RCQ (observable change: restore)
+	 * 7: write RCQ_IRQ_CTL=0x00 via RCQ ONLY (no MMIO pre-writes)
+	 * 8: write RCQ_IRQ_CTL=0x51 via RCQ ONLY (no MMIO pre-writes)
+	* 9: like 8 but set HEAD_LEN=16 and header.dirty.n_header_len=16
+	* 10: like 8 but HEAD_LEN=1 and header.dirty.n_header_len=16
+	 * 12: HEAD_LEN in bytes = 16; dirty.next_len (bytes) = 0
+	 * 13: HEAD_LEN in bytes = 32; two headers chained (next_len=16 on first)
+	 * 14: 3 headers encadenados para MIXER (CLK, INT, CTL) [HEAD_LEN=3 enforced]
+	 * 15: 1 header para MIXER_CLK=1 únicamente (sin INT/CTL) [HEAD_LEN=1]
+	 */
+	switch (mode) {
+	case 3:
+	case 4:
+		target_reg = G2D_RCQ_IRQ_CTL;
+		payload_val = (G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN | G2D_RCQ_IRQ_CFG_FINISH_EN);
+		len_field = (mode == 4) ? 1 : 4;
+		break;
+	case 5:
+		target_reg = G2D_RCQ_IRQ_CTL;
+		payload_val = 0x0; /* clear */
+		len_field = 4;
+		break;
+	case 6:
+		target_reg = G2D_RCQ_IRQ_CTL;
+		payload_val = (G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN | G2D_RCQ_IRQ_CFG_FINISH_EN); /* restore */
+		len_field = 4;
+		break;
+	case 7:
+		target_reg = G2D_RCQ_IRQ_CTL;
+		payload_val = 0x0; /* clear, RCQ only */
+		len_field = 4;
+		break;
+	case 8:
+		target_reg = G2D_RCQ_IRQ_CTL;
+		payload_val = (G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN | G2D_RCQ_IRQ_CFG_FINISH_EN); /* restore, RCQ only */
+		len_field = 4;
+		break;
+	case 9:
+	case 10:
+		target_reg = G2D_RCQ_IRQ_CTL;
+		payload_val = (mode == 9) ?
+			(G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN | G2D_RCQ_IRQ_CFG_FINISH_EN) :
+			(G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN | G2D_RCQ_IRQ_CFG_FINISH_EN);
+		len_field = 4;
+		break;
+	case 1:
+	case 2:
+	default:
+		target_reg = G2D_MIXER_INT;
+		payload_val = G2D_MIXER_INT_FINISH_IRQ_EN;
+		len_field = 4;
+		break;
+	case 15:
+		/* Seguro: solo MIXER_CLK=1 */
+		target_reg = G2D_MIXER_CLK;
+		payload_val = 0x1;
+		len_field = 4;
+		break;
+	}
+
+	virt = dmam_alloc_coherent(g2d->dev, 128, &dma, GFP_KERNEL);
+	if (!virt)
+		return -ENOMEM;
+
+	blk = virt;
+	memset(blk, 0, 128);
+	data = (u32 *)((u8 *)virt + 32);
+	data[0] = payload_val; /* payload */
+	data_dma = dma + 32;
+
+	blk->head[0].low_addr = lower_32_bits(data_dma);
+	blk->head[0].dw0.bits.len = len_field; /* bytes */
+	blk->head[0].dw0.bits.high_addr = (u8)((data_dma >> 24) & 0xFF);   /* high byte of 32-bit DMA */
+	blk->head[0].dirty.bits.dirty = 1;
+	blk->head[0].dirty.bits.n_header_len = (mode == 9 || mode == 10) ? 16 : 0;
+	blk->head[0].reg_offset = g2d_rcq_reg_off(g2d, target_reg);
+
+	/* Guardia de seguridad: si vamos a tocar sub-bloques y TOP está abierto, aborta */
+	if (rcq_guard_top_open) {
+		bool targets_subblock = (blk->head[0].reg_offset >= G2D_MIXER);
+		if (mode == 14 || mode == 15 || targets_subblock) {
+			u32 sclk = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+			u32 hclk = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+			u32 ahb  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+			if ((sclk | hclk | ahb) != 0) {
+				dev_warn(g2d->dev, "rcq_ping: TOP gates open (SCLK=0x%08x HCLK=0x%08x AHB=0x%08x), blocking sub-block RCQ (mode=%lu). Set rcq_guard_top_open=0 to override.\n",
+						 sclk, hclk, ahb, mode);
+				dmam_free_coherent(g2d->dev, 128, virt, dma);
+				return -EPERM;
+			}
+		}
+	}
+
+	dev_info(g2d->dev, "rcq_ping: mode=%lu target_reg=0x%04x reg_off=0x%05x payload=0x%08x len_field=%u\n",
+			 mode, target_reg, g2d_rcq_reg_off(g2d, target_reg), payload_val, len_field);
+
+	__g2d_writel(g2d->mmio, (u32)dma, G2D_RCQ_HEAD_LOW);
+	__g2d_writel(g2d->mmio, upper_32_bits(dma), G2D_RCQ_HEAD_HIGH);
+	/* Additional header wiring for complex modes */
+	if (mode == 13) {
+		u32 *data2 = (u32 *)((u8 *)virt + 64);
+		dma_addr_t data2_dma = dma + 64;
+
+		data2[0] = payload_val;
+		blk->head[0].dirty.bits.n_header_len = 16;
+		blk->head[1].low_addr = lower_32_bits(data2_dma);
+		blk->head[1].dw0.bits.len = 4;
+		blk->head[1].dw0.bits.high_addr = (u8)((data2_dma >> 24) & 0xFF);
+		blk->head[1].dirty.bits.dirty = 1;
+		blk->head[1].dirty.bits.n_header_len = 0;
+		blk->head[1].reg_offset = g2d_rcq_reg_off(g2d, target_reg);
+		head_count = 2;
+	} else if (mode == 14) {
+		u32 *d1 = (u32 *)((u8 *)virt + 32);
+		u32 *d2 = (u32 *)((u8 *)virt + 64);
+		u32 *d3 = (u32 *)((u8 *)virt + 96);
+		dma_addr_t d1_dma = dma + 32;
+		dma_addr_t d2_dma = dma + 64;
+		dma_addr_t d3_dma = dma + 96;
+
+		d1[0] = 0x1;
+		d2[0] = G2D_MIXER_INT_FINISH_IRQ_EN;
+		d3[0] = g2d_mixer_start_mask();
+		blk->head[0].low_addr = lower_32_bits(d1_dma);
+		blk->head[0].dw0.bits.len = 4;
+		blk->head[0].dw0.bits.high_addr = (u8)((d1_dma >> 24) & 0xFF);
+		blk->head[0].dirty.bits.dirty = 1;
+		blk->head[0].dirty.bits.n_header_len = 16;
+		blk->head[0].reg_offset = g2d_rcq_reg_off(g2d, G2D_MIXER_CLK);
+		blk->head[1].low_addr = lower_32_bits(d2_dma);
+		blk->head[1].dw0.bits.len = 4;
+		blk->head[1].dw0.bits.high_addr = (u8)((d2_dma >> 24) & 0xFF);
+		blk->head[1].dirty.bits.dirty = 1;
+		blk->head[1].dirty.bits.n_header_len = 16;
+		blk->head[1].reg_offset = g2d_rcq_reg_off(g2d, G2D_MIXER_INT);
+		blk->head[2].low_addr = lower_32_bits(d3_dma);
+		blk->head[2].dw0.bits.len = 4;
+		blk->head[2].dw0.bits.high_addr = (u8)((d3_dma >> 24) & 0xFF);
+		blk->head[2].dirty.bits.dirty = 1;
+		blk->head[2].dirty.bits.n_header_len = 0;
+		blk->head[2].reg_offset = g2d_rcq_reg_off(g2d, G2D_MIXER_CTL);
+		head_count = 3;
+	} else {
+		head_count = 1;
+	}
+
+	/* HEAD_LEN normally carries the header count; bytes mode is experimental */
+	{
+		u32 head_len_bytes = head_count * sizeof(struct g2d_rcq_head);
+		u32 head_len_field = g2d_rcq_headlen_field(head_count, head_len_bytes);
+
+		if (!rcq_headlen_use_count)
+			dev_warn_once(g2d->dev, "rcq_ping: using experimental HEAD_LEN byte semantics (rcq_headlen_use_count=0)");
+
+		__g2d_writel(g2d->mmio, head_len_field, G2D_RCQ_HEAD_LEN);
+	}
+	/* Preconfiguración por MMIO (solo si no estamos en modos RCQ-only 7/8) */
+	if (mode != 7 && mode != 8 && mode != 9 && mode != 10) {
+		__g2d_writel(g2d->mmio, 0, G2D_RCQ_IRQ_CTL);
+		__g2d_writel(g2d->mmio, G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH, G2D_RCQ_STATUS);
+		__g2d_writel(g2d->mmio, G2D_RCQ_IRQ_SEL | G2D_RCQ_IRQ_TASK_END_EN | G2D_RCQ_IRQ_CFG_FINISH_EN, G2D_RCQ_IRQ_CTL);
+	} else {
+		/* En 7/8, solo limpiamos STATUS por MMIO para no falsear el efecto de RCQ */
+		__g2d_writel(g2d->mmio, G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH, G2D_RCQ_STATUS);
+	}
+	{
+		u32 rcq_ctrl_before = __g2d_readl(g2d->mmio, G2D_RCQ_CTRL);
+		/* Ensure header/len writes are visible before UPDATE */
+		wmb();
+	/* EN|UPDATE: algunos SoC requieren habilitar antes de actualizar */
+	__g2d_writel(g2d->mmio, G2D_RCQ_CTRL_EN, G2D_RCQ_CTRL);
+	wmb();
+	__g2d_writel(g2d->mmio, G2D_RCQ_CTRL_EN | G2D_RCQ_CTRL_UPDATE, G2D_RCQ_CTRL);
+		udelay(10);
+		dev_info(g2d->dev, "rcq_ping: RCQ_CTRL before=0x%08x after=0x%08x\n",
+				 rcq_ctrl_before, __g2d_readl(g2d->mmio, G2D_RCQ_CTRL));
+	}
+
+	/* short wait and report */
+	usleep_range(1000, 2000);
+	dev_info(g2d->dev, "rcq_ping: RCQ_STATUS=0x%08x IRQ_CTL=0x%08x CMDQ CTL=0x%08x STS=0x%08x ADDR=0x%08x",
+			 __g2d_readl(g2d->mmio, G2D_RCQ_STATUS),
+			 __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL),
+			 __g2d_readl(g2d->mmio, G2D_CMDQ_CTL),
+			 __g2d_readl(g2d->mmio, G2D_CMDQ_STS),
+			 __g2d_readl(g2d->mmio, G2D_CMDQ_ADDR));
+
+	if (mode == 3 || mode == 4 || mode == 7 || mode == 8 || mode == 9 || mode == 10) {
+		u32 rcq_irq_now = __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL);
+		dev_info(g2d->dev, "rcq_ping(mode=%lu): post RCQ_IRQ_CTL=0x%08x (expected write=0x%08x)",
+				 mode, rcq_irq_now, payload_val);
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_WO(rcq_ping);
+
+/* rcq_reset_safely: limpia de forma segura el RCQ (CTRL/HEAD/IRQ/STATUS)
+ * sin tocar sub-bloques. Opcionalmente, puede limpiar MIXER_INT pending.
+ * Formato: echo <mode> > rcq_reset_safely
+ *   mode=1: limpia RCQ_CTRL, HEAD_LOW/HIGH/LEN, IRQ_CTL=0, STATUS bits
+ *   mode=2: idem + limpia MIXER_INT pending
+ *   mode=3: idem + limpia/cauteriza CMDQ registers (ADDR=0, STS=ack, CTL=0)
+ */
+static ssize_t rcq_reset_safely_store(struct device *dev,
+									  struct device_attribute *attr,
+									  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long mode = 1;
+	u32 st_before, irq_before, ctl_before;
+
+	if (!g2d)
+		return -ENODEV;
+	if (buf && buf[0])
+		kstrtoul(buf, 0, &mode);
+
+	st_before  = __g2d_readl(g2d->mmio, G2D_RCQ_STATUS);
+	irq_before = __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL);
+	ctl_before = __g2d_readl(g2d->mmio, G2D_RCQ_CTRL);
+	dev_info(g2d->dev, "rcq_reset_safely: BEFORE CTRL=0x%08x IRQ=0x%08x ST=0x%08x\n",
+			 ctl_before, irq_before, st_before);
+
+	/* Paso 1: desactiva UPDATE */
+	__g2d_writel(g2d->mmio, 0x0, G2D_RCQ_CTRL);
+	/* Paso 2: deshabilita IRQ y limpia STATUS */
+	__g2d_writel(g2d->mmio, 0x0, G2D_RCQ_IRQ_CTL);
+	__g2d_writel(g2d->mmio, G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH,
+				 G2D_RCQ_STATUS);
+	/* Paso 3: borra HEAD ptr/len */
+	__g2d_writel(g2d->mmio, 0x0, G2D_RCQ_HEAD_LOW);
+	__g2d_writel(g2d->mmio, 0x0, G2D_RCQ_HEAD_HIGH);
+	__g2d_writel(g2d->mmio, 0x0, G2D_RCQ_HEAD_LEN);
+
+	if (mode >= 2) {
+		/* Limpia también MIXER_INT pending si estuviera latente */
+		u32 mi = 0;
+		/* lectura segura a través de helper (aplica sesgo/shift) */
+		mi = g2d_readl_dev(g2d, G2D_MIXER_INT);
+		if (mi & G2D_MIXER_INT_IRQ_PENDING)
+			g2d_writel_dev(g2d, G2D_MIXER_INT_IRQ_PENDING, G2D_MIXER_INT);
+	}
+
+	if (mode >= 3) {
+		/* Cauteriza CMDQ ventana si está mapeada: ACK STS, CTL=0, ADDR=0 */
+		if (G2D_CMDQ_STS < g2d->mmio_size)
+			__g2d_writel(g2d->mmio, 0x100, G2D_CMDQ_STS);
+		if (G2D_CMDQ_CTL < g2d->mmio_size)
+			__g2d_writel(g2d->mmio, 0x0, G2D_CMDQ_CTL);
+		if (G2D_CMDQ_ADDR < g2d->mmio_size)
+			__g2d_writel(g2d->mmio, 0x0, G2D_CMDQ_ADDR);
+	}
+
+	dev_info(g2d->dev, "rcq_reset_safely: AFTER  CTRL=0x%08x IRQ=0x%08x ST=0x%08x\n",
+			 __g2d_readl(g2d->mmio, G2D_RCQ_CTRL),
+			 __g2d_readl(g2d->mmio, G2D_RCQ_IRQ_CTL),
+			 __g2d_readl(g2d->mmio, G2D_RCQ_STATUS));
+	return count;
+}
+static DEVICE_ATTR_WO(rcq_reset_safely);
+/* Double-confirm attribute: write magic 0xA5A5 to validate the previously stored
+ * cmdq_addr and perform a pre-read of the RCQ header to ensure it looks sane.
+ */
+static ssize_t cmdq_validate_store(struct device *dev,
+								  struct device_attribute *attr,
+								  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+	phys_addr_t paddr;
+	void __iomem *v;
+	u32 low, dw0, dirty, reg_off;
+	size_t map_len = 32; /* read first header (16 bytes) */
+
+	if (!g2d)
+		return -ENODEV;
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	if (val != 0xA5A5) {
+		dev_warn(g2d->dev, "cmdq_validate: wrong magic (expected 0xA5A5)\n");
+		return -EINVAL;
+	}
+
+	if (!g2d->sysfs_cmdq_addr) {
+		dev_warn(g2d->dev, "cmdq_validate: no cmdq_addr set\n");
+		return -EINVAL;
+	}
+
+	if (!in_cma_reserved_region(g2d->sysfs_cmdq_addr)) {
+		dev_warn(g2d->dev, "cmdq_validate: cmdq_addr 0x%08x not inside CMA reserved region\n",
+				 g2d->sysfs_cmdq_addr);
+		return -EINVAL;
+	}
+
+	paddr = (phys_addr_t)g2d->sysfs_cmdq_addr;
+
+	/* Map physical memory to kernel virtual to inspect header safely */
+	v = memremap(paddr, map_len, MEMREMAP_WB);
+	if (!v) {
+		dev_err(g2d->dev, "cmdq_validate: memremap failed for 0x%08x\n", g2d->sysfs_cmdq_addr);
+		return -ENOMEM;
+	}
+
+	/* Read fields as u32s (RCQ header layout) */
+	low = readl(v + 0);
+	dw0 = readl(v + 4);
+	dirty = readl(v + 8);
+	reg_off = readl(v + 12);
+
+	/* Unmap after read */
+	memunmap(v);
+
+	/* Basic sanity checks */
+	if ((dw0 & G2D_RCQ_LEN_MASK24) == 0) {
+		dev_warn(g2d->dev, "cmdq_validate: header length zero (dw0=0x%08x)\n", dw0);
+		return -EINVAL;
+	}
+
+	if (!(dirty & G2D_RCQ_DIRTY_BIT)) {
+		dev_warn(g2d->dev, "cmdq_validate: header dirty bit not set (dirty=0x%08x)\n", dirty);
+		return -EINVAL;
+	}
+
+	/* Ensure reg_offset lies within mapped G2D MMIO to avoid invalid pointers */
+	if (reg_off >= (u32)g2d->mmio_size) {
+		dev_warn(g2d->dev, "cmdq_validate: header reg_offset 0x%08x outside MMIO range (size=0x%llx)\n",
+				 reg_off, (unsigned long long)g2d->mmio_size);
+		return -EINVAL;
+	}
+
+	/* All checks passed: mark validated */
+	g2d->sysfs_addr_valid = true;
+	dev_info(g2d->dev, "cmdq_validate: validated cmdq_addr=0x%08x low=0x%08x dw0=0x%08x dirty=0x%08x reg_off=0x%08x\n",
+			 g2d->sysfs_cmdq_addr, low, dw0, dirty, reg_off);
+
+	return count;
+}
+
+static DEVICE_ATTR_WO(cmdq_validate);
+
+/* Sysfs trigger to run the BSP-style RCQ fillrect test on demand */
+static ssize_t rcq_fillrect_store(struct device *dev,
+								 struct device_attribute *attr,
+								 const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+
+	if (!g2d)
+		return -ENODEV;
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	if (val == 0)
+		return count;
+
+	dev_info(g2d->dev, "rcq_fillrect: requested by sysfs\n");
+	g2d_hw_fillrect_rcq(pdev, g2d);
+	return count;
+}
+
+static DEVICE_ATTR_WO(rcq_fillrect);
+
+/* RCQ_CTRL raw access (experimentos: EN/UPDATE combinaciones) */
+static ssize_t rcq_ctrl_raw_show(struct device *dev,
+								 struct device_attribute *attr, char *buf)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	u32 v = g2d ? __g2d_readl(g2d->mmio, G2D_RCQ_CTRL) : 0;
+	return scnprintf(buf, PAGE_SIZE, "0x%08x\n", v);
+}
+
+static ssize_t rcq_ctrl_raw_store(struct device *dev,
+								  struct device_attribute *attr,
+								  const char *buf, size_t count)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
+	unsigned long val;
+	u32 before, after;
+	if (!g2d)
+		return -ENODEV;
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+	before = __g2d_readl(g2d->mmio, G2D_RCQ_CTRL);
+	__g2d_writel(g2d->mmio, (u32)val, G2D_RCQ_CTRL);
+	udelay(1);
+	after = __g2d_readl(g2d->mmio, G2D_RCQ_CTRL);
+	dev_info(g2d->dev, "rcq_ctrl_raw: 0x%08x -> 0x%08x\n", before, after);
+	return count;
+}
+
+static DEVICE_ATTR(rcq_ctrl_raw, 0644, rcq_ctrl_raw_show, rcq_ctrl_raw_store);
 
 static void g2d_rcq_probe_window(struct platform_device *pdev,
 				 struct sunxi_g2d_dev *g2d)
@@ -1261,24 +2861,31 @@ static void g2d_device_run(void *priv)
 				dev_dbg(g2d->dev, "device_run: HW path skipped (WB regs out of mapped range: size=0x%llx)\n",
 					(unsigned long long)g2d->mmio_size);
 		} else {
-			/* ==== PROGRAMAR G2D (conservador, v2) ==== */
-			/* Selección de formato HW (FBFMT) en bits [13:8] según formato V4L2 */
+			/* ==== PROGRAMAR G2D - PROVEN SEQUENCE FROM v1.0.0 ==== */
+			/* This sequence is CRITICAL - tested and working in fillrect driver */
+			
+			/* Get format info */
 			const struct sunxi_g2d_fmt *fmt_out = find_fmt(ctx->out_fmt.pixelformat);
 			const struct sunxi_g2d_fmt *fmt_cap = find_fmt(ctx->cap_fmt.pixelformat);
-			u32 v0_att = V0_ATTCTL_EN;
-			u32 wb_att = WB_ATT_EN;
-			if (fmt_out)
-				v0_att |= ((u32)fmt_out->hw_fmt_id << V0_ATTCTL_FMT_SHIFT);
-			if (fmt_cap)
-				wb_att |= ((u32)fmt_cap->hw_fmt_id << WB_ATT_FMT_SHIFT);
-			/* Fuente V0 */
+			u32 v0_fmt = fmt_out ? fmt_out->hw_fmt_id : 0x04; /* Default XRGB8888 */
+			u32 wb_fmt = fmt_cap ? fmt_cap->hw_fmt_id : 0x04;
+			u32 size_word = ((src_w - 1) & 0xFFFF) | (((src_h - 1) & 0xFFFF) << 16);
+			u32 dst_size_word = ((dst_w - 1) & 0xFFFF) | (((dst_h - 1) & 0xFFFF) << 16);
+			
+			/* 1. Reset G2D - CRITICAL: ensures clean state */
+			__g2d_writel(g2d->mmio, 0x0, G2D_AHB_RESET);  /* Assert reset */
+			__g2d_writel(g2d->mmio, 0x3, G2D_AHB_RESET);  /* De-assert reset */
+			wmb();
+			
+			/* 2. V0 Layer Setup (source) */
 			g2d_writel_dev(g2d, lower_32_bits(src_dma), V0_LADD0);
-			/* Bits altos (8b) de la dirección para cada plano; usamos sólo plano 0 */
 			g2d_writel_dev(g2d, (u32)((src_dma >> 24) & 0xFF), V0_HADD);
 			g2d_writel_dev(g2d, src_pitch, V0_PITCH0);
-			g2d_writel_dev(g2d, (src_w - 1) | ((src_h - 1) << 16), V0_MBSIZE);
-			g2d_writel_dev(g2d, 0, V0_COOR);
-			g2d_writel_dev(g2d, v0_att, V0_ATTCTL);
+			g2d_writel_dev(g2d, size_word, V0_MBSIZE);  /* Macroblock size */
+			g2d_writel_dev(g2d, size_word, V0_SIZE);    /* Layer size */
+			g2d_writel_dev(g2d, 0, V0_COOR);           /* Position (0,0) */
+			/* V0_ATTCTL: EN=1, format, no fillcolor for blit */
+			g2d_writel_dev(g2d, V0_ATTCTL_EN | (v0_fmt << V0_ATTCTL_FMT_SHIFT), V0_ATTCTL);
 		dev_dbg(g2d->dev, "V0: ATT=0x%08x LADD0=0x%08x HADD=0x%08x PITCH0=0x%08x MBSIZE=0x%08x\n",
 			g2d_readl_dev(g2d, V0_ATTCTL),
 			g2d_readl_dev(g2d, V0_LADD0),
@@ -1286,37 +2893,68 @@ static void g2d_device_run(void *priv)
 			g2d_readl_dev(g2d, V0_PITCH0),
 			g2d_readl_dev(g2d, V0_MBSIZE));
 
-			/* Destino WB */
+			/* 3. BLD (Blender) Setup - CRITICAL SIZING! */
+			/* These registers control how many pixels BLD processes */
+			u32 bld_en = g2d_readl_dev(g2d, BLD_EN_CTL);
+			bld_en |= BLD_PIPE0_EN;  /* Enable pipe 0 (bit 8) */
+			g2d_writel_dev(g2d, bld_en, BLD_EN_CTL);  /* RMW as BSP does */
+			
+			g2d_writel_dev(g2d, 0x0, BLD_PREMUL_CTL);  /* No premultiply alpha */
+			g2d_writel_dev(g2d, size_word, BLD_CH_ISIZE0);  /* Channel 0 input size */
+			g2d_writel_dev(g2d, 0x0, BLD_CH_OFFSET0);       /* Channel 0 offset */
+			g2d_writel_dev(g2d, dst_size_word, BLD_OUT_SIZE); /* Output size - CRITICAL */
+			
+			/* BLD_OUT_COLOR: RGB color space (clear bit 1 for RGB, not YUV) */
+			u32 bld_out_color = g2d_readl_dev(g2d, BLD_OUT_COLOR);
+			bld_out_color &= ~BIT(1);  /* Clear bit 1 for RGB mode */
+			g2d_writel_dev(g2d, bld_out_color, BLD_OUT_COLOR);
+			
+			g2d_writel_dev(g2d, 0x0, BLD_CTL);  /* Mode 0: direct copy */
+		dev_dbg(g2d->dev, "BLD: EN_CTL=0x%08x PREMUL=0x%08x CH0_ISIZE=0x%08x OUT_SIZE=0x%08x CTL=0x%08x\n",
+			g2d_readl_dev(g2d, BLD_EN_CTL),
+			g2d_readl_dev(g2d, BLD_PREMUL_CTL),
+			g2d_readl_dev(g2d, BLD_CH_ISIZE0),
+			g2d_readl_dev(g2d, BLD_OUT_SIZE),
+			g2d_readl_dev(g2d, BLD_CTL));
+
+			/* 4. ROP Setup - pass-through mode */
+			g2d_writel_dev(g2d, 0xF0, ROP_CTL);      /* SRC pass-through */
+			g2d_writel_dev(g2d, 0x61080, ROP_INDEX0); /* COPYPEN for pipe 0 */
+		dev_dbg(g2d->dev, "ROP: CTL=0x%08x INDEX0=0x%08x\n",
+			g2d_readl_dev(g2d, ROP_CTL),
+			g2d_readl_dev(g2d, ROP_INDEX0));
+
+			/* 5. WB (Writeback) Setup - destination */
 			g2d_writel_dev(g2d, lower_32_bits(dst_dma), WB_LADD0);
 			g2d_writel_dev(g2d, (u32)((dst_dma >> 24) & 0xFF), WB_HADD0);
 			g2d_writel_dev(g2d, dst_pitch, WB_PITCH0);
-			g2d_writel_dev(g2d, (dst_w - 1) | ((dst_h - 1) << 16), WB_SIZE);
-			g2d_writel_dev(g2d, wb_att, WB_ATT);
-		dev_dbg(g2d->dev, "WB: ATT=0x%08x LADD0=0x%08x HADD0=0x%08x PITCH0=0x%08x SIZE=0x%08x\n",
+			g2d_writel_dev(g2d, dst_size_word, WB_SIZE);
+			
+			/* CRITICAL: BSP writes BLD_SIZE here, AFTER WB config, not with BLD setup */
+			g2d_writel_dev(g2d, dst_size_word, BLD_SIZE);
+			
+			g2d_writel_dev(g2d, wb_fmt << WB_ATT_FMT_SHIFT, WB_ATT);  /* Format only, no EN bit */
+		dev_dbg(g2d->dev, "WB: ATT=0x%08x LADD0=0x%08x HADD0=0x%08x PITCH0=0x%08x SIZE=0x%08x BLD_SIZE=0x%08x\n",
 			g2d_readl_dev(g2d, WB_ATT),
 			g2d_readl_dev(g2d, WB_LADD0),
 			g2d_readl_dev(g2d, WB_HADD0),
 			g2d_readl_dev(g2d, WB_PITCH0),
-			g2d_readl_dev(g2d, WB_SIZE));
+			g2d_readl_dev(g2d, WB_SIZE),
+			g2d_readl_dev(g2d, BLD_SIZE));
+			wmb();  /* Ensure all writes reach hardware */
 
-			/* BLD: ruta mínima V0 -> salida (WB) */
-			g2d_writel_dev(g2d, (dst_w - 1) | ((dst_h - 1) << 16), BLD_OUT_SIZE);
-			g2d_writel_dev(g2d, (src_w - 1) | ((src_h - 1) << 16), BLD_CH_ISIZE0);
-			/* habilitar PIPE0 */
-			g2d_writel_dev(g2d, BLD_PIPE0_EN, BLD_EN_CTL);
-		dev_dbg(g2d->dev, "BLD: EN_CTL=0x%08x OUT_SIZE=0x%08x CH0_ISIZE=0x%08x\n",
-			g2d_readl_dev(g2d, BLD_EN_CTL),
-			g2d_readl_dev(g2d, BLD_OUT_SIZE),
-			g2d_readl_dev(g2d, BLD_CH_ISIZE0));
+			/* 6. MIXER Control - Clear and enable IRQ */
+			g2d_writel_dev(g2d, 0x0, G2D_MIXER_INT);  /* IRQ off */
+			g2d_writel_dev(g2d, 0x0, G2D_MIXER_CTL);  /* START=0 */
+			wmb();
+			
+			/* Clear pending IRQ first - critical before enable */
+			g2d_writel_dev(g2d, G2D_MIXER_INT_IRQ_PENDING | G2D_MIXER_INT_FINISH_IRQ_EN, G2D_MIXER_INT);
+			wmb();
 
-			/* Nota: ya no hacemos fallback inmediato por lecturas iguales; esperamos al timeout */
-
-			/* IRQ de MIXER: limpia pending y habilita */
-			g2d_writel_dev(g2d, G2D_MIXER_INT_IRQ_PENDING, G2D_MIXER_INT);
-			g2d_writel_dev(g2d, G2D_MIXER_INT_FINISH_IRQ_EN, G2D_MIXER_INT);
-
-			/* START (bit 31 en T113) */
-			g2d_writel_dev(g2d, G2D_MIXER_CTL_START, G2D_MIXER_CTL);
+			/* 7. START - use READ-MODIFY-WRITE as BSP does */
+			u32 mixer_ctl = g2d_readl_dev(g2d, G2D_MIXER_CTL);
+			g2d_writel_dev(g2d, mixer_ctl | G2D_MIXER_CTL_START, G2D_MIXER_CTL);
 
 			/* Timeout de seguridad */
 			schedule_delayed_work(&ctx->timeout_work, msecs_to_jiffies(50));
@@ -1361,13 +2999,35 @@ static irqreturn_t g2d_irq(int irq, void *data)
 	unsigned long flags;
 	struct sunxi_g2d_ctx *ctx;
 	u32 st;
+	u32 rcq_status;
+	bool handled = false;
+
+	// BSP: Check RCQ status first (g2d_top_rcq_task_irq_query)
+	rcq_status = __g2d_readl(g2d->mmio, G2D_RCQ_STATUS);
+	if (rcq_status & G2D_RCQ_STATUS_TASK_END) {
+		/* Clear RCQ task_end_irq by writing back */
+		__g2d_writel(g2d->mmio, G2D_RCQ_STATUS_TASK_END, G2D_RCQ_STATUS);
+		dev_dbg(g2d->dev, "irq: RCQ_STATUS=0x%08x (task_end cleared)\n", rcq_status);
+		handled = true;
+		
+		/* BSP: After RCQ task completes, reset mixer */
+		/* g2d_top_mixer_reset() - pulse mixer AHB reset */
+		u32 ahb = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+		__g2d_writel(g2d->mmio, ahb & ~G2D_AHB_MIXER_RESET, G2D_AHB_RESET);
+		udelay(1);
+		__g2d_writel(g2d->mmio, ahb | G2D_AHB_MIXER_RESET, G2D_AHB_RESET);
+	}
 
 	// Lee y limpia IRQ del MIXER (v2: write-back para clear)
 	st = g2d_readl_dev(g2d, G2D_MIXER_INT);
-	if (!(st & G2D_MIXER_INT_IRQ_PENDING))
+	if (st & G2D_MIXER_INT_IRQ_PENDING) {
+		g2d_writel_dev(g2d, st, G2D_MIXER_INT);
+		dev_dbg(g2d->dev, "irq: MIXER_INT=0x%08x cleared, finishing job\n", st);
+		handled = true;
+	}
+	
+	if (!handled)
 		return IRQ_NONE;
-	g2d_writel_dev(g2d, st, G2D_MIXER_INT);
-	dev_dbg(g2d->dev, "irq: MIXER_INT=0x%08x cleared, finishing job\n", st);
 
 	// Finaliza el job en curso si hay
 	spin_lock_irqsave(&g2d->irqlock, flags);
@@ -1468,6 +3128,9 @@ static void g2d_job_abort(void *priv)
 	if (g2d->curr_ctx == ctx)
 		g2d->curr_ctx = NULL;
 	spin_unlock_irqrestore(&g2d->irqlock, flags);
+
+	/* Notifica al framework que el trabajo ha terminado/abortado */
+	v4l2_m2m_job_finish(g2d->m2m_dev, ctx->fh.m2m_ctx);
 }
 
 static const struct v4l2_m2m_ops g2d_m2m_ops_full = {
@@ -1482,7 +3145,7 @@ static int g2d_queue_init(void *priv, struct vb2_queue *out, struct vb2_queue *c
 
 	memset(out, 0, sizeof(*out));
 	out->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	out->io_modes = VB2_MMAP;
+	out->io_modes = VB2_MMAP | VB2_DMABUF;
 	out->drv_priv = ctx;
 	out->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
 	out->ops = &qbuf_qops;
@@ -1518,36 +3181,44 @@ static int g2d_querycap(struct file *filp, void *priv, struct v4l2_capability *c
 }
 static int g2d_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index >= ARRAY_SIZE(g_formats))
+	/* MVP: solo XR24 */
+	if (f->index)
 		return -EINVAL;
-	f->pixelformat = g_formats[f->index].fourcc;
-	strscpy(f->description, "32-bit RGBX", sizeof(f->description));
+	f->pixelformat = V4L2_PIX_FMT_XRGB32;
+	strscpy(f->description, "XRGB8888", sizeof(f->description));
 	return 0;
 }
 
 static int g2d_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index >= ARRAY_SIZE(g_formats))
+	/* MVP: solo XR24 */
+	if (f->index)
 		return -EINVAL;
-	f->pixelformat = g_formats[f->index].fourcc;
-	strscpy(f->description, "32-bit RGBX", sizeof(f->description));
+	f->pixelformat = V4L2_PIX_FMT_XRGB32;
+	strscpy(f->description, "XRGB8888", sizeof(f->description));
 	return 0;
 }
 static int g2d_try_fmt(struct file *filp, void *priv, struct v4l2_format *f)
 {
-	const struct sunxi_g2d_fmt *fmt = find_fmt(f->fmt.pix.pixelformat);
-	if (!fmt)
-		fmt = &g_formats[0];
-	f->fmt.pix.pixelformat = fmt->fourcc;
+	struct v4l2_pix_format *pix = &f->fmt.pix;
+	const u32 fourcc = V4L2_PIX_FMT_XRGB32;
+	const u32 bpp = 4;
+	u32 w = pix->width ? pix->width : 16;
+	u32 h = pix->height ? pix->height : 16;
 
-	// clamp tamaños
-	if (!f->fmt.pix.width)  f->fmt.pix.width  = 16;
-	if (!f->fmt.pix.height) f->fmt.pix.height = 16;
+	w = clamp(w, 16U, 8192U);
+	h = clamp(h, 16U, 8192U);
 
-	// bytes por línea e imagen
-	f->fmt.pix.bytesperline = (f->fmt.pix.width * (fmt->depth / 8));
-	f->fmt.pix.sizeimage = f->fmt.pix.bytesperline * f->fmt.pix.height;
-	f->fmt.pix.field = V4L2_FIELD_NONE;
+	pix->pixelformat = fourcc;
+	pix->field = V4L2_FIELD_NONE;
+	pix->colorspace = V4L2_COLORSPACE_SRGB;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+	pix->width = w;
+	pix->height = h;
+	pix->bytesperline = w * bpp;
+	pix->sizeimage = pix->bytesperline * h;
 	return 0;
 }
 
@@ -1580,6 +3251,8 @@ static int g2d_s_fmt_cap(struct file *filp, void *priv, struct v4l2_format *f)
 	int ret = g2d_try_fmt(filp, priv, f);
 	if (ret) return ret;
 	ctx->cap_fmt = f->fmt.pix;
+	ctx->needs_scale = (ctx->out_fmt.width  != ctx->cap_fmt.width) ||
+					   (ctx->out_fmt.height != ctx->cap_fmt.height);
 	return 0;
 }
 
@@ -1860,6 +3533,13 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	int ret = pm_runtime_resume_and_get(&pdev->dev);
 	if (ret < 0)
 		dev_warn(&pdev->dev, "pm_runtime get failed: %d (continuing)\n", ret);
+
+	/* Configura máscara DMA coherente 32-bit para direcciones de RCQ/WB */
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(&pdev->dev, "failed to set 32-bit DMA mask: %d\n", ret);
+		return ret;
+	}
 	struct sunxi_g2d_dev *g2d;
 	struct resource *res;
 
@@ -1886,6 +3566,7 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 
 	g2d->use_rcq = variant->use_rcq;
 	g2d->bias_subblocks = variant->bias_subblocks;
+	dev_info(&pdev->dev, "G2D Driver Version: " DRV_VERSION "\n");
 	dev_info(&pdev->dev, "Variant: use_rcq=%d bias_subblocks=0x%05x\n",
 		 g2d->use_rcq, g2d->bias_subblocks);
 
@@ -2044,6 +3725,65 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 		/* Check if RCQ subsystem is alive after BGR/CLK configuration */
 		dev_info(&pdev->dev, "RCQ_STATUS after BGR/CLK init: 0x%08x\n",
 			 __g2d_readl(g2d->mmio, G2D_RCQ_STATUS));
+
+		/* SELF-TEST: ensure TOP gates are open on boards where U-Boot/BSP may not
+		 * have enabled them. Only perform this when explicitly requested via
+		 * module param `self_test` to avoid side-effects on normal systems.
+		 */
+		if (self_test) {
+			u32 sclk = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+			u32 hclk = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+			u32 ahb  = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+			dev_info(&pdev->dev, "self_test: TOP before: SCLK=0x%08x HCLK=0x%08x AHB_RESET=0x%08x\n",
+				 sclk, hclk, ahb);
+
+			/* If any of the TOP gates look closed (zero), optionally try to open them
+			 * but only when `self_test_write` is explicitly enabled. This prevents
+			 * accidental writes that pueden colgar la placa si no hay consola serial.
+			 */
+			if (sclk == 0 || hclk == 0 || ahb == 0) {
+				/* Safety: do NOT perform TOP writes during probe unless the caller
+				 * explicitly enables three parameters to indicate conscious intent
+				 * to risk hardware state changes: self_test_write + cmdq_start + rcq_kick.
+				 * This prevents accidental hangs when only `self_test=1` is passed.
+				 */
+				if (!self_test_write || !cmdq_start || !rcq_kick || confirm_probe_top_magic != 0xA5A5) {
+					dev_info(&pdev->dev,
+							 "self_test: TOP writes suppressed (require self_test_write=1 cmdq_start=1 rcq_kick=1 and confirm_probe_top_magic=0xA5A5)\n");
+				} else {
+						/* Conservative writes: set only MIXER+ROT bits (0x3) and verify
+						 * after each write. This is much safer than writing G2D_SCLK_GATE_ALL
+						 * which previously caused hangs on some boards.
+						 */
+						u32 want = 0x3;
+						dev_info(&pdev->dev, "self_test: performing staged TOP gate writes (value=0x%08x)\n", want);
+
+						dev_info(&pdev->dev, "self_test: write SCLK=0x%08x -> off=0x%03x\n", want, G2D_SCLK_GATE);
+						__g2d_writel(g2d->mmio, want, G2D_SCLK_GATE);
+						udelay(50);
+						sclk = __g2d_readl(g2d->mmio, G2D_SCLK_GATE);
+						dev_info(&pdev->dev, "self_test: SCLK readback=0x%08x\n", sclk);
+						if (sclk != want) {
+							dev_warn(&pdev->dev, "self_test: SCLK write did not stick (readback 0x%08x) - aborting further TOP writes\n", sclk);
+						} else {
+							dev_info(&pdev->dev, "self_test: write HCLK=0x%08x -> off=0x%03x\n", want, G2D_HCLK_GATE);
+							__g2d_writel(g2d->mmio, want, G2D_HCLK_GATE);
+							udelay(50);
+							hclk = __g2d_readl(g2d->mmio, G2D_HCLK_GATE);
+							dev_info(&pdev->dev, "self_test: HCLK readback=0x%08x\n", hclk);
+							if (hclk != want) {
+								dev_warn(&pdev->dev, "self_test: HCLK write did not stick (readback 0x%08x)\n", hclk);
+							}
+
+							dev_info(&pdev->dev, "self_test: de-assert AHB reset (value=0x%08x) -> off=0x%03x\n", want, G2D_AHB_RESET);
+							__g2d_writel(g2d->mmio, want, G2D_AHB_RESET);
+							udelay(50);
+							ahb = __g2d_readl(g2d->mmio, G2D_AHB_RESET);
+							dev_info(&pdev->dev, "self_test: AHB readback=0x%08x\n", ahb);
+						}
+				}
+			}
+		}
 		
 	} else {
 		/* Legacy mode: Use TOP gates (SCLK_GATE, HCLK_GATE, AHB_RESET) */
@@ -2071,12 +3811,6 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	}
 	
 	/* ============================================================================ */
-
-	/* Layout estándar sin bias */
-	g2d->reg_shift = 0;
-	g2d->bias_subblocks = 0;
-	g2d->bias_mixer = g2d->bias_bld = g2d->bias_v0 = g2d->bias_wb = 0;
-	dev_info(&pdev->dev, "Standard G2D v2 layout: MIXER@0x100 V0@0x800 BLD@0x400 WB@0x3000\n");
 
 	/* Habilita la IRQ de FINISH del MIXER y limpia pending (W1C) */
 	g2d_writel_dev(g2d, G2D_MIXER_INT_FINISH_IRQ_EN, G2D_MIXER_INT);
@@ -2196,6 +3930,51 @@ skip_ccu_dump:
 		 g2d->vfd.minor);
 
     platform_set_drvdata(pdev, g2d);
+    /* Create safe sysfs attributes for CMDQ/RCQ control and diagnostics */
+    if (device_create_file(&pdev->dev, &dev_attr_cmdq_addr))
+	    dev_warn(&pdev->dev, "failed to create sysfs cmdq_addr\n");
+    if (device_create_file(&pdev->dev, &dev_attr_cmdq_start))
+	    dev_warn(&pdev->dev, "failed to create sysfs cmdq_start\n");
+    if (device_create_file(&pdev->dev, &dev_attr_cmdq_validate))
+	    dev_warn(&pdev->dev, "failed to create sysfs cmdq_validate\n");
+    if (device_create_file(&pdev->dev, &dev_attr_rcq_fillrect))
+	    dev_warn(&pdev->dev, "failed to create sysfs rcq_fillrect\n");
+    if (device_create_file(&pdev->dev, &dev_attr_rcq_ping))
+	    dev_warn(&pdev->dev, "failed to create sysfs rcq_ping\n");
+    if (device_create_file(&pdev->dev, &dev_attr_top_touch))
+	    dev_warn(&pdev->dev, "failed to create sysfs top_touch\n");
+    if (device_create_file(&pdev->dev, &dev_attr_top_dump))
+	    dev_warn(&pdev->dev, "failed to create sysfs top_dump\n");
+    if (device_create_file(&pdev->dev, &dev_attr_cmdq_dump))
+	    dev_warn(&pdev->dev, "failed to create sysfs cmdq_dump\n");
+	/* Defensive: remove any stale sysfs files before (re)creating */
+	device_remove_file(&pdev->dev, &dev_attr_top_scan);
+	if (device_create_file(&pdev->dev, &dev_attr_top_scan))
+	    dev_warn(&pdev->dev, "failed to create sysfs top_scan\n");
+	if (device_create_file(&pdev->dev, &dev_attr_ccu_dump_g2d))
+	    dev_warn(&pdev->dev, "failed to create sysfs ccu_dump_g2d\n");
+	device_remove_file(&pdev->dev, &dev_attr_top_gate_min);
+	if (device_create_file(&pdev->dev, &dev_attr_top_gate_min))
+		dev_warn(&pdev->dev, "failed to create sysfs top_gate_min\n");
+	device_remove_file(&pdev->dev, &dev_attr_cmdq_hunt);
+	if (device_create_file(&pdev->dev, &dev_attr_cmdq_hunt))
+	    dev_warn(&pdev->dev, "failed to create sysfs cmdq_hunt\n");
+	if (device_create_file(&pdev->dev, &dev_attr_ccu_reset_cycle))
+	    dev_warn(&pdev->dev, "failed to create sysfs ccu_reset_cycle\n");
+	if (device_create_file(&pdev->dev, &dev_attr_id_scan))
+	    dev_warn(&pdev->dev, "failed to create sysfs id_scan\n");
+	if (device_create_file(&pdev->dev, &dev_attr_rcq_ctrl_raw))
+	    dev_warn(&pdev->dev, "failed to create sysfs rcq_ctrl_raw\n");
+	if (device_create_file(&pdev->dev, &dev_attr_top_open_safe))
+	    dev_warn(&pdev->dev, "failed to create sysfs top_open_safe\n");
+	if (device_create_file(&pdev->dev, &dev_attr_top_close_safe))
+	    dev_warn(&pdev->dev, "failed to create sysfs top_close_safe\n");
+	if (device_create_file(&pdev->dev, &dev_attr_rcq_reset_safely))
+	    dev_warn(&pdev->dev, "failed to create sysfs rcq_reset_safely\n");
+	if (device_create_file(&pdev->dev, &dev_attr_cmdq_pulse_now))
+	    dev_warn(&pdev->dev, "failed to create sysfs cmdq_pulse_now\n");
+	if (device_create_file(&pdev->dev, &dev_attr_rcq_ctrl_explore))
+	    dev_warn(&pdev->dev, "failed to create sysfs rcq_ctrl_explore\n");
 
 	return 0;
 
@@ -2214,7 +3993,7 @@ err_clk:
 	if (!IS_ERR_OR_NULL(g2d->clk_mbus))
 		clk_disable_unprepare(g2d->clk_mbus);
 	return ret;
-}
+	}
 
 static void sunxi_g2d_remove(struct platform_device *pdev)
 {
@@ -2227,6 +4006,28 @@ static void sunxi_g2d_remove(struct platform_device *pdev)
 	/* T113: Unmap CCU if it was mapped */
 	if (g2d->ccu)
 		iounmap(g2d->ccu);
+
+	/* Remove sysfs attrs */
+	device_remove_file(&pdev->dev, &dev_attr_cmdq_addr);
+	device_remove_file(&pdev->dev, &dev_attr_cmdq_start);
+	device_remove_file(&pdev->dev, &dev_attr_cmdq_validate);
+	device_remove_file(&pdev->dev, &dev_attr_rcq_fillrect);
+	device_remove_file(&pdev->dev, &dev_attr_rcq_ping);
+	device_remove_file(&pdev->dev, &dev_attr_top_touch);
+	device_remove_file(&pdev->dev, &dev_attr_top_dump);
+	device_remove_file(&pdev->dev, &dev_attr_cmdq_dump);
+	device_remove_file(&pdev->dev, &dev_attr_top_scan);
+	device_remove_file(&pdev->dev, &dev_attr_ccu_dump_g2d);
+	device_remove_file(&pdev->dev, &dev_attr_top_gate_min);
+	device_remove_file(&pdev->dev, &dev_attr_cmdq_hunt);
+	device_remove_file(&pdev->dev, &dev_attr_ccu_reset_cycle);
+	device_remove_file(&pdev->dev, &dev_attr_id_scan);
+	device_remove_file(&pdev->dev, &dev_attr_rcq_ctrl_raw);
+	device_remove_file(&pdev->dev, &dev_attr_top_open_safe);
+	device_remove_file(&pdev->dev, &dev_attr_top_close_safe);
+	device_remove_file(&pdev->dev, &dev_attr_rcq_reset_safely);
+	device_remove_file(&pdev->dev, &dev_attr_cmdq_pulse_now);
+	device_remove_file(&pdev->dev, &dev_attr_rcq_ctrl_explore);
 	
 	if (!IS_ERR(g2d->rst))
 		reset_control_assert(g2d->rst);
@@ -2239,6 +4040,7 @@ static void sunxi_g2d_remove(struct platform_device *pdev)
 	pm_runtime_put_sync(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 }
+
 
 static struct platform_driver sunxi_g2d_driver = {
 	.probe  = sunxi_g2d_probe,
