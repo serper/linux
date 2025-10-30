@@ -364,28 +364,26 @@ int g2d_fillrect_display(struct drm_display *disp,
 	struct g2d_fillrect fill = {0};
 	int dmabuf_fd;
 	int ret;
+	int backbuffer_y_offset;
 	
 	/* Export DRM buffer as DMA-BUF */
 	dmabuf_fd = drm_export_dmabuf(disp);
 	if (dmabuf_fd < 0)
 		return -1;
 	
-	/* Configure fillrect operation on backbuffer */
+	/* Calculate Y offset for current backbuffer page (in lines) */
+	backbuffer_y_offset = drm_get_backbuffer_offset(disp) / disp->pitch;
+	
+	/* Configure fillrect operation on full buffer */
 	fill.dst.width = disp->width;
 	fill.dst.height = disp->height * 2;  /* Full buffer height */
 	fill.dst.format = G2D_FMT_XRGB8888;
 	fill.dst.stride[0] = disp->pitch;
 	fill.dst.dma_fd = dmabuf_fd;
 	
-	/* Crop to current backbuffer page */
-	fill.dst.crop_x = 0;
-	fill.dst.crop_y = drm_get_backbuffer_offset(disp) / disp->pitch;
-	fill.dst.crop_w = disp->width;
-	fill.dst.crop_h = disp->height;
-	
-	/* Rectangle position and size */
+	/* Rectangle position (absolute within full buffer) and size */
 	fill.dst_x = x;
-	fill.dst_y = y;
+	fill.dst_y = y + backbuffer_y_offset;  /* Offset to current page */
 	fill.dst_w = w;
 	fill.dst_h = h;
 	fill.color = color;

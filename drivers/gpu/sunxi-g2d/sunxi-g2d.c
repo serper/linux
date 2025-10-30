@@ -1808,10 +1808,6 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 	/* Get DMA address from first sg entry */
 	dma_addr = sg_dma_address(sgt->sgl);
 	
-	/* Calculate dimensions and pitch */
-	width = fill.dst_w;
-	height = fill.dst_h;
-	
 	/* Calculate bytes per pixel based on format */
 	u32 bpp;
 	switch (fill.dst.format) {
@@ -1828,7 +1824,12 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		goto err_unmap;
 	}
 	
-	pitch = fill.dst.stride[0] ? fill.dst.stride[0] : (width * bpp);
+	/* Rectangle dimensions */
+	width = fill.dst_w;
+	height = fill.dst_h;
+	
+	/* Pitch is the stride of the BUFFER, not the rectangle */
+	pitch = fill.dst.stride[0] ? fill.dst.stride[0] : (fill.dst.width * bpp);
 	
 	/* Adjust DMA address for dst_x/dst_y offset */
 	dma_addr += (fill.dst_y * pitch) + (fill.dst_x * bpp);

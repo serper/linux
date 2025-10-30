@@ -132,6 +132,10 @@ int main(void)
 	struct drm_display disp;
 	int ret;
 	
+	printf("G2D + DRM Bouncing Ball Demo\n");
+	printf("sizeof(struct g2d_buf) = %zu\n", sizeof(struct g2d_buf));
+	printf("sizeof(struct g2d_fillrect) = %zu\n", sizeof(struct g2d_fillrect));
+	
 	/* Ball physics */
 	float ball_x, ball_y;
 	float vel_x = 3.5f;
@@ -153,7 +157,6 @@ int main(void)
 	
 	signal(SIGINT, sigint_handler);
 	
-	printf("G2D + DRM Bouncing Ball Demo\n");
 	printf("==============================\n\n");
 	
 	ret = drm_display_init(&disp);
