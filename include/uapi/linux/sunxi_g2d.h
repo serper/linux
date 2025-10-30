@@ -124,6 +124,18 @@ struct g2d_alloc_buffer {
 	__u32 flags;		/* Reserved for future use */
 };
 
+/* G2D alpha blending operation */
+struct g2d_alpha_blend {
+	struct g2d_buf dst;	/* Background/destination image */
+	struct g2d_buf src;	/* Foreground/source image */
+	
+	__u8 global_alpha;	/* Global alpha: 0=transparent, 255=opaque */
+	__u8 _pad[3];		/* Padding for alignment */
+	
+	__s32 fence_fd_in;
+	__s32 fence_fd_out;	/* OUT */
+};
+
 /* IOCTLs */
 #define G2D_IOC_MAGIC		'G'
 
@@ -131,6 +143,7 @@ struct g2d_alloc_buffer {
 #define G2D_IOC_BLIT		_IOWR(G2D_IOC_MAGIC, 1, struct g2d_blit)
 #define G2D_IOC_FILLRECT	_IOWR(G2D_IOC_MAGIC, 2, struct g2d_fillrect)
 #define G2D_IOC_SYNC		_IOW(G2D_IOC_MAGIC, 3, __s32)  /* Wait on fence */
+#define G2D_IOC_ALPHA_BLEND	_IOWR(G2D_IOC_MAGIC, 5, struct g2d_alpha_blend)
 /* #define G2D_IOC_ALLOC_BUFFER	_IOWR(G2D_IOC_MAGIC, 4, struct g2d_alloc_buffer) - TODO */
 
 #endif /* _UAPI_SUNXI_G2D_H */

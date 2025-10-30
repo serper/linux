@@ -1854,6 +1854,147 @@ err_put_dmabuf:
 	return ret;
 }
 
+static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
+					 unsigned long arg)
+{
+	struct g2d_alpha_blend blend;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr;
+	u32 src_bpp, dst_bpp;
+	int ret;
+	
+	if (copy_from_user(&blend, (void __user *)arg, sizeof(blend)))
+		return -EFAULT;
+	
+	/* Validate parameters */
+	if (blend.src.crop_w == 0 || blend.src.crop_h == 0 ||
+	    blend.dst.crop_w == 0 || blend.dst.crop_h == 0) {
+		dev_err(g2d->dev, "Invalid dimensions\n");
+		return -EINVAL;
+	}
+	
+	/* For now, only support DMA-BUF */
+	if (blend.src.dma_fd < 0 || blend.dst.dma_fd < 0) {
+		dev_err(g2d->dev, "Physical address mode not supported\n");
+		return -EINVAL;
+	}
+	
+	dev_info(g2d->dev, "ALPHA_BLEND: src=%dx%d dst=%dx%d alpha=%u\n",
+		 blend.src.crop_w, blend.src.crop_h,
+		 blend.dst.crop_w, blend.dst.crop_h,
+		 blend.global_alpha);
+	
+	/* Import source DMA-BUF */
+	src_dmabuf = dma_buf_get(blend.src.dma_fd);
+	if (IS_ERR(src_dmabuf)) {
+		ret = PTR_ERR(src_dmabuf);
+		dev_err(g2d->dev, "Failed to get src dma_buf: %d\n", ret);
+		return ret;
+	}
+	
+	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
+	if (IS_ERR(src_attach)) {
+		ret = PTR_ERR(src_attach);
+		goto err_put_src;
+	}
+	
+	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
+	if (IS_ERR(src_sgt)) {
+		ret = PTR_ERR(src_sgt);
+		goto err_detach_src;
+	}
+	
+	/* Import destination DMA-BUF */
+	dst_dmabuf = dma_buf_get(blend.dst.dma_fd);
+	if (IS_ERR(dst_dmabuf)) {
+		ret = PTR_ERR(dst_dmabuf);
+		goto err_unmap_src;
+	}
+	
+	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+	if (IS_ERR(dst_attach)) {
+		ret = PTR_ERR(dst_attach);
+		goto err_put_dst;
+	}
+	
+	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(dst_sgt)) {
+		ret = PTR_ERR(dst_sgt);
+		goto err_detach_dst;
+	}
+	
+	/* Get DMA addresses */
+	src_dma_addr = sg_dma_address(src_sgt->sgl);
+	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
+	
+	/* Calculate bytes per pixel */
+	switch (blend.src.format) {
+	case G2D_FMT_ARGB8888:
+	case G2D_FMT_XRGB8888:
+		src_bpp = 4;
+		break;
+	case G2D_FMT_RGB565:
+		src_bpp = 2;
+		break;
+	default:
+		ret = -EINVAL;
+		goto err_unmap_dst;
+	}
+	
+	switch (blend.dst.format) {
+	case G2D_FMT_ARGB8888:
+	case G2D_FMT_XRGB8888:
+		dst_bpp = 4;
+		break;
+	case G2D_FMT_RGB565:
+		dst_bpp = 2;
+		break;
+	default:
+		ret = -EINVAL;
+		goto err_unmap_dst;
+	}
+	
+	/* Adjust DMA addresses for crop offsets */
+	u32 src_pitch = blend.src.stride[0] ? blend.src.stride[0] : (blend.src.width * src_bpp);
+	u32 dst_pitch = blend.dst.stride[0] ? blend.dst.stride[0] : (blend.dst.width * dst_bpp);
+	
+	src_dma_addr += (blend.src.crop_y * src_pitch) + (blend.src.crop_x * src_bpp);
+	dst_dma_addr += (blend.dst.crop_y * dst_pitch) + (blend.dst.crop_x * dst_bpp);
+	
+	/* Execute alpha blending operation */
+	ret = sunxi_g2d_do_blit_alpha(g2d,
+				      src_dma_addr, blend.src.width, blend.src.height,
+				      src_pitch, blend.src.format,
+				      0, 0, blend.src.crop_w, blend.src.crop_h,
+				      dst_dma_addr, blend.dst.width, blend.dst.height,
+				      dst_pitch, blend.dst.format,
+				      0, 0, blend.src.crop_w, blend.src.crop_h,
+				      blend.global_alpha);
+	
+	/* TODO: Create and return fence_fd if needed */
+	blend.fence_fd_out = -1;
+	
+	if (copy_to_user((void __user *)arg, &blend, sizeof(blend)))
+		ret = -EFAULT;
+	
+err_unmap_dst:
+	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_BIDIRECTIONAL);
+err_detach_dst:
+	dma_buf_detach(dst_dmabuf, dst_attach);
+err_put_dst:
+	dma_buf_put(dst_dmabuf);
+err_unmap_src:
+	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+err_detach_src:
+	dma_buf_detach(src_dmabuf, src_attach);
+err_put_src:
+	dma_buf_put(src_dmabuf);
+	
+	return ret;
+}
+
 static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 					  unsigned long arg)
 {
@@ -1931,6 +2072,8 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		return sunxi_g2d_ioctl_blit(g2d, arg);
 	case G2D_IOC_FILLRECT:
 		return sunxi_g2d_ioctl_fillrect(g2d, arg);
+	case G2D_IOC_ALPHA_BLEND:
+		return sunxi_g2d_ioctl_alpha_blend(g2d, arg);
 	/* TODO: Implement buffer allocation
 	case G2D_IOC_ALLOC_BUFFER:
 		return sunxi_g2d_ioctl_alloc_buffer(g2d, arg);
