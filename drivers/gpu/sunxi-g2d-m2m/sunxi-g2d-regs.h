@@ -19,25 +19,37 @@
 /* RCQ-based layout (T113/D1): legacy blocks shift to +0x28000 when RCQ active */
 #define G2D_RCQ_BASE   0x28000
 
-/* RCQ control block (still located within TOP address space) */
-#define G2D_RCQ_IRQ_CTL   (0x20 + G2D_TOP)
+/* RCQ control block: back to TOP addresses (0x20-0x34)
+ * These require special handling in T113 - accessed via raw mmio, not through calc_off */
+#define G2D_RCQ_IRQ_CTL   (0x20 + G2D_TOP)  /* 0x0020 */
 #define  G2D_RCQ_IRQ_SEL              BIT(0)
 #define  G2D_RCQ_IRQ_TASK_END_EN      BIT(4)
 #define  G2D_RCQ_IRQ_CFG_FINISH_EN    BIT(6)
 
-#define G2D_RCQ_STATUS    (0x24 + G2D_TOP)
+#define G2D_RCQ_STATUS    (0x24 + G2D_TOP)  /* 0x0024 */
 #define  G2D_RCQ_STATUS_TASK_END      BIT(0)
 #define  G2D_RCQ_STATUS_CFG_FINISH    BIT(2)
 #define  G2D_RCQ_STATUS_FRAME_CNT_SHIFT 8
 #define  G2D_RCQ_STATUS_FRAME_CNT_MASK  (0xFF << G2D_RCQ_STATUS_FRAME_CNT_SHIFT)
 
-#define G2D_RCQ_CTRL      (0x28 + G2D_TOP)
+#define G2D_RCQ_CTRL      (0x28 + G2D_TOP)  /* 0x0028 */
 #define  G2D_RCQ_CTRL_UPDATE          BIT(0)
+/* En T113 (v2 RCQ) hay un bit de habilitación adicional para RCQ.
+ * Los BSP suelen usar EN|UPDATE. Documentación no pública sugiere EN en bit4.
+ * Permitimos ajustar por sysfs si fuese necesario, pero por defecto BIT(4).
+ */
+#define  G2D_RCQ_CTRL_EN              BIT(4)
 
-#define G2D_RCQ_HEAD_LOW  (0x2C + G2D_TOP)
-#define G2D_RCQ_HEAD_HIGH (0x30 + G2D_TOP)
-#define G2D_RCQ_HEAD_LEN  (0x34 + G2D_TOP)
+#define G2D_RCQ_HEAD_LOW  (0x2C + G2D_TOP)  /* 0x002C */
+#define G2D_RCQ_HEAD_HIGH (0x30 + G2D_TOP)  /* 0x0030 */
+#define G2D_RCQ_HEAD_LEN  (0x34 + G2D_TOP)  /* 0x0034 */
 #define  G2D_RCQ_HEAD_LEN_MASK        0xFFFF
+
+/* CMDQ and control registers in TOP space (BSP naming vs driver naming) */
+#define G2D_CONTROL      (0x00 + G2D_TOP)
+#define G2D_CMDQ_CTL     (0x140 + G2D_TOP)
+#define G2D_CMDQ_STS     (0x144 + G2D_TOP)
+#define G2D_CMDQ_ADDR    (0x148 + G2D_TOP)
 
 #define G2D_ROT        0x28000
 #define G2D_GSU        0x30000

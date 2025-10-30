@@ -7,6 +7,7 @@
 #include <dt-bindings/clock/sun20i-d1-ccu.h>
 #include <dt-bindings/clock/sun20i-d1-r-ccu.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/clock/sun8i-de2.h>
 #include <dt-bindings/reset/sun8i-de2.h>
 #include <dt-bindings/reset/sun20i-d1-ccu.h>
 #include <dt-bindings/reset/sun20i-d1-r-ccu.h>
@@ -151,6 +152,14 @@
                 allwinner,pipelines = <&mixer0>, <&mixer1>;
                 status = "disabled";
         };
+
+        // deinterlace: deinterlace@5400000 {
+        //         reg = <0x5400000 0x10000>;
+        //         interconnects = <&mbus 10>;
+        //         interconnect-names = "dma-mem";
+        //         interrupts = <104 IRQ_TYPE_LEVEL_HIGH>;
+        //         iommus = <&iommu 4>;
+        // };
 
         soc {
                 compatible = "simple-bus";
@@ -588,6 +597,8 @@
                 dma: dma-controller@3002000 {
                         compatible = "allwinner,sun20i-d1-dma";
                         reg = <0x3002000 0x1000>;
+                        // interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>,
+                        //              <GIC_SPI 142 IRQ_TYPE_LEVEL_HIGH>;
                         interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
                         clocks = <&ccu CLK_BUS_DMA>, <&ccu CLK_MBUS_DMA>;
                         clock-names = "bus", "mbus";
@@ -597,18 +608,17 @@
                         #dma-cells = <1>;
                 };
 
-                /* Sunxi G2D 2D Engine (M2M) - placeholder node for sunxi-g2d-m2m driver */
-                g2d: g2d@3003000 {
-                        compatible = "allwinner,sun8i-g2d", "allwinner,sun8i-g2d-v1";
-                        /* Keep a minimal 0x1000 window like H6; larger sizes overlap other IPs here */
-                        reg = <0x3003000 0x1000>;
-                        interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>;
-                        clocks = <&ccu CLK_BUS_G2D>;
-                        clock-names = "bus";
-                        resets = <&ccu RST_BUS_G2D>;
-                        reset-names = "bus";
-                        status = "disabled";
-                };
+                msgbox: mailbox@3003000 {
+			compatible = "allwinner,sun20i-d1-msgbox";
+			reg = <0x3003000 0x1000>;
+			clocks = <&ccu CLK_BUS_MSGBOX0>;
+			resets = <&ccu RST_BUS_MSGBOX0>;
+			interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 102 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "rx", "tx";
+			#mbox-cells = <2>;
+		};
+
 
                 sid: efuse@3006000 {
                         compatible = "allwinner,sun20i-d1-sid";
@@ -856,6 +866,7 @@
                                  <&display_clocks CLK_MIXER0>;
                         clock-names = "bus", "mod";
                         resets = <&display_clocks RST_MIXER0>;
+                        // iommus = <&iommu 2>;
 
                         ports {
                                 #address-cells = <1>;
@@ -878,6 +889,7 @@
                                  <&display_clocks CLK_MIXER1>;
                         clock-names = "bus", "mod";
                         resets = <&display_clocks RST_MIXER1>;
+                        // iommus = <&iommu 2>;
 
                         ports {
                                 #address-cells = <1>;
@@ -893,6 +905,54 @@
                         };
                 };
 
+                g2d: g2d@5410000 {
+                        compatible = "allwinner,t113-g2d", "allwinner,sun8i-g2d";
+                        reg = <0x05410000 0x00040000>;
+                        interrupts = <GIC_SPI 89 IRQ_TYPE_LEVEL_HIGH>;
+                        clocks = <&ccu CLK_BUS_G2D>, <&ccu CLK_G2D>, <&ccu CLK_MBUS_G2D>;
+                        clock-names = "bus_g2d", "g2d", "mbus_g2d";
+                        resets = <&ccu RST_BUS_G2D>;
+                        reset-names = "bus";
+                        /* NO power-domains: G2D does NOT use VE power domain, it's always-on */
+                        interconnects = <&mbus 3>;   /* v0.0.91: G2D uses master 3 per T113-S3 User Manual Table 3-16 */
+                        interconnect-names = "dma-mem";
+                        /* iommus = <&iommu 3>; DISABLED - G2D master 3 may not have IOMMU in T113 */
+                };
+
+                ve: video-codec@1c0e000 {
+                        compatible = "allwinner,sun20i-d1-video-engine";
+                        reg = <0x01c0e000 0x2000>;
+                        interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
+                        clocks = <&ccu CLK_BUS_VE>, <&ccu CLK_VE>, <&ccu CLK_MBUS_VE>;
+                        clock-names = "ahb", "mod", "ram";
+                        resets = <&ccu RST_BUS_VE>;
+                        interconnects = <&mbus 4>;
+                        interconnect-names = "dma-mem";
+                        allwinner,sram = <&ve_sram 1>;
+                        // power-domains = <&ppu PD_VE>;
+                        /* iommus = <&iommu 0>; Temporarily disabled */
+                        status = "disabled";
+                };
+
+                // iommu: iommu@2010000 {
+                //         compatible = "allwinner,sun20i-d1-iommu";
+                //         reg = <0x2010000 0x10000>;
+                //         interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+                //         clocks = <&ccu CLK_BUS_IOMMU>;
+                //         #iommu-cells = <1>;
+                // };
+
+                // csi: csi@5800000 {
+		// 	reg = <0x5800000 0x400000>;
+		// 	interrupts = <111 IRQ_TYPE_LEVEL_HIGH>,
+		// 		     <112 IRQ_TYPE_LEVEL_HIGH>,
+		// 		     <116 IRQ_TYPE_LEVEL_HIGH>,
+		// 		     <122 IRQ_TYPE_LEVEL_HIGH>;
+		// 	interconnects = <&mbus 7>;
+		// 	interconnect-names = "dma-mem";
+		// 	iommus = <&iommu 1>;
+		// };
+                
                 dsi: dsi@5450000 {
                         compatible = "allwinner,sun20i-d1-mipi-dsi",
                                      "allwinner,sun50i-a100-mipi-dsi";
@@ -1137,19 +1197,5 @@
 				reg = <0x000000 0x80000>;
 			};
 		};
-
-                ve: video-codec@1c0e000 {
-                        compatible = "allwinner,sun20i-d1-video-engine";
-                        reg = <0x01c0e000 0x2000>;
-                        interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
-                        clocks = <&ccu CLK_BUS_VE>, <&ccu CLK_VE>, <&ccu CLK_MBUS_VE>;
-                        clock-names = "ahb", "mod", "ram";
-                        resets = <&ccu RST_BUS_VE>;
-                        interconnects = <&mbus 4>;
-                        interconnect-names = "dma-mem";
-                        allwinner,sram = <&ve_sram 1>;
-                        power-domains = <&ppu PD_VE>;
-                        status = "disabled";
-                };
         };
 };

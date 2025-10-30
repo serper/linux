@@ -803,10 +803,12 @@ static int sun50i_iommu_attach_device(struct iommu_domain *domain,
 	struct sun50i_iommu *iommu;
 
 	iommu = sun50i_iommu_from_dev(dev);
-	if (!iommu)
+	if (!iommu) {
+		dev_err(dev, "Failed to get IOMMU from device\n");
 		return -ENODEV;
+	}
 
-	dev_dbg(dev, "Attaching to IOMMU domain\n");
+	dev_info(dev, "Attaching to IOMMU domain (iommu=%p)\n", iommu);
 
 	refcount_inc(&sun50i_domain->refcnt);
 
@@ -997,6 +999,8 @@ static int sun50i_iommu_probe(struct platform_device *pdev)
 	struct sun50i_iommu *iommu;
 	int ret, irq;
 
+	dev_info(&pdev->dev, "sun50i-iommu: probe starting...\n");
+
 	iommu = devm_kzalloc(&pdev->dev, sizeof(*iommu), GFP_KERNEL);
 	if (!iommu)
 		return -ENOMEM;
@@ -1026,16 +1030,23 @@ static int sun50i_iommu_probe(struct platform_device *pdev)
 
 	iommu->clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(iommu->clk)) {
-		dev_err(&pdev->dev, "Couldn't get our clock.\n");
 		ret = PTR_ERR(iommu->clk);
+		dev_err(&pdev->dev, "Couldn't get our clock: %d\n", ret);
 		goto err_free_cache;
 	}
+	
+	dev_info(&pdev->dev, "Clock acquired successfully\n");
 
-	iommu->reset = devm_reset_control_get(&pdev->dev, NULL);
+	/* Reset line may be absent on some SoCs (e.g., sun20i-d1). Treat as optional. */
+	iommu->reset = devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
 	if (IS_ERR(iommu->reset)) {
-		dev_err(&pdev->dev, "Couldn't get our reset line.\n");
 		ret = PTR_ERR(iommu->reset);
 		goto err_free_cache;
+	}
+	if (iommu->reset) {
+		ret = reset_control_deassert(iommu->reset);
+		if (ret)
+			goto err_free_cache;
 	}
 
 	ret = iommu_device_sysfs_add(&iommu->iommu, &pdev->dev,
@@ -1052,6 +1063,8 @@ static int sun50i_iommu_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto err_unregister;
 
+	dev_info(&pdev->dev, "sun50i-iommu: probe completed successfully\n");
+
 	return 0;
 
 err_unregister:
@@ -1067,6 +1080,7 @@ err_free_cache:
 }
 
 static const struct of_device_id sun50i_iommu_dt[] = {
+	{ .compatible = "allwinner,sun20i-d1-iommu", },
 	{ .compatible = "allwinner,sun50i-h6-iommu", },
 	{ .compatible = "allwinner,sun50i-h616-iommu", },
 	{ /* sentinel */ },
@@ -1074,13 +1088,14 @@ static const struct of_device_id sun50i_iommu_dt[] = {
 MODULE_DEVICE_TABLE(of, sun50i_iommu_dt);
 
 static struct platform_driver sun50i_iommu_driver = {
+	.probe		= sun50i_iommu_probe,
 	.driver		= {
 		.name			= "sun50i-iommu",
 		.of_match_table 	= sun50i_iommu_dt,
 		.suppress_bind_attrs	= true,
 	}
 };
-builtin_platform_driver_probe(sun50i_iommu_driver, sun50i_iommu_probe);
+builtin_platform_driver(sun50i_iommu_driver);
 
 MODULE_DESCRIPTION("Allwinner H6 IOMMU driver");
 MODULE_AUTHOR("Maxime Ripard <maxime@cerno.tech>");

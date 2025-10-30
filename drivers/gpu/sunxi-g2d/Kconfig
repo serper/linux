@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_SUN8I_G2D
+	tristate "Allwinner G2D 2D Graphics Accelerator"
+	depends on (ARM || ARM64) && HAS_IOMEM
+	select DMA_SHARED_BUFFER
+	help
+	  Choose this option if you have an Allwinner SoC with the G2D
+	  2D graphics accelerator (T113, D1, etc.).
+	  
+	  This driver provides a character device (/dev/g2d) with custom
+	  UAPI ioctls optimized for UI/graphics acceleration. It supports:
+	  - Hardware-accelerated blits and fills
+	  - DMA-BUF import/export for zero-copy
+	  - Sync fences for coordination with DRM/GPU
+	  - Rotation, scaling, and format conversion
+	  
+	  To compile this driver as a module, choose M here: the module
+	  will be called sunxi-g2d.
