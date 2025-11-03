@@ -7,7 +7,7 @@ CC = arm-linux-musleabihf-gcc
 KERNEL_DIR = /home/sergio/source/t113/kernel-t113
 KERNEL_HEADERS = $(KERNEL_DIR)/include/uapi
 # Use Alpine rootfs sysroot
-ALPINE_ROOTFS = /home/sergio/source/t113/spuc-rootfs/build/rootfs-alpine
+ALPINE_ROOTFS = /home/sergio/source/t113/rootfs-alpine
 # Use --sysroot to avoid mixing headers from different sources
 CFLAGS = -Wall -O2 --sysroot=$(ALPINE_ROOTFS) -I$(KERNEL_HEADERS) -I$(ALPINE_ROOTFS)/usr/include/libdrm
 LDFLAGS = --sysroot=$(ALPINE_ROOTFS) -ldrm -lm

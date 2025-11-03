@@ -23,37 +23,24 @@
 #include <xf86drmMode.h>
 #include <linux/dma-heap.h>
 #include <linux/sunxi_g2d.h>
+#include "demo-drm-base.h"
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
-
-struct drm_display {
-	int drm_fd;
-	int g2d_fd;
-	
-	uint32_t conn_id;
-	uint32_t crtc_id;
-	uint32_t fb_id;
-	
-	drmModeModeInfo mode;
-	drmModeCrtc *saved_crtc;
-	
-	uint32_t width;
-	uint32_t height;
-	uint32_t pitch;
-	uint32_t size;
-	
-	/* Double-height buffer for page flipping via panning */
-	void *map;
-	uint32_t handle;
-	
-	/* Current page (0 or 1) */
-	int current_page;
-};
 
 /*
  * Find first connected connector
  */
-static uint32_t find_connector(int drm_fd, drmModeRes *res)
+
+#include "demo-drm-base.h"
+
+/* Global page tracker - separate from struct to avoid corruption 
+ * NOTE: Initialize to 2 (invalid value) to detect if variable gets
+ * mysteriously reset by some external mechanism.
+ */
+volatile int g_current_page = 2;
+
+static struct drm_connector *find_connector(int drm_fd, drmModeRes *res)
+
 {
 	for (int i = 0; i < res->count_connectors; i++) {
 		drmModeConnector *conn = drmModeGetConnector(drm_fd, res->connectors[i]);
@@ -124,7 +111,7 @@ int drm_display_init(struct drm_display *disp)
 	int ret;
 	
 	memset(disp, 0, sizeof(*disp));
-	disp->current_page = 0;
+	g_current_page = 0;  /* Initialize global page tracker (was 2 from .data) */
 	
 	/* Open DRM device */
 	disp->drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
@@ -298,17 +285,25 @@ void drm_display_cleanup(struct drm_display *disp)
  */
 void *drm_get_backbuffer(struct drm_display *disp)
 {
-	int next_page = 1 - disp->current_page;
+	int next_page = 1 - g_current_page;
 	return (uint8_t *)disp->map + (next_page * disp->pitch * disp->height);
 }
 
 /*
  * Get offset of backbuffer in bytes
+ * The backbuffer is always the opposite of what's currently displayed
  */
 uint32_t drm_get_backbuffer_offset(struct drm_display *disp)
 {
-	int next_page = 1 - disp->current_page;
-	return next_page * disp->pitch * disp->height;
+	/* Return the offset (in bytes) of the backbuffer page.
+	 * Use the current page tracker `g_current_page` which is
+	 * updated only when the DRM pan/flip ioctl completes. This
+	 * prevents toggling the target page on every call to this
+	 * helper (which caused alternating writes/black frames when
+	 * the function was called multiple times per frame).
+	 */
+	int backbuffer_page = 1 - g_current_page; /* opposite of displayed page */
+	return backbuffer_page * disp->pitch * disp->height;
 }
 
 /*
@@ -316,7 +311,7 @@ uint32_t drm_get_backbuffer_offset(struct drm_display *disp)
  */
 int drm_flip_page(struct drm_display *disp)
 {
-	int next_page = 1 - disp->current_page;
+	int next_page = 1 - g_current_page;
 	int y_offset = next_page * disp->height;
 	int ret;
 	
@@ -329,7 +324,13 @@ int drm_flip_page(struct drm_display *disp)
 		return -1;
 	}
 	
-	disp->current_page = next_page;
+	/* UPDATE PAGE TRACKER AFTER IOCTL (when display actually changed) */
+	g_current_page = next_page;
+
+	/* Debug: report page flip info */
+	printf("[drm_flip_page] y_offset=%d next_page=%d g_current_page=%d\n",
+	       y_offset, next_page, g_current_page);
+	
 	return 0;
 }
 
@@ -356,14 +357,57 @@ int drm_export_dmabuf(struct drm_display *disp)
 }
 
 /*
- * Helper: Fill rectangle using G2D
+ * Helper structure for fillrect parameters
+ */
+struct g2d_rect_params {
+	int x, y, w, h;
+	uint32_t color;
+};
+
+/* Forward declaration */
+static int g2d_fillrect_display_rect(struct drm_display *disp, 
+                                      const struct g2d_rect_params *params);
+
+/*
+ * Fill a rectangle on the current backbuffer page (NEW SAFE INTERFACE)
+ * This version passes params by pointer to avoid ARM ABI stack issues
+ */
+int g2d_fillrect_display_safe(struct drm_display *disp, 
+                               int x, int y, int w, int h, uint32_t color)
+{
+	struct g2d_rect_params params;
+	
+	/* Explicitly assign to local struct to avoid compiler issues */
+	params.x = x;
+	params.y = y;
+	params.w = w;
+	params.h = h;
+	params.color = color;
+	
+	return g2d_fillrect_display_rect(disp, &params);
+}
+
+/*
+ * Fill a rectangle on the current backbuffer page (OLD INTERFACE - DEPRECATED)
+ * WARNING: This function has ARM ABI issues with stack parameters!
+ * Use g2d_fillrect_display_safe() instead.
  */
 int g2d_fillrect_display(struct drm_display *disp, 
                          int x, int y, int w, int h, uint32_t color)
 {
+	return g2d_fillrect_display_safe(disp, x, y, w, h, color);
+}
+
+/*
+ * Fill a rectangle on the current backbuffer page (internal)
+ */
+static int g2d_fillrect_display_rect(struct drm_display *disp, 
+                                      const struct g2d_rect_params *params)
+{
 	struct g2d_fillrect fill = {0};
 	int dmabuf_fd;
 	int ret;
+	uint32_t backbuffer_offset_bytes;
 	int backbuffer_y_offset;
 	
 	/* Export DRM buffer as DMA-BUF */
@@ -372,7 +416,8 @@ int g2d_fillrect_display(struct drm_display *disp,
 		return -1;
 	
 	/* Calculate Y offset for current backbuffer page (in lines) */
-	backbuffer_y_offset = drm_get_backbuffer_offset(disp) / disp->pitch;
+	backbuffer_offset_bytes = drm_get_backbuffer_offset(disp);
+	backbuffer_y_offset = backbuffer_offset_bytes / disp->pitch;
 	
 	/* Configure fillrect operation on full buffer */
 	fill.dst.width = disp->width;
@@ -382,11 +427,12 @@ int g2d_fillrect_display(struct drm_display *disp,
 	fill.dst.dma_fd = dmabuf_fd;
 	
 	/* Rectangle position (absolute within full buffer) and size */
-	fill.dst_x = x;
-	fill.dst_y = y + backbuffer_y_offset;  /* Offset to current page */
-	fill.dst_w = w;
-	fill.dst_h = h;
-	fill.color = color;
+	fill.dst_x = params->x;
+	fill.dst_y = params->y + backbuffer_y_offset;  /* Offset to current page */
+	fill.dst_w = params->w;
+	fill.dst_h = params->h;
+	fill.color = params->color;
+	fill.color_format = G2D_FMT_ARGB8888;  /* Color is in ARGB format */
 	fill.fence_fd_in = -1;
 	fill.fence_fd_out = -1;
 	
