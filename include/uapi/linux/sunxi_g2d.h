@@ -50,6 +50,13 @@ enum g2d_pixel_format {
 	G2D_FMT_1BPP_MONO = 36,
 };
 
+/* Alpha modes for per-image control */
+enum g2d_alpha_mode {
+	G2D_PIXEL_ALPHA = 0,	/* Use per-pixel alpha from image */
+	G2D_GLOBAL_ALPHA = 1,	/* Use global_alpha value */
+	G2D_MIXER_ALPHA = 2,	/* Multiply pixel and global alpha */
+};
+
 /* G2D buffer description */
 struct g2d_buf {
 	__u32 width;
@@ -65,6 +72,11 @@ struct g2d_buf {
 	__u32 crop_y;
 	__u32 crop_w;
 	__u32 crop_h;
+	
+	/* Alpha control (for alpha blending operations) */
+	__u8 alpha;		/* Global alpha value for this buffer (0-255) */
+	__u8 alpha_mode;	/* enum g2d_alpha_mode */
+	__u16 _pad;		/* Padding for alignment to 4-byte boundary */
 };
 
 /* G2D blit operation */
@@ -103,7 +115,8 @@ struct g2d_fillrect {
 	__u32 dst_w;
 	__u32 dst_h;
 	
-	__u32 color;		/* ARGB8888 color */
+	__u32 color;		/* Color in format specified by color_format */
+	__u32 color_format;	/* enum g2d_pixel_format - format of color value */
 	
 	__s32 fence_fd_in;
 	__s32 fence_fd_out;	/* OUT */
@@ -129,11 +142,17 @@ struct g2d_alpha_blend {
 	struct g2d_buf dst;	/* Background/destination image */
 	struct g2d_buf src;	/* Foreground/source image */
 	
-	__u8 global_alpha;	/* Global alpha: 0=transparent, 255=opaque */
-	__u8 _pad[3];		/* Padding for alignment */
-	
 	__s32 fence_fd_in;
 	__s32 fence_fd_out;	/* OUT */
+};
+
+/* Selftest helper for userspace to create a kernel-backed fence that will
+ * be signalled after a timeout. Used for isolating fence lifecycle bugs
+ * without touching hardware.
+ */
+struct g2d_selftest {
+    __s32 timeout_ms;   /* IN: delay in milliseconds before signalling */
+    __s32 fence_fd;     /* OUT: returned fence fd */
 };
 
 /* IOCTLs */
@@ -143,7 +162,12 @@ struct g2d_alpha_blend {
 #define G2D_IOC_BLIT		_IOWR(G2D_IOC_MAGIC, 1, struct g2d_blit)
 #define G2D_IOC_FILLRECT	_IOWR(G2D_IOC_MAGIC, 2, struct g2d_fillrect)
 #define G2D_IOC_SYNC		_IOW(G2D_IOC_MAGIC, 3, __s32)  /* Wait on fence */
+#define G2D_IOC_ALLOC_BUFFER	_IOWR(G2D_IOC_MAGIC, 4, struct g2d_alloc_buffer)
 #define G2D_IOC_ALPHA_BLEND	_IOWR(G2D_IOC_MAGIC, 5, struct g2d_alpha_blend)
-/* #define G2D_IOC_ALLOC_BUFFER	_IOWR(G2D_IOC_MAGIC, 4, struct g2d_alloc_buffer) - TODO */
+#define G2D_IOC_SELFTEST_FENCE _IOWR(G2D_IOC_MAGIC, 6, struct g2d_selftest)
+/* New: RCQ-based fillrect - allows userspace to explicitly request the
+ * RCQ path while keeping the legacy FILLRECT ioctl for direct writes.
+ */
+#define G2D_IOC_FILLRECT_RCQ	_IOWR(G2D_IOC_MAGIC, 7, struct g2d_fillrect)
 
 #endif /* _UAPI_SUNXI_G2D_H */

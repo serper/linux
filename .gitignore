@@ -183,3 +183,6 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# Temporary directory for testing
+**/tmp_test_dir/

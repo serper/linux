@@ -282,6 +282,7 @@
 #define WB_HADD1       (0x20 + G2D_WB)
 #define WB_LADD2       (0x24 + G2D_WB)
 #define WB_HADD2       (0x28 + G2D_WB)
+#define WB_CROP_COOR   (0x2C + G2D_WB)  /* Crop coordinate: X|Y position for output */
 
 /* WB_ATT bits (minimal, based on BSP patterns; subject to refinement) */
 #define WB_ATT_EN          BIT(0)  /* writeback enable */

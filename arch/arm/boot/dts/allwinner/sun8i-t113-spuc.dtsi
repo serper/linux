@@ -913,10 +913,9 @@
                         clock-names = "bus_g2d", "g2d", "mbus_g2d";
                         resets = <&ccu RST_BUS_G2D>;
                         reset-names = "bus";
-                        /* NO power-domains: G2D does NOT use VE power domain, it's always-on */
-                        interconnects = <&mbus 3>;   /* v0.0.91: G2D uses master 3 per T113-S3 User Manual Table 3-16 */
+                        interconnects = <&mbus 9>;
                         interconnect-names = "dma-mem";
-                        /* iommus = <&iommu 3>; DISABLED - G2D master 3 may not have IOMMU in T113 */
+                        // iommus = <&iommu 3>;
                 };
 
                 ve: video-codec@1c0e000 {
