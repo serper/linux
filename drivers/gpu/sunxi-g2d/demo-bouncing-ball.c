@@ -1152,11 +1152,17 @@ int main(int argc, char **argv)
 	frame_count++;
 	clock_gettime(CLOCK_MONOTONIC, &frame_end);
 	
-	/* Update ball physics (bouncing) */
+	/* Update ball size with smooth sinusoidal animation (BEFORE physics) */
+	scale_time += delta_time;
+	float scale_factor = 0.5f + 0.5f * sinf(2.0f * M_PI * scale_speed * scale_time);
+	ball_radius = min_radius + (int)((max_radius - min_radius) * scale_factor);
+	ball_size = ball_radius * 2;
+	
+	/* Update ball physics (bouncing) - now uses current radius */
 	ball_x += vel_x;
 	ball_y += vel_y;
 	
-	/* Bounce off walls */
+	/* Bounce off walls - uses current radius to prevent out-of-bounds */
 	if (ball_x - ball_radius < 0 || ball_x + ball_radius > disp.width) {
 		vel_x = -vel_x;
 		ball_x += vel_x;  /* Correct position */
@@ -1165,12 +1171,6 @@ int main(int argc, char **argv)
 		vel_y = -vel_y;
 		ball_y += vel_y;  /* Correct position */
 	}
-	
-	/* Update ball size with smooth sinusoidal animation */
-	scale_time += delta_time;
-	float scale_factor = 0.5f + 0.5f * sinf(2.0f * M_PI * scale_speed * scale_time);
-	ball_radius = min_radius + (int)((max_radius - min_radius) * scale_factor);
-	ball_size = ball_radius * 2;
 	
 	/* FPS display (every second) */
 	struct timespec fps_now;
