@@ -16,7 +16,7 @@ LDFLAGS = --sysroot=$(ALPINE_ROOTFS) -ldrm -lm
 DRM_BASE = demo-drm-base.c
 
 # Demo programs
-DEMOS = demo-bouncing-ball
+DEMOS = demo-bouncing-ball demo-rotate-test
 
 # Build directory (optional, for cross-compilation output)
 BUILD_DIR = .
@@ -27,6 +27,11 @@ all: $(DEMOS)
 
 # Bouncing ball demo
 demo-bouncing-ball: demo-bouncing-ball.c $(DRM_BASE)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@"
+
+# Rotation test demo
+demo-rotate-test: demo-rotate-test.c $(DRM_BASE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built: $@"
 
@@ -46,5 +51,6 @@ help:
 	@echo ""
 	@echo "Demos:"
 	@echo "  demo-bouncing-ball    - Bouncing ball with alpha blending"
+	@echo "  demo-rotate-test      - Rotation test (0°, 90°, 180°, 270°)"
 	@echo ""
 	@echo "Note: Compiled for Alpine Linux (musl) on T113-S3"
