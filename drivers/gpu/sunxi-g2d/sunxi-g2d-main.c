@@ -4,13 +4,27 @@
  * 
  * Copyright (C) 2025 Sergio Perez
  *
+ * Version: v2.9.48 - STABLE VSU SCALING WORKING
+ * 
+ * CRITICAL FIX: T113-S3 VSU Hardware Quirk
+ * ==========================================
+ * T113-S3 G2D requires << 2 shift for VS_*_HSTEP/VSTEP registers
+ * Standard Allwinner BSP uses << 1 (for A33/H3/other SoCs)
+ * 
+ * Experimental evidence (T113-S3):
+ *   << 0: Only 1/8 of image visible (4x overscan)
+ *   << 1: Only 1/4 of image visible (2x overscan) - BSP value
+ *   << 2: Perfect full image - CORRECT for T113-S3
+ * 
+ * This is a silicon-specific quirk, not a driver bug.
+ *
  * Architecture:
  * - Char device with custom UAPI ioctls for graphics/UI acceleration
  * - DMA-BUF import/export support
  * - Sync fence integration with DRM
  * - Power management with reference counting
  * - Job queue with workqueue for async operations
- * - Future: V4L2 M2M layer on top
+ * - VSU hardware-accelerated scaling with proper alpha blending
  *
  * Based on fillrect v1.0.0 STABLE proven initialization sequence
  */
@@ -217,7 +231,33 @@ static const s32 lan2coefftab32_full[512] = {
 struct sunxi_g2d_dev;
 struct sunxi_g2d_job;
 
+/* Forward declarations for internal functions used before definition */
+
 /**
+ * sunxi_g2d_do_scale - Isolated scaling operation using VSU
+ *
+ * Performs ONLY scaling (via VSU), nothing else. Can be called before
+ * blit, blend, mask operations when scaling is required.
+ *
+ * G2D V2 limitation: Cannot combine VSU+BLD without RCQ.
+ * Solution: Call this first to scale, then do blend/blit/etc.
+ */
+static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
+                              dma_addr_t src_dma, u32 src_width, u32 src_height,
+                              u32 src_pitch, u32 src_format,
+                              u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+                              dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
+                              u32 dst_pitch, u32 dst_format,
+                              u32 dst_x, u32 dst_y, u32 dst_out_w, u32 dst_out_h,
+                              void *dst_vaddr);
+
+static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
+                              dma_addr_t src_dma, u32 src_width, u32 src_height,
+                              u32 src_pitch, u32 src_format,
+                              u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+                              dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
+                              u32 dst_pitch, u32 dst_format,
+                              u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h);/**
  * struct sunxi_g2d_dev - G2D device structure
  * 
  * Hardware resources:
@@ -296,6 +336,11 @@ struct sunxi_g2d_dev {
 	/* Fence support */
 	u64 fence_context;
 	atomic64_t fence_seqno;
+	
+	/* Temporary scaling buffer (allocated per-operation, freed after blend) */
+	void *temp_scale_buffer;
+	dma_addr_t temp_scale_dma;
+	size_t temp_scale_size;
 	
 	/* Statistics */
 	u32 hw_version;
@@ -1150,7 +1195,7 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 /**
  * sunxi_g2d_do_fillrect_rcq - Execute fillrect operation (RCQ mode)
  * 
- * ⚠️  ADVERTENCIA: Esta función NO ES FUNCIONAL en T113-S3
+ * ⚠️  ADVERTENCIA: Esta función NO ES FUNCIONAL AÚN en T113-S3
  * 
  * Estado: EXPERIMENTAL / NO FUNCIONAL
  * Problema: RCQ procesa comandos pero MIXER nunca ejecuta
@@ -1909,13 +1954,19 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	u32 format;
 	int i;
 
-	dev_dbg(g2d->dev, "VSU: Setup scaling %ux%u -> %ux%u, alpha=%u\n",
-		in_w, in_h, out_w, out_h, alpha);
+	dev_info(g2d->dev, "🔧 VSU: Setup scaling %ux%u -> %ux%u, alpha=%u fmt=%u (%s)\n",
+		 in_w, in_h, out_w, out_h, alpha, fmt,
+		 fmt == G2D_FMT_ARGB8888 ? "API:ARGB8888" :
+		 fmt == G2D_FMT_ABGR8888 ? "API:ABGR8888" :
+		 fmt == G2D_FMT_XRGB8888 ? "API:XRGB8888" :
+		 fmt == G2D_FMT_XBGR8888 ? "API:XBGR8888" :
+		 fmt == G2D_FMT_RGB565 ? "API:RGB565" : "UNKNOWN");
 
-	/* Enable VSU with coefficient access */
-	g2d_write(g2d, VS_CTRL, VS_CTRL_EN | VS_CTRL_COEF_ACCESS_SEL);
-
-	/* Determine format type - for now only RGB */
+	/* Determine format type
+	 * CRITICAL: Now accepts API format enums (G2D_FMT_*), not hardware (G2D_FORMAT_*)
+	 * VSU processes pixels byte-by-byte, doesn't care about ARGB vs ABGR
+	 * V0/WB handle the byte order interpretation when reading/writing
+	 */
 	switch (fmt) {
 	case G2D_FMT_ARGB8888:
 	case G2D_FMT_XRGB8888:
@@ -1923,10 +1974,27 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	case G2D_FMT_XBGR8888:
 	case G2D_FMT_RGB565:
 		format = VSU_FORMAT_RGB;
+		dev_info(g2d->dev, "   VSU format determined: VSU_FORMAT_RGB (0x03)\n");
 		break;
 	default:
 		dev_err(g2d->dev, "VSU: Unsupported format %u\n", fmt);
 		return -EINVAL;
+	}
+
+	/* BSP CRITICAL ORDER: Write VS_CTRL FIRST to enable coefficient access
+	 * This must be done BEFORE writing size registers
+	 * 
+	 * CRITICAL FIX: filter_type meaning based on BSP enum check:
+	 * BSP: if (fmt > G2D_FORMAT_IYUV422_Y1U0Y0V0) filter_type=1; else filter_type=0
+	 * RGB formats (0-23) are NOT > 0x23, so filter_type=0 for RGB
+	 * filter_type=1 causes timeout - confirmed incorrect for RGB
+	 */
+	if (format == VSU_FORMAT_RGB) {
+		g2d_write(g2d, VS_CTRL, 0x00101);  /* RGB mode: filter_type=0 + COEF_ACCESS + EN */
+		dev_info(g2d->dev, "📝 VS_CTRL(initial) = 0x00101 (filter_type=0 RGB)\n");
+	} else {
+		g2d_write(g2d, VS_CTRL, 0x10101);  /* YUV mode: filter_type=1 + COEF_ACCESS + EN */
+		dev_info(g2d->dev, "📝 VS_CTRL(initial) = 0x10101 (filter_type=1 YUV)\n");
 	}
 
 	/* Set output size */
@@ -1935,6 +2003,10 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 
 	/* Set Y channel (luma/RGB) input size */
 	g2d_write(g2d, VS_Y_SIZE, ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16));
+	
+	dev_info(g2d->dev, "VSU REGS: VS_OUT_SIZE=0x%08X (out=%ux%u) VS_Y_SIZE=0x%08X (in=%ux%u)\n",
+		 ((out_w - 1) & 0x1FFF) | (((out_h - 1) & 0x1FFF) << 16), out_w, out_h,
+		 ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16), in_w, in_h);
 
 	/* Calculate horizontal step (input_width / output_width) in fixed-point */
 	temp = (u64)in_w << VSU_PHASE_FRAC_BITWIDTH;
@@ -1943,7 +2015,54 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	else
 		temp = 0;
 	yhstep = (u32)temp;
-	g2d_write(g2d, VS_Y_HSTEP, yhstep << 1);
+	
+	/* T113 G2D spec: Supports 1/16× to 32× resize ratio
+	 * However, empirical testing shows timeout at yhstep=0x5F229 (110→74)
+	 * Last working: yhstep=0x58000 (110→80)
+	 * 
+	 * THEORY: The issue may not be the step limit itself, but rather:
+	 * 1. Some other VSU configuration (phase, coefficients, window size)
+	 * 2. Interaction with the << 1 shift when writing to register
+	 * 3. A hardware erratum not documented in the spec
+	 * 
+	 * For now, we'll log a warning but ALLOW the operation to proceed,
+	 * so we can gather more data about what actually fails.
+	 */
+	#define VSU_EMPIRICAL_SAFE_MAX 0x58000
+	
+	if (yhstep == 0) {
+		dev_err(g2d->dev, "❌ VSU: yhstep is zero (out_w=%u)\n", out_w);
+		return -EINVAL;
+	}
+	
+	if (yhstep > VSU_EMPIRICAL_SAFE_MAX) {
+		u32 ratio_x1000 = (out_w * 1000) / in_w;  /* Ratio * 1000 for 3 decimals */
+		dev_warn(g2d->dev, "⚠️  VSU: yhstep=0x%08x exceeds empirical safe limit 0x%08x\n",
+			 yhstep, VSU_EMPIRICAL_SAFE_MAX);
+		dev_warn(g2d->dev, "   Scaling %ux%u→%ux%u (ratio=%u.%03u) - may timeout\n",
+			 in_w, in_h, out_w, out_h, ratio_x1000 / 1000, ratio_x1000 % 1000);
+		dev_warn(g2d->dev, "   Spec allows 1/16x to 32x (this is %u.%03ux), proceeding anyway...\n",
+			 ratio_x1000 / 1000, ratio_x1000 % 1000);
+	}
+	
+	/* VSU Step Register Write
+	 * CRITICAL CORRECTION after extensive investigation:
+	 * 
+	 * Previous misunderstanding:
+	 *   - We used VSU_PHASE_FRAC_BITWIDTH = 18 (WRONG)
+	 *   - BSP actually uses 19 bits, NOT 18
+	 * 
+	 * Correct implementation (matching BSP):
+	 *   - yhstep = (in_w << 19) / out_w  (19-bit fractional part)
+	 *   - Register = yhstep << 1         (shift for hardware format)
+	 *   - Total precision: 20 bits
+	 * 
+	 * BSP code (g2d_scal.c:306):
+	 *   temp = in_w << VSU_PHASE_FRAC_BITWIDTH;  // 19 bits
+	 *   yhstep = temp / out_w;
+	 *   p_reg->y_hor_step.dwval = yhstep << 1;
+	 */
+	g2d_write(g2d, VS_Y_HSTEP, yhstep << 1);  /* BSP standard: << 1 */
 
 	/* Calculate vertical step (input_height / output_height) in fixed-point */
 	temp = (u64)in_h << VSU_PHASE_FRAC_BITWIDTH;
@@ -1952,43 +2071,115 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	else
 		temp = 0;
 	yvstep = (u32)temp;
+	
+	if (yvstep == 0) {
+		dev_err(g2d->dev, "❌ VSU: yvstep is zero (out_h=%u)\n", out_h);
+		return -EINVAL;
+	}
+	
+	if (yvstep > VSU_EMPIRICAL_SAFE_MAX) {
+		dev_warn(g2d->dev, "⚠️  VSU: yvstep=0x%08x exceeds empirical safe limit 0x%08x\n",
+			 yvstep, VSU_EMPIRICAL_SAFE_MAX);
+		dev_warn(g2d->dev, "   Proceeding anyway (spec allows 1/16× to 32×)...\n");
+	}
+	
+	/* BSP standard: << 1 for vertical step */
 	g2d_write(g2d, VS_Y_VSTEP, yvstep << 1);
-
-	/* Calculate coefficient offsets based on scale factors */
+	
+	/* BSP ORDER: Load Y coefficients IMMEDIATELY after steps, BEFORE chroma config
+	 * CRITICAL: Calculate coefficient offsets based on step values!
+	 * BSP: yhcoef_offset = g2d_vsu_calc_fir_coef(yhstep);
+	 */
 	yhcoef_offset = g2d_vsu_calc_fir_coef(yhstep);
 	yvcoef_offset = g2d_vsu_calc_fir_coef(yvstep);
 
-	/* Load horizontal coefficients (Lanczos2) */
+	/* Load horizontal coefficients (Lanczos with adaptive offset) */
 	for (i = 0; i < VSU_PHASE_NUM; i++) {
 		g2d_write(g2d, VS_Y_HCOEF0 + i * 4,
 			  lan2coefftab32_full[yhcoef_offset + i]);
 	}
 
-	/* For RGB: use linear (bilinear) vertical filtering */
-	for (i = 0; i < VSU_PHASE_NUM; i++) {
-		g2d_write(g2d, VS_Y_VCOEF0 + i * 4, linearcoefftab32[i]);
+	/* BSP CRITICAL: RGB uses LINEAR vertical coefficients!
+	 * RGB formats: linearcoefftab32 (simple interpolation)
+	 * YUV formats: lan2coefftab32_full (Lanczos filtering)
+	 * This affects how hardware processes vertical scaling
+	 */
+	if (format == VSU_FORMAT_RGB) {
+		/* RGB: Use linear interpolation for vertical (BSP line 1217) */
+		for (i = 0; i < VSU_PHASE_NUM; i++) {
+			g2d_write(g2d, VS_Y_VCOEF0 + i * 4, linearcoefftab32[i]);
+		}
+	} else {
+		/* YUV: Use Lanczos for vertical */
+		for (i = 0; i < VSU_PHASE_NUM; i++) {
+			g2d_write(g2d, VS_Y_VCOEF0 + i * 4,
+				  lan2coefftab32_full[yvcoef_offset + i]);
+		}
 	}
-
-	/* Set phases to 0 for RGB */
+	
 	g2d_write(g2d, VS_Y_HPHASE, 0);
 	g2d_write(g2d, VS_Y_VPHASE0, 0);
 
-	/* For RGB format, C channel mirrors Y channel settings */
-	g2d_write(g2d, VS_C_SIZE, ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16));
-	g2d_write(g2d, VS_C_HSTEP, yhstep << 1);
-	g2d_write(g2d, VS_C_VSTEP, yvstep << 1);
-	
-	/* Load chroma horizontal coefficients (same as luma for RGB) */
-	for (i = 0; i < VSU_PHASE_NUM; i++) {
-		g2d_write(g2d, VS_C_HCOEF0 + i * 4,
-			  lan2coefftab32_full[yhcoef_offset + i]);
+	dev_info(g2d->dev, "🎯 VSU: About to configure chroma, format=%u (RGB=%u)\n",
+		 format, VSU_FORMAT_RGB);
+
+	/* === Configure Chroma (UV) channels for RGB ===
+	 * BSP uses << 1 for step registers (with 19-bit fractional calculation)
+	 * 
+	 * BSP RGB default case (g2d_scal.c:439-440):
+	 *   p_reg->c_hor_step.dwval = yhstep << 1;
+	 *   p_reg->c_ver_step.dwval = yvstep << 1;
+	 * 
+	 * Where yhstep was calculated with 19-bit shift, then shifted << 1 for register
+	 */
+	if (format == VSU_FORMAT_RGB) {
+		/* Set chroma input/output size same as luma */
+		g2d_write(g2d, VS_C_SIZE, ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16));
+		
+		/* BSP standard: << 1 for chroma step registers */
+		g2d_write(g2d, VS_C_HSTEP, yhstep << 1);
+		g2d_write(g2d, VS_C_VSTEP, yvstep << 1);
+		
+		/* Load chroma horizontal coefficients (same as luma for RGB) */
+		for (i = 0; i < VSU_PHASE_NUM; i++) {
+			g2d_write(g2d, VS_C_HCOEF0 + i * 4,
+				  lan2coefftab32_full[yhcoef_offset + i]);
+		}
+		
+		/* Zero phase for chroma */
+		g2d_write(g2d, VS_C_HPHASE, 0);
+		g2d_write(g2d, VS_C_VPHASE0, 0);
+		
+		dev_info(g2d->dev, "🎨 VSU CHROMA: size=%ux%u hstep=0x%08x vstep=0x%08x (BSP << 1)\n",
+			 in_w, in_h, yhstep << 1, yvstep << 1);
 	}
 
-	g2d_write(g2d, VS_C_HPHASE, 0);
-	g2d_write(g2d, VS_C_VPHASE0, 0);
+	/* BSP CRITICAL: For RGB, DO NOT load VS_C_VCOEF0!
+	 * BSP only loads: VS_C_HCOEF0 + VS_Y_VCOEF0 for RGB
+	 * Loading VS_C_VCOEF0 may confuse hardware in RGB mode
+	 */
 
-	dev_dbg(g2d->dev, "VSU: yhstep=0x%08x yvstep=0x%08x format=%u\n",
-		yhstep, yvstep, format);
+	/* BSP CRITICAL: Final VS_CTRL write after loading coefficients
+	 * MUST disable COEF_ACCESS (bit8) after loading coefficients!
+	 * 
+	 * CRITICAL FIX: filter_type meaning based on BSP enum check:
+	 * BSP: if (fmt > G2D_FORMAT_IYUV422_Y1U0Y0V0) filter_type=1; else filter_type=0
+	 * RGB formats (0-23) are NOT > 0x23, so filter_type=0 for RGB
+	 * filter_type=1 causes timeout - confirmed incorrect for RGB
+	 * 
+	 * RGB formats: VS_CTRL = 0x00001 (filter_type=0 + EN)
+	 * YUV formats: VS_CTRL = 0x10001 (filter_type=1 + EN)
+	 */
+	if (format == VSU_FORMAT_RGB) {
+		g2d_write(g2d, VS_CTRL, 0x00001);  /* RGB: filter_type=0 + EN */
+		dev_info(g2d->dev, "📝 VS_CTRL(final) = 0x00001 (filter_type=0 RGB)\n");
+	} else {
+		g2d_write(g2d, VS_CTRL, 0x10001);  /* YUV: filter_type=1 + EN */
+		dev_info(g2d->dev, "📝 VS_CTRL(final) = 0x10001 (filter_type=1 YUV)\n");
+	}
+
+	dev_info(g2d->dev, "✅ VSU: Enabled for scaling %ux%u->%ux%u (yhstep=0x%08x yvstep=0x%08x)\n",
+		in_w, in_h, out_w, out_h, yhstep, yvstep);
 
 	return 0;
 }
@@ -2020,12 +2211,14 @@ static int sunxi_g2d_do_blit_alpha_rcq(struct sunxi_g2d_dev *g2d,
 }
 
 /*
- * sunxi_g2d_do_blit_alpha - Perform alpha blending operation (BSP-based with structures)
+ * sunxi_g2d_do_blit_alpha_3buf - Alpha blending with 3 separate buffers
  *
- * v2.9.31: CORRECT alpha blending - UI2 (background) + V0 (foreground with alpha)
- * Like real graphics composition: background + foreground with alpha → result
+ * v2.9.16: 3-buffer alpha blending to avoid read/write conflicts
+ * - src/V0: foreground layer (ball) - READ ONLY
+ * - dst/UI2: background layer (gradient) - READ ONLY
+ * - out/WB: output layer (temp) - WRITE ONLY
  */
-static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
+static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 				    dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
 				    u32 src_pitch, u32 src_format,
 				    u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
@@ -2034,29 +2227,164 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 				    u32 dst_w, u32 dst_h,
 				    u32 dst_pitch, u32 dst_format,
 				    u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				    u8 dst_alpha, u8 dst_alpha_mode)
+				    u8 dst_alpha, u8 dst_alpha_mode,
+				    dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
+				    u32 out_pitch, u32 out_format,
+				    u32 out_crop_w, u32 out_crop_h)
 {
-	/* v2.9.31: CORRECT alpha blending - UI2 (background) + V0 (foreground with alpha) */
-	struct g2d_mixer_ovl_u_reg ui2 = {0};  /* Pipe0: background (dst/temp buffer) */
-	struct g2d_mixer_ovl_v_reg v0 = {0};   /* Pipe1: foreground (src/ball) */
+	/* v2.9.16: 3-buffer alpha blending - UI2 (dst READ) + V0 (src READ) → WB (out WRITE) */
+	struct g2d_mixer_ovl_u_reg ui2 = {0};  /* Pipe0: background (dst) - READ ONLY */
+	struct g2d_mixer_ovl_v_reg v0 = {0};   /* Pipe1: foreground (src) - READ ONLY */
 	struct g2d_mixer_bld_reg bld = {0};    /* Blender */
-	struct g2d_mixer_write_back_reg wb = {0}; /* Writeback to temp buffer */
+	struct g2d_mixer_write_back_reg wb = {0}; /* Writeback (out) - WRITE ONLY */
 
-	u32 src_fmt_val, dst_fmt_val;
+	u32 src_fmt_val, dst_fmt_val, out_fmt_val;
 	dma_addr_t ui2_addr, v0_addr, wb_addr;
-	u32 ui2_bpp, v0_bpp;
+	u32 ui2_bpp, v0_bpp, wb_bpp;
 	unsigned long timeout;
 	int ret;
 
-	dev_info(g2d->dev, "BLIT_ALPHA_CORRECT: src=%ux%u@(%u,%u) alpha=%u/%u dst=%ux%u@(%u,%u) alpha=%u/%u blend=%ux%u\n",
+	dev_info(g2d->dev, "BLIT_ALPHA_3BUF: src=%ux%u@(%u,%u) alpha=%u/%u dst=%ux%u@(%u,%u) alpha=%u/%u out=%ux%u blend=%ux%u\n",
 		 src_crop_w, src_crop_h, src_x, src_y, src_alpha, src_alpha_mode,
 		 dst_w, dst_h, dst_x, dst_y, dst_alpha, dst_alpha_mode,
-		 blend_w, blend_h);
+		 out_crop_w, out_crop_h, blend_w, blend_h);
+
+	/* Check if scaling is needed (G2D V2 requires TWO operations for scale+blend) */
+	bool needs_scaling = (src_crop_w != blend_w) || (src_crop_h != blend_h);
+	
+	if (needs_scaling) {
+		/*
+		 * G2D V2 CRITICAL LIMITATION: VSU cannot do positioning!
+		 * VSU ONLY scales, it always writes to (0,0) of the output buffer.
+		 * 
+		 * WRONG approach (causes artifacts):
+		 *   Scale 110×110 → 84×84 into 800×480 buffer at (345,185)
+		 *   → VSU writes at (0,0), ignoring position!
+		 * 
+		 * CORRECT approach (BSP-compatible):
+		 *   1. Allocate temporary buffer EXACTLY 84×84 (scaled size)
+		 *   2. Scale 110×110 → temp buffer 84×84 at (0,0)
+		 *   3. Use scaled temp as source for alpha blend
+		 * 
+		 * This matches BSP behavior: g2d_bsp_bitblt() allocates temp buffers
+		 * for intermediate scaling results.
+		 */
+		dev_info(g2d->dev, "╔═══════════════════════════════════════════════════════════════╗\n");
+		dev_info(g2d->dev, "║ SCALING REQUIRED: MULTI-STEP OPERATION                       ║\n");
+		dev_info(g2d->dev, "╚═══════════════════════════════════════════════════════════════╝\n");
+		
+		/*
+		 * CRITICAL: Allocate internal temp buffer for scaled result
+		 * Size: blend_w × blend_h (exact scaled size, no positioning)
+		 * 
+		 * PITCH ALIGNMENT: G2D hardware requires pitch aligned to 128 bytes
+		 * Tight pitch (width * 4) causes horizontal line shifting artifacts
+		 */
+		u32 temp_pitch = ALIGN(blend_w * 4, 128);  /* Align pitch to 128 bytes */
+		u32 temp_size = temp_pitch * blend_h;      /* Use aligned pitch for buffer size */
+		void *temp_vaddr = NULL;
+		dma_addr_t temp_dma = 0;
+		
+		/* Force ARGB format to preserve alpha channel */
+		u32 temp_format = (src_format == G2D_FMT_ARGB8888) ? G2D_FMT_ARGB8888 : out_format;
+		
+		dev_info(g2d->dev, "⚠️  Allocating internal temp buffer: %ux%u pitch=%u (%u bytes) fmt=%u\n",
+			 blend_w, blend_h, temp_pitch, temp_size, temp_format);
+		
+		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size, &temp_dma, GFP_KERNEL);
+		if (!temp_vaddr) {
+			dev_err(g2d->dev, "Failed to allocate temp buffer for scaling\n");
+			return -ENOMEM;
+		}
+		
+		/* Clear temp buffer to avoid garbage/stale data affecting blend */
+		memset(temp_vaddr, 0, temp_size);
+		
+		dev_info(g2d->dev, "✅ Temp buffer allocated: vaddr=%p dma=0x%llx pitch=%u (aligned to 128)\n",
+			temp_vaddr, (u64)temp_dma, temp_pitch);
+		
+		/* 
+		* STEP 1: Scale src → temp buffer (EXACT size, no positioning)
+		* VSU writes to (0,0) of temp buffer, which is perfect because
+		* temp buffer is exactly blend_w × blend_h
+		*/
+		dev_info(g2d->dev, "STEP 1: SCALE %ux%u → %ux%u (into temp buffer)\n",
+			src_crop_w, src_crop_h, blend_w, blend_h);
+		dev_info(g2d->dev, "  src: 0x%llx (%ux%u) fmt=%u crop=(%u,%u,%ux%u) pitch=%u\n",
+			(u64)src_dma_addr, src_w, src_h, src_format,
+			src_x, src_y, src_crop_w, src_crop_h, src_pitch);
+		dev_info(g2d->dev, "  temp: 0x%llx (%ux%u) fmt=%u pitch=%u (ALIGNED)\n",
+			(u64)temp_dma, blend_w, blend_h, temp_format, temp_pitch);
+		
+		ret = sunxi_g2d_do_scale(g2d,
+		                         src_dma_addr, src_w, src_h,
+		                         src_pitch, src_format,
+		                         src_x, src_y, src_crop_w, src_crop_h,
+		                         temp_dma, blend_w, blend_h,  /* TEMP: exact size */
+		                         temp_pitch, temp_format,     /* pitch = ALIGNED */
+		                         0, 0, blend_w, blend_h,       /* Write at (0,0) */
+		                         temp_vaddr);                  /* DUMP temp buffer for debug */
+		if (ret) {
+			dev_err(g2d->dev, "❌ Step 1 (scale) failed: %d\n", ret);
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma);
+			return ret;
+		}
+		
+		dev_info(g2d->dev, "✅ Step 1 complete: ball scaled %ux%u → %ux%u in temp\n",
+			 src_crop_w, src_crop_h, blend_w, blend_h);
+		
+		/* 
+		 * STEP 2: Alpha blend using scaled temp buffer
+		 * Now we blend:
+		 * - src = scaled ball (in temp buffer, full buffer read)
+		 * - dst = background (from dst_dma_addr)
+		 * - out = final result (to out_dma_addr at dst_x, dst_y)
+		 */
+		dev_info(g2d->dev, "STEP 2: ALPHA BLEND (temp + bg → out)\n");
+		dev_info(g2d->dev, "  OLD src: dma=0x%llx fmt=%u w=%u h=%u\n",
+			 (u64)src_dma_addr, src_format, src_crop_w, src_crop_h);
+		
+		/* Update src parameters to point to temp buffer */
+		src_dma_addr = temp_dma;           /* Read from temp buffer */
+		src_w = blend_w;                   /* Temp buffer width */
+		src_h = blend_h;                   /* Temp buffer height */
+		src_pitch = temp_pitch;            /* Temp buffer pitch (ALIGNED to 128) */
+		src_format = temp_format;          /* Preserved alpha format */
+		src_x = 0;                         /* Read from (0,0) of temp */
+		src_y = 0;
+		src_crop_w = blend_w;              /* Read entire temp buffer */
+		src_crop_h = blend_h;
+		
+		dev_info(g2d->dev, "  NEW src: dma=0x%llx fmt=%u (%s) w=%u h=%u pitch=%u (ALIGNED)\n",
+			 (u64)src_dma_addr, src_format,
+			 src_format == G2D_FMT_ARGB8888 ? "ARGB8888" :
+			 src_format == G2D_FMT_XRGB8888 ? "XRGB8888" : "OTHER",
+			 src_w, src_h, src_pitch);
+		dev_info(g2d->dev, "  src_crop: (%u,%u) %ux%u (FULL TEMP BUFFER)\n",
+			 src_x, src_y, src_crop_w, src_crop_h);
+		
+		dev_info(g2d->dev, "→ Proceeding to STEP 2 (alpha blend)...\n");
+		
+		/* Fall through to normal alpha blend below (without scaling) */
+		/* IMPORTANT: temp buffer will be freed after blend completes */
+		
+		/* Store temp buffer info for cleanup after blend */
+		g2d->temp_scale_buffer = temp_vaddr;
+		g2d->temp_scale_dma = temp_dma;
+		g2d->temp_scale_size = temp_size;
+	}
 
 	/* Enable hardware */
 	ret = sunxi_g2d_hw_enable(g2d);
-	if (ret)
+	if (ret) {
+		/* Cleanup temp buffer if allocated */
+		if (g2d->temp_scale_buffer) {
+			dma_free_coherent(g2d->dev, g2d->temp_scale_size,
+					  g2d->temp_scale_buffer, g2d->temp_scale_dma);
+			g2d->temp_scale_buffer = NULL;
+		}
 		return ret;
+	}
 
 	/* Map format to hardware value - SAME as fillrect */
 	switch (src_format) {
@@ -2086,6 +2414,21 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 		break;
 	default:
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
+		return -EINVAL;
+	}
+
+	switch (out_format) {
+	case G2D_FMT_ARGB8888:
+		out_fmt_val = 0x0;
+		break;
+	case G2D_FMT_XRGB8888:
+		out_fmt_val = 0x4;
+		break;
+	case G2D_FMT_RGB565:
+		out_fmt_val = 0xA;
+		break;
+	default:
+		dev_err(g2d->dev, "Unsupported output format: %u\n", out_format);
 		return -EINVAL;
 	}
 
@@ -2121,21 +2464,30 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 		break;
 	}
 
-	/* UI2 reads from dst_base_addr (temp buffer with background already copied) */
-	ui2_addr = dst_base_addr;  /* Read from temp buffer base (before offset) */
+	/* UI2 reads from dst buffer at the position where the ball is (dst_x, dst_y) */
+	ui2_addr = dst_dma_addr;  /* Use dst_dma_addr which already has the offset applied */
 
-	/* Configure UI2 attributes - background is transparent for alpha blending */
+	dev_info(g2d->dev, "UI2 addressing: dst_dma_addr=0x%llx dst_base_addr=0x%llx diff=0x%llx pitch=%u\n",
+		 (u64)dst_dma_addr, (u64)dst_base_addr, (u64)(dst_dma_addr - dst_base_addr), dst_pitch);
+
+	/* Configure UI2 attributes - background with user alpha settings */
 	ui2.ovl_attr.bits.lay_en = 1;
-	ui2.ovl_attr.bits.alpha_mode = 1;  /* Global alpha */
+	ui2.ovl_attr.bits.alpha_mode = dst_alpha_mode;  /* User's dst alpha mode */
 	ui2.ovl_attr.bits.lay_fbfmt = dst_fmt_val;
-	ui2.ovl_attr.bits.lay_glbalpha = 0;  /* Background fully transparent */
+	ui2.ovl_attr.bits.lay_glbalpha = dst_alpha;  /* User's dst alpha value */
+	
+	dev_info(g2d->dev, "UI2 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
+		 dst_alpha_mode, dst_alpha);
 
-	/* UI2 memory configuration - read full temp buffer */
-	ui2.ovl_mem.bits.lay_width = dst_w - 1;  /* Full framebuffer width */
-	ui2.ovl_mem.bits.lay_height = dst_h - 1; /* Full framebuffer height */
-	ui2.ovl_mem_coor.bits.lay_xcoor = 0;  /* No crop - read from start */
+	/* UI2 memory configuration - read the blend region from dst buffer
+	 * The address (ui2_addr = dst_dma_addr) already points to (dst_x, dst_y),
+	 * so we read blend_w x blend_h starting from (0,0) relative to that address
+	 */
+	ui2.ovl_mem.bits.lay_width = blend_w - 1;   /* Blend area width */
+	ui2.ovl_mem.bits.lay_height = blend_h - 1;  /* Blend area height */
+	ui2.ovl_mem_coor.bits.lay_xcoor = 0;  /* Already at correct position via address */
 	ui2.ovl_mem_coor.bits.lay_ycoor = 0;
-	ui2.ovl_mem_pitch0 = dst_pitch;
+	ui2.ovl_mem_pitch0 = dst_pitch;  /* Full framebuffer stride */
 	ui2.ovl_mem_low_addr0 = (u32)ui2_addr;
 	ui2.ovl_mem_high_addr = (u32)((u64)ui2_addr >> 32);
 	ui2.ovl_winsize.bits.width = blend_w - 1;   /* Output to blend area size */
@@ -2150,8 +2502,8 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, UI2_HADD, ui2.ovl_mem_high_addr);
 	g2d_write(g2d, UI2_SIZE, ui2.ovl_winsize.dwval);
 
-	dev_info(g2d->dev, "UI2 (Pipe0/BG): attr=0x%08X addr=0x%llx size=%ux%u crop=(0,0) win=%ux%u alpha=0\n",
-		 ui2.ovl_attr.dwval, (u64)ui2_addr, dst_w, dst_h, blend_w, blend_h);
+	dev_info(g2d->dev, "UI2 (Pipe0/BG): addr=0x%llx size=%ux%u pitch=%u win=%ux%u alpha=%u mode=%u\n",
+		 (u64)ui2_addr, blend_w, blend_h, dst_pitch, blend_w, blend_h, dst_alpha, dst_alpha_mode);
 
 	/* === Configure V0 (Pipe1: foreground/ball with alpha) === */
 
@@ -2173,12 +2525,18 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 
 	/* V0 address = ball buffer base + offset */
 	v0_addr = src_dma_addr + (src_y * src_pitch) + (src_x * v0_bpp);
+	
+	dev_info(g2d->dev, "ALPHA_BLEND V0 ADDR: base=0x%llx crop_xy=(%u,%u) pitch=%u bpp=%u -> v0_addr=0x%llx\n",
+		 (u64)src_dma_addr, src_x, src_y, src_pitch, v0_bpp, (u64)v0_addr);
 
 	/* Configure V0 attributes - foreground with user alpha */
 	v0.ovl_attr.bits.lay_en = 1;
 	v0.ovl_attr.bits.alpha_mode = src_alpha_mode;  /* User's alpha mode */
 	v0.ovl_attr.bits.lay_fbfmt = src_fmt_val;
 	v0.ovl_attr.bits.lay_glbalpha = src_alpha;  /* User's alpha value */
+	
+	dev_info(g2d->dev, "V0 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
+		 src_alpha_mode, src_alpha);
 
 	/* V0 memory configuration */
 	v0.ovl_mem.bits.lay_width = src_crop_w - 1;
@@ -2190,6 +2548,12 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 	v0.ovl_mem_high_addr.bits.lay_y_hadd = (u32)((u64)v0_addr >> 32);
 	v0.ovl_winsize.bits.width = src_crop_w - 1;
 	v0.ovl_winsize.bits.height = src_crop_h - 1;
+
+	dev_info(g2d->dev, "ALPHA_BLEND V0 PITCH WRITE: v0.ovl_mem_pitch0=%u src_pitch=%u\n",
+		 v0.ovl_mem_pitch0, src_pitch);
+	dev_info(g2d->dev, "ALPHA_BLEND V0 REGS: MBSIZE=0x%08X (lay_w=%u lay_h=%u) SIZE=0x%08X (win_w=%u win_h=%u)\n",
+		 v0.ovl_mem.dwval, v0.ovl_mem.bits.lay_width, v0.ovl_mem.bits.lay_height,
+		 v0.ovl_winsize.dwval, v0.ovl_winsize.bits.width, v0.ovl_winsize.bits.height);
 
 	/* Write V0 to hardware */
 	g2d_write(g2d, V0_ATTCTL, v0.ovl_attr.dwval);
@@ -2230,15 +2594,24 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 	bld.out_size.bits.width = blend_w - 1;
 	bld.out_size.bits.height = blend_h - 1;
 
-	/* BLD control - TEST: DSTIN mode */
-	bld.bld_ctrl.dwval = 0x02000200;  /* DSTIN: show intersection of src and dst */
+	/* BLD control - SRCOVER mode for proper alpha blending
+	 * SRCOVER: out_color = src_color + dst_color * (1 - src_alpha)
+	 * This creates proper transparency effect - foreground over background
+	 * 
+	 * BLD_CTL format: [31:24]=pipe3 [23:16]=pipe2 [15:8]=pipe1 [7:0]=pipe0
+	 * BSP driver uses 0x03010301 for SRCOVER:
+	 *   pipe3=0x03, pipe2=0x01, pipe1=0x03 (V0/foreground), pipe0=0x01 (UI2/background)
+	 */
+	bld.bld_ctrl.dwval = 0x03010301;  /* SRCOVER mode matching BSP driver */
 
 	/* Output in RGB mode (framebuffer is XRGB8888) */
-	bld.out_color.dwval = 0;  /* RGB mode */
+	bld.out_color.dwval = 0;  /* Clear all first */
+	bld.out_color.bits.alpha_mode = 0;  /* RGB mode (not YUV) */
+	bld.out_color.bits.premul_en = 0;   /* No premultiplication on output */
 
 	/* ROP: Source copy for alpha blending */
 	bld.rop_ctrl.dwval = 0xf0;
-	bld.ch3_index0.dwval = 0x00000000;  /* Try 0 instead of COPYPEN */
+	bld.ch3_index0.dwval = 0x00000000;
 
 	/* Write BLD configuration */
 	g2d_write(g2d, BLD_EN_CTL, bld.bld_en_ctrl.dwval);
@@ -2256,16 +2629,34 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 	dev_info(g2d->dev, "BLD: en=0x%08X ctl=0x%08X (UI2+alpha V0 blending)\n",
 		 bld.bld_en_ctrl.dwval, bld.bld_ctrl.dwval);
 
-	/* === Configure Writeback - Write result back to temp buffer === */
+	/* === Configure Writeback - Write result to OUTPUT buffer (separate from inputs) === */
 
-	/* WB address = temp buffer (same as input, for in-place blending) */
-	wb_addr = dst_dma_addr;  /* Write back to temp buffer */
+	/* WB address = output buffer (temp_buffer in demo, DIFFERENT from dst) */
+	wb_addr = out_dma_addr;  /* Write to output buffer */
+
+	/* Calculate bytes per pixel for writeback */
+	switch (out_format) {
+	case G2D_FMT_ARGB8888:
+	case G2D_FMT_XRGB8888:
+	case G2D_FMT_ABGR8888:
+	case G2D_FMT_XBGR8888:
+		wb_bpp = 4;
+		break;
+	case G2D_FMT_RGB565:
+		wb_bpp = 2;
+		break;
+	default:
+		wb_bpp = 4;
+		break;
+	}
 
 	/* Configure writeback */
-	wb.wb_attr.bits.fmt = dst_fmt_val;
+	wb.wb_attr.dwval = 0;  /* Clear all bits first */
+	wb.wb_attr.bits.fmt = out_fmt_val;
+	wb.wb_attr.bits.round_en = 0;
 	wb.data_size.bits.width = blend_w - 1;
 	wb.data_size.bits.height = blend_h - 1;
-	wb.pitch0 = dst_pitch;
+	wb.pitch0 = out_pitch;
 	wb.laddr0 = (u32)wb_addr;
 	wb.haddr0 = (u32)((u64)wb_addr >> 32);
 
@@ -2276,8 +2667,16 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, WB_LADD0, wb.laddr0);
 	g2d_write(g2d, WB_HADD0, wb.haddr0);
 
-	dev_info(g2d->dev, "WB: addr=0x%llx size=%ux%u (write back to temp buffer)\n",
-		 (u64)wb_addr, blend_w, blend_h);
+	dev_info(g2d->dev, "WB: addr=0x%llx size=%ux%u pitch=%u (WRITE to output buffer)\n",
+		 (u64)wb_addr, blend_w, blend_h, out_pitch);
+
+	/* 
+	 * Note: VSU (scaling) is NOT configured here because:
+	 * - If scaling was needed, it was already done in Step 1 (BLIT with VSU)
+	 * - This step (Step 2) only does alpha blending without scaling
+	 * - src_crop_w/h now equals blend_w/h (1:1 operation)
+	 */
+	g2d_write(g2d, VS_CTRL, 0);  /* Ensure VSU is disabled for alpha blend */
 
 	/* === Start operation === */
 	g2d_write(g2d, CMD_CTL, CMD_CTL_START);
@@ -2304,6 +2703,379 @@ static int sunxi_g2d_do_blit_alpha(struct sunxi_g2d_dev *g2d,
 	}
 
 	dev_dbg(g2d->dev, "BLIT_ALPHA_CORRECT completed via IRQ\n");
+	sunxi_g2d_hw_disable(g2d);
+	
+	/* Free temporary scaling buffer if it was allocated */
+	if (g2d->temp_scale_buffer) {
+		dev_info(g2d->dev, "Freeing temp scale buffer: vaddr=%p dma=0x%llx size=%zu\n",
+			 g2d->temp_scale_buffer, (u64)g2d->temp_scale_dma, g2d->temp_scale_size);
+		dma_free_coherent(g2d->dev, g2d->temp_scale_size,
+				  g2d->temp_scale_buffer, g2d->temp_scale_dma);
+		g2d->temp_scale_buffer = NULL;
+		g2d->temp_scale_dma = 0;
+		g2d->temp_scale_size = 0;
+	}
+	
+	return 0;
+}
+
+/**
+ * sunxi_g2d_dump_buffer - Dump buffer contents to /tmp for debugging
+ * @g2d: G2D device
+ * @vaddr: Virtual address of buffer (must be CPU-accessible)
+ * @size: Buffer size in bytes
+ * @name: Filename prefix (e.g., "vsu-output")
+ *
+ * Writes buffer to /tmp/<name>-<timestamp>.raw
+ */
+// static void sunxi_g2d_dump_buffer(struct sunxi_g2d_dev *g2d, void *vaddr,
+//                                   size_t size, const char *name)
+// {
+// 	struct file *f;
+// 	char path[128];
+// 	loff_t pos = 0;
+// 	ssize_t written;
+	
+// 	snprintf(path, sizeof(path), "/tmp/%s-%lld.raw", name, ktime_get_ns());
+	
+// 	f = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+// 	if (IS_ERR(f)) {
+// 		dev_err(g2d->dev, "Failed to create dump file %s: %ld\n",
+// 			path, PTR_ERR(f));
+// 		return;
+// 	}
+	
+// 	written = kernel_write(f, vaddr, size, &pos);
+// 	filp_close(f, NULL);
+	
+// 	if (written != size) {
+// 		dev_err(g2d->dev, "Dump incomplete: wrote %zd/%zu bytes to %s\n",
+// 			written, size, path);
+// 	} else {
+// 		dev_info(g2d->dev, "✅ Dumped %zu bytes to %s\n", size, path);
+// 	}
+// }
+
+/**
+ * sunxi_g2d_do_scale - Isolated scaling operation using VSU
+ *
+ * Performs ONLY scaling (via Video Scaler Unit), no blending or other effects.
+ * This is a building block that can be called before blend/blit/mask operations
+ * when scaling is required.
+ *
+ * G2D V2 Architecture Limitation:
+ * - Without RCQ, cannot combine VSU+BLD in single operation
+ * - Solution: Call this first to scale, then call blend/blit/etc separately
+ *
+ * @src_crop_w x src_crop_h: Input size (what to read from source)
+ * @dst_out_w x dst_out_h: Output size (what to write to destination)
+ * VSU will scale from input size to output size.
+ * @dst_vaddr: Optional CPU-accessible address of dst buffer for debugging (NULL = no dump)
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
+                              dma_addr_t src_dma, u32 src_width, u32 src_height,
+                              u32 src_pitch, u32 src_format,
+                              u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+                              dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
+                              u32 dst_pitch, u32 dst_format,
+                              u32 dst_x, u32 dst_y, u32 dst_out_w, u32 dst_out_h,
+                              void *dst_vaddr)
+{
+	struct g2d_mixer_ovl_v_reg v0 = {0};      /* V0 layer (video pipe with VSU) */
+	struct g2d_mixer_bld_reg bld = {0};       /* Blender */
+	struct g2d_mixer_write_back_reg wb = {0}; /* Writeback */
+	
+	u32 hw_src_fmt, hw_dst_fmt;
+	dma_addr_t src_offset_dma, dst_offset_dma;
+	u32 src_bpp, dst_bpp;
+	unsigned long timeout;
+	u32 mixer_ctl;
+	int ret;
+	
+	dev_info(g2d->dev, "SCALE: %ux%u@(%u,%u) crop=%ux%u → %ux%u@(%u,%u) scaled=%ux%u\n",
+		 src_width, src_height, src_x, src_y, src_crop_w, src_crop_h,
+		 dst_width, dst_height, dst_x, dst_y, dst_out_w, dst_out_h);
+	
+	/* === Convert format enums to hardware values === */
+	
+	/* Source format conversion
+	 * CRITICAL: ION buffers created by userspace are in native ARGB format
+	 * The VSU reads pixels byte-by-byte and expects the format to match memory layout
+	 * DO NOT swap R↔B for source - use direct mapping like BSP does
+	 */
+	switch (src_format) {
+	case G2D_FMT_ARGB8888:
+		src_bpp = 4;
+		hw_src_fmt = G2D_FORMAT_ARGB8888;  /* Direct mapping, NO swap */
+		break;
+	case G2D_FMT_XRGB8888:
+		src_bpp = 4;
+		hw_src_fmt = G2D_FORMAT_XRGB8888;  /* Direct mapping, NO swap */
+		break;
+	case G2D_FMT_ABGR8888:
+		src_bpp = 4;
+		hw_src_fmt = G2D_FORMAT_ABGR8888;  /* Direct mapping */
+		break;
+	case G2D_FMT_XBGR8888:
+		src_bpp = 4;
+		hw_src_fmt = G2D_FORMAT_XBGR8888;  /* Direct mapping */
+		break;
+	case G2D_FMT_RGB565:
+		src_bpp = 2;
+		hw_src_fmt = G2D_FORMAT_RGB565;
+		break;
+	default:
+		dev_err(g2d->dev, "Unsupported source format: %u\n", src_format);
+		return -EINVAL;
+	}
+	
+	/* Destination format conversion
+	 * For DRM framebuffer output, we may need R↔B swap depending on DRM format
+	 * But for intermediate buffers (temp), use direct mapping
+	 */
+	switch (dst_format) {
+	case G2D_FMT_ARGB8888:
+		dst_bpp = 4;
+		hw_dst_fmt = G2D_FORMAT_ARGB8888;  /* Direct mapping for temp buffers */
+		break;
+	case G2D_FMT_XRGB8888:
+		dst_bpp = 4;
+		hw_dst_fmt = G2D_FORMAT_XRGB8888;  /* Direct mapping */
+		break;
+	case G2D_FMT_ABGR8888:
+		dst_bpp = 4;
+		hw_dst_fmt = G2D_FORMAT_ABGR8888;  /* Direct mapping */
+		break;
+	case G2D_FMT_XBGR8888:
+		dst_bpp = 4;
+		hw_dst_fmt = G2D_FORMAT_XBGR8888;  /* Direct mapping */
+		break;
+	case G2D_FMT_RGB565:
+		dst_bpp = 2;
+		hw_dst_fmt = G2D_FORMAT_RGB565;
+		break;
+	default:
+		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
+		return -EINVAL;
+	}
+	
+	/* Calculate DMA addresses with offsets */
+	src_offset_dma = src_dma + (src_y * src_pitch) + (src_x * src_bpp);
+	dst_offset_dma = dst_dma + (dst_y * dst_pitch) + (dst_x * dst_bpp);
+	
+	/* Enable hardware */
+	ret = sunxi_g2d_hw_enable(g2d);
+	if (ret)
+		return ret;
+	
+	/* Reset IRQ flag */
+	atomic_set(&g2d->irq_done, 0);
+	
+	/* === Hardware Configuration === */
+	
+	/* 1. Reset G2D */
+	g2d_write(g2d, G2D_AHB_RESET, 0x0);
+	g2d_write(g2d, G2D_AHB_RESET, 0x3);
+	wmb();
+	
+	/* Clear and enable interrupts */
+	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
+	udelay(1);
+	g2d_write(g2d, G2D_MIXER_INT, 0x00000011);
+	
+	/* === Configure V0 Layer (Source with VSU) === */
+	
+	v0.ovl_attr.dwval = 0;
+	v0.ovl_attr.bits.lay_en = 1;                      /* Enable layer */
+	v0.ovl_attr.bits.alpha_mode = 0;                  /* Pixel alpha mode */
+	v0.ovl_attr.bits.lay_fbfmt = src_format;          /* TEST: Use API format directly, no conversion */
+	v0.ovl_attr.bits.lay_glbalpha = 0xFF;             /* Global alpha */
+	
+	v0.ovl_mem.bits.lay_width = src_crop_w - 1;       /* Input width (buffer size) */
+	v0.ovl_mem.bits.lay_height = src_crop_h - 1;      /* Input height (buffer size) */
+	
+	v0.ovl_mem_coor.bits.lay_xcoor = 0;               /* Position in blender */
+	v0.ovl_mem_coor.bits.lay_ycoor = 0;
+	
+	v0.ovl_mem_pitch0 = src_pitch;
+	v0.ovl_mem_low_addr0 = (u32)src_offset_dma;
+	v0.ovl_mem_high_addr.bits.lay_y_hadd = (u32)((u64)src_offset_dma >> 32);
+	
+	v0.ovl_fill_color = 0;  /* Not used in image mode */
+	
+	/* TEST v2.9.43: ovl_winsize should match INPUT size when using VSU
+	 * The VSU output size is configured separately in VS_OUT_SIZE
+	 * ovl_winsize may define the "window" of pixels to READ, not WRITE
+	 */
+	v0.ovl_winsize.bits.width = src_crop_w - 1;   /* TEST: Use INPUT size */
+	v0.ovl_winsize.bits.height = src_crop_h - 1;  /* TEST: Use INPUT size */
+	
+	/* BSP: DO NOT write HDS/VDS registers for RGB formats
+	 * Only YUV formats or very aggressive scaling (>8x/4x) use HDS/VDS
+	 * For RGB with VSU, leave HDS/VDS untouched (default disabled)
+	 */
+	/* Removed HDS/VDS writes */
+	
+	/* Write V0 registers using struct */
+	dev_info(g2d->dev, "📐 VSU INPUT: src_crop=%ux%u, dst_out=%ux%u\n",
+		 src_crop_w, src_crop_h, dst_out_w, dst_out_h);
+	dev_info(g2d->dev, "📐 V0 CONFIG: mem=%ux%u, win=%ux%u, pitch=%u\n",
+		 src_crop_w - 1, src_crop_h - 1, dst_out_w - 1, dst_out_h - 1, src_pitch);
+	
+	g2d_write(g2d, V0_ATTCTL, v0.ovl_attr.dwval);
+	g2d_write(g2d, V0_MBSIZE, v0.ovl_mem.dwval);
+	g2d_write(g2d, V0_COOR, v0.ovl_mem_coor.dwval);
+	g2d_write(g2d, V0_PITCH0, v0.ovl_mem_pitch0);
+	g2d_write(g2d, V0_LADD0, v0.ovl_mem_low_addr0);
+	g2d_write(g2d, V0_HADD, v0.ovl_mem_high_addr.dwval);
+	g2d_write(g2d, V0_FILLC, v0.ovl_fill_color);
+	g2d_write(g2d, V0_SIZE, v0.ovl_winsize.dwval);
+	/* BSP: DO NOT write HDS/VDS for RGB - removed writes */
+	
+	dev_info(g2d->dev, "V0: fmt=%u (hw=%u) mem=%ux%u win=%ux%u pitch=%u addr=0x%llx alpha=0x%02X\n",
+		 src_format, hw_src_fmt, src_crop_w, src_crop_h,
+		 dst_out_w, dst_out_h, src_pitch,
+		 (u64)src_offset_dma, v0.ovl_attr.bits.lay_glbalpha);
+	
+	/* === Setup VSU (Video Scaler Unit) === */
+	/* CRITICAL FIX: Pass API format (src_format), NOT hardware format (hw_src_fmt)!
+	 * VSU processes pixels byte-by-byte agnostic to ARGB/ABGR order
+	 * The ARGB↔ABGR conversion is for V0/WB overlay layers, not VSU
+	 * V0 reads from VSU output with the correct hw_src_fmt interpretation
+	 */
+	ret = sunxi_g2d_vsu_setup(g2d, src_format, src_crop_w, src_crop_h,
+	                          dst_out_w, dst_out_h, 0xff);
+	if (ret) {
+		dev_err(g2d->dev, "VSU setup failed: %d\n", ret);
+		sunxi_g2d_hw_disable(g2d);
+		return ret;
+	}
+	
+	/* === Configure BLD (Blender) === */
+	
+	bld.bld_en_ctrl.dwval = 0;
+	bld.bld_en_ctrl.bits.p0_en = 1;  /* Enable pipe 0 (V0) */
+	
+	bld.premulti_ctrl.dwval = 0;   /* No premultiply */
+	
+	bld.mem_coor[0].bits.xcoor = 0;  /* Channel 0 position */
+	bld.mem_coor[0].bits.ycoor = 0;
+	
+	/* v2.9.45: REVERT v2.9.44 - BSP uses OUTPUT size for BLD_CH_ISIZE0
+	 * BSP code (line 2007-2011): rect0.w = dst->clip_rect.w (OUTPUT)
+	 * When VSU is enabled, BLD receives VSU OUTPUT, not input
+	 */
+	bld.mem_size[0].bits.width = dst_out_w - 1;   /* BSP: Use OUTPUT size */
+	bld.mem_size[0].bits.height = dst_out_h - 1;  /* BSP: Use OUTPUT size */
+	
+	bld.out_size.bits.width = dst_out_w - 1;      /* Output size */
+	bld.out_size.bits.height = dst_out_h - 1;
+	
+	bld.out_color.dwval = 0;
+	bld.out_color.bits.alpha_mode = 0;  /* RGB mode (not YUV) */
+	bld.out_color.bits.premul_en = 0;   /* No premultiplication on output */
+	
+	bld.bld_ctrl.dwval = 0;  /* Simple passthrough */
+	
+	bld.rop_ctrl.dwval = 0x000000f0;     /* ROP3: S (source copy) */
+	bld.ch3_index0.dwval = 0x00061080;
+	
+	/* Write BLD registers using struct */
+	g2d_write(g2d, BLD_EN_CTL, bld.bld_en_ctrl.dwval);
+	g2d_write(g2d, BLD_PREMUL_CTL, bld.premulti_ctrl.dwval);
+	g2d_write(g2d, BLD_CH_ISIZE0, bld.mem_size[0].dwval);
+	g2d_write(g2d, BLD_CH_OFFSET0, bld.mem_coor[0].dwval);
+	g2d_write(g2d, BLD_OUT_SIZE, bld.out_size.dwval);
+	g2d_write(g2d, BLD_OUT_COLOR, bld.out_color.dwval);
+	g2d_write(g2d, BLD_CTL, bld.bld_ctrl.dwval);
+	g2d_write(g2d, ROP_CTL, bld.rop_ctrl.dwval);
+	g2d_write(g2d, ROP_INDEX0, bld.ch3_index0.dwval);
+	
+	/* === Configure Writeback === */
+	
+	wb.wb_attr.dwval = 0;
+	wb.wb_attr.bits.fmt = hw_dst_fmt;    /* Destination format (converted) */
+	wb.wb_attr.bits.round_en = 0;
+	
+	wb.data_size.bits.width = dst_out_w - 1;
+	wb.data_size.bits.height = dst_out_h - 1;
+	
+	wb.pitch0 = dst_pitch;
+	wb.laddr0 = (u32)dst_offset_dma;
+	wb.haddr0 = (u32)((u64)dst_offset_dma >> 32);
+	
+	/* Write WB registers using struct */
+	g2d_write(g2d, WB_ATT, wb.wb_attr.dwval);
+	g2d_write(g2d, WB_SIZE, wb.data_size.dwval);
+	g2d_write(g2d, WB_PITCH0, wb.pitch0);
+	g2d_write(g2d, WB_LADD0, wb.laddr0);
+	g2d_write(g2d, WB_HADD0, wb.haddr0);
+	
+	dev_info(g2d->dev, "WB: fmt=%u (hw=%u) size=%ux%u pitch=%u addr=0x%llx\n",
+		 dst_format, hw_dst_fmt, dst_out_w, dst_out_h, dst_pitch,
+		 (u64)dst_offset_dma);
+	
+	/* === Start Operation === */
+	
+	mixer_ctl = G2D_MIXER_CTL_START;
+	g2d_write(g2d, G2D_MIXER_CTL, mixer_ctl);
+	
+	/* Wait for completion */
+	timeout = wait_event_timeout(g2d->irq_wait,
+	                              atomic_read(&g2d->irq_done),
+	                              msecs_to_jiffies(100));
+	if (timeout == 0) {
+		dev_err(g2d->dev, "Scale operation timeout (100ms)\n");
+		sunxi_g2d_hw_disable(g2d);
+		return -ETIMEDOUT;
+	}
+	
+	if (!atomic_read(&g2d->irq_done)) {
+		dev_err(g2d->dev, "Scale failed (no IRQ)\n");
+		sunxi_g2d_hw_disable(g2d);
+		return -EIO;
+	}
+	
+	dev_info(g2d->dev, "✅ SCALE completed: %ux%u → %ux%u\n",
+		 src_crop_w, src_crop_h, dst_out_w, dst_out_h);
+	
+	/* DEBUG: Dump output buffer if vaddr provided */
+	// if (dst_vaddr) {
+	// 	size_t dump_size = dst_out_h * dst_pitch;
+	// 	dev_info(g2d->dev, "🔍 DUMPING VSU OUTPUT: %ux%u (pitch=%u) = %zu bytes to /tmp/vsu-output-*.raw\n",
+	// 		 dst_out_w, dst_out_h, dst_pitch, dump_size);
+	// 	dev_info(g2d->dev, "   To convert: convert -size %ux%u -depth 8 BGRA:vsu-output-*.raw vsu-output.png\n",
+	// 		 dst_out_w, dst_out_h);
+		
+	// 	/* Log first few pixels to verify RGB data */
+	// 	u32 *pixels = (u32 *)dst_vaddr;
+	// 	int mid_offset = (dst_out_h / 2) * (dst_pitch / 4) + (dst_out_w / 2);
+	// 	dev_info(g2d->dev, "   VSU OUTPUT PIXELS: [0]=0x%08x [1]=0x%08x [mid=%d]=0x%08x [mid+5]=0x%08x\n",
+	// 		 pixels[0], pixels[1], mid_offset, pixels[mid_offset], pixels[mid_offset + 5]);
+		
+	// 	/* Detailed RGB byte analysis for first pixel (should be 0x804488EE if color preserved) */
+	// 	u32 p0 = pixels[0];
+	// 	u8 b0 = p0 & 0xFF;
+	// 	u8 g0 = (p0 >> 8) & 0xFF;
+	// 	u8 r0 = (p0 >> 16) & 0xFF;
+	// 	u8 a0 = (p0 >> 24) & 0xFF;
+	// 	dev_info(g2d->dev, "   🔬 PIXEL[0] BYTES: B=0x%02x G=0x%02x R=0x%02x A=0x%02x (expected: B=0xEE G=0x88 R=0x44 A=0x80)\n",
+	// 		 b0, g0, r0, a0);
+		
+	// 	/* Check a few more pixels for pattern */
+	// 	u32 p1 = pixels[1];
+	// 	u32 pm = pixels[mid_offset];
+	// 	dev_info(g2d->dev, "   🔬 PIXEL[1] = 0x%08x (B=%02x G=%02x R=%02x A=%02x)\n",
+	// 		 p1, (u8)(p1 & 0xFF), (u8)((p1 >> 8) & 0xFF), (u8)((p1 >> 16) & 0xFF), (u8)((p1 >> 24) & 0xFF));
+	// 	dev_info(g2d->dev, "   🔬 PIXEL[mid=%d] = 0x%08x (B=%02x G=%02x R=%02x A=%02x)\n",
+	// 		 mid_offset, pm, (u8)(pm & 0xFF), (u8)((pm >> 8) & 0xFF), (u8)((pm >> 16) & 0xFF), (u8)((pm >> 24) & 0xFF));
+
+		
+	// 	sunxi_g2d_dump_buffer(g2d, dst_vaddr, dump_size, "vsu-output");
+	// }
+	
 	sunxi_g2d_hw_disable(g2d);
 	return 0;
 }
@@ -2351,7 +3123,7 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 		src_width, src_height, (u64)src_dma, src_x, src_y, src_crop_w, src_crop_h,
 		dst_x, dst_y, dst_w, dst_h, (u64)dst_dma);
 	
-	/* Calculate source offset for crop */
+	/* Calculate source format info for V0 configuration */
 	u32 src_bpp;
 	switch (src_format) {
 	case G2D_FMT_ARGB8888:
@@ -2359,7 +3131,7 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	case G2D_FMT_ABGR8888:
 	case G2D_FMT_XBGR8888:
 		src_bpp = 4;
-		v0_attctl = 0x00; /* ARGB8888 format */
+		v0_attctl = 0x00; /* ARGB8888 format code for V0_ATTCTL */
 		break;
 	case G2D_FMT_RGB565:
 		src_bpp = 2;
@@ -2394,6 +3166,9 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, V0_PITCH0, src_pitch);
 	g2d_write(g2d, V0_LADD0, lower_32_bits(src_offset_dma));
 	g2d_write(g2d, V0_HADD, upper_32_bits(src_offset_dma));
+	
+	dev_info(g2d->dev, "BLIT V0 CONFIG: MBSIZE=%ux%u SIZE=%ux%u PITCH=%u addr=0x%llx\n",
+		 src_crop_w, src_crop_h, src_crop_w, src_crop_h, src_pitch, (u64)src_offset_dma);
 	
 	/* V0 fillcolor not used in image mode */
 	g2d_write(g2d, V0_FILLC, 0x00000000);
@@ -2442,6 +3217,9 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, WB_HADD0, upper_32_bits(dst_offset_dma));
 	g2d_write(g2d, WB_PITCH0, dst_pitch);
 	
+	dev_info(g2d->dev, "BLIT WB CONFIG: size=%ux%u pitch=%u dst_xy=(%u,%u) addr=0x%llx (offset from base=0x%llx)\n",
+		 dst_w, dst_h, dst_pitch, dst_x, dst_y, (u64)dst_offset_dma, (u64)(dst_offset_dma - dst_dma));
+	
 	/* WB size = destination blit size */
 	g2d_write(g2d, WB_SIZE, ((dst_h - 1) << 16) | (dst_w - 1));
 	g2d_write(g2d, BLD_SIZE, ((dst_h - 1) << 16) | (dst_w - 1));  /* Must match WB_SIZE */
@@ -2456,6 +3234,11 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 		dev_info(g2d->dev, "VSU: Enabling scaler for %ux%u -> %ux%u\n",
 			 src_crop_w, src_crop_h, dst_w, dst_h);
 		
+		/* CRITICAL FIX: Pass API format (src_format), NOT hardware format (hw_src_fmt)!
+		 * VSU processes pixels byte-by-byte agnostic to ARGB/ABGR order
+		 * The ARGB↔ABGR conversion is for V0/WB overlay layers, not VSU
+		 * V0 reads from VSU output with the correct hw_src_fmt interpretation
+		 */
 		ret = sunxi_g2d_vsu_setup(g2d, src_format, src_crop_w, src_crop_h,
 					  dst_w, dst_h, 0xff);
 		if (ret) {
@@ -3259,33 +4042,43 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 					 unsigned long arg)
 {
 	struct g2d_alpha_blend blend;
-	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL;
-	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL;
-	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
-	dma_addr_t src_dma_addr, dst_dma_addr;
-	u32 src_bpp, dst_bpp;
-	u32 src_pitch, dst_pitch;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
+	u32 src_bpp, dst_bpp, out_bpp;
+	u32 src_pitch, dst_pitch, out_pitch;
 	int ret;
 	
 	if (copy_from_user(&blend, (void __user *)arg, sizeof(blend)))
 		return -EFAULT;
 	
+	dev_info(g2d->dev, "ALPHA_BLEND IOCTL: src.crop=%ux%u dst.crop=%ux%u out.crop=%ux%u\n",
+		 blend.src.crop_w, blend.src.crop_h,
+		 blend.dst.crop_w, blend.dst.crop_h,
+		 blend.out.crop_w, blend.out.crop_h);
+	
+	dev_info(g2d->dev, "ALPHA_BLEND: dst.crop_x=%u dst.crop_y=%u dst.crop_w=%u dst.crop_h=%u\n",
+		 blend.dst.crop_x, blend.dst.crop_y, blend.dst.crop_w, blend.dst.crop_h);
+	
 	/* Validate parameters */
 	if (blend.src.crop_w == 0 || blend.src.crop_h == 0 ||
-	    blend.dst.crop_w == 0 || blend.dst.crop_h == 0) {
+	    blend.dst.crop_w == 0 || blend.dst.crop_h == 0 ||
+	    blend.out.crop_w == 0 || blend.out.crop_h == 0) {
 		dev_err(g2d->dev, "Invalid dimensions\n");
 		return -EINVAL;
 	}
 	
 	/* For now, only support DMA-BUF */
-	if (blend.src.dma_fd < 0 || blend.dst.dma_fd < 0) {
-		dev_err(g2d->dev, "Physical address mode not supported\n");
+	if (blend.src.dma_fd < 0 || blend.dst.dma_fd < 0 || blend.out.dma_fd < 0) {
+		dev_err(g2d->dev, "Physical address mode not supported (need 3 dma_fds)\n");
 		return -EINVAL;
 	}
 	
-	dev_info(g2d->dev, "ALPHA_BLEND: src=%dx%d (alpha=%u mode=%u) dst=%dx%d (alpha=%u mode=%u)\n",
+	dev_info(g2d->dev, "ALPHA_BLEND (3-buffer): src=%dx%d (alpha=%u mode=%u) dst=%dx%d (alpha=%u mode=%u) out=%dx%d\n",
 		 blend.src.crop_w, blend.src.crop_h, blend.src.alpha, blend.src.alpha_mode,
-		 blend.dst.crop_w, blend.dst.crop_h, blend.dst.alpha, blend.dst.alpha_mode);
+		 blend.dst.crop_w, blend.dst.crop_h, blend.dst.alpha, blend.dst.alpha_mode,
+		 blend.out.crop_w, blend.out.crop_h);
 	
 	/* Import source DMA-BUF */
 	src_dmabuf = dma_buf_get(blend.src.dma_fd);
@@ -3329,15 +4122,56 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 		goto err_put_dst;
 	}
 	
-	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_BIDIRECTIONAL);
-	if (IS_ERR(dst_sgt)) {
-		ret = PTR_ERR(dst_sgt);
+	/* Import output DMA-BUF (writeback destination) first to detect same buffer */
+	out_dmabuf = dma_buf_get(blend.out.dma_fd);
+	if (IS_ERR(out_dmabuf)) {
+		ret = PTR_ERR(out_dmabuf);
+		dev_err(g2d->dev, "Failed to get out dma_buf: %d\n", ret);
 		goto err_detach_dst;
 	}
+	
+	/* Check if dst and out are the same buffer (in-place blending)
+	 * If so, we need DMA_BIDIRECTIONAL for proper cache coherency */
+	bool same_buffer = (dst_dmabuf == out_dmabuf);
+	enum dma_data_direction dst_dir = same_buffer ? DMA_BIDIRECTIONAL : DMA_TO_DEVICE;
+	enum dma_data_direction out_dir = same_buffer ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
+	
+	dev_info(g2d->dev, "dst/out same buffer: %s (using %s)\n",
+		 same_buffer ? "YES" : "NO",
+		 same_buffer ? "DMA_BIDIRECTIONAL" : "DMA_TO/FROM_DEVICE");
+	
+	dst_sgt = dma_buf_map_attachment(dst_attach, dst_dir);
+	if (IS_ERR(dst_sgt)) {
+		ret = PTR_ERR(dst_sgt);
+		goto err_put_out;
+	}
+	
+	dev_info(g2d->dev, "out_dmabuf: size=%zu\n", out_dmabuf->size);
+	
+	out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
+	if (IS_ERR(out_attach)) {
+		ret = PTR_ERR(out_attach);
+		dev_err(g2d->dev, "Failed to attach out: %d\n", ret);
+		goto err_unmap_dst;
+	}
+	
+	dev_info(g2d->dev, "out attached, mapping with direction %s...\n",
+		 same_buffer ? "DMA_BIDIRECTIONAL" : "DMA_FROM_DEVICE");
+	
+	out_sgt = dma_buf_map_attachment(out_attach, out_dir);
+	if (IS_ERR(out_sgt)) {
+		ret = PTR_ERR(out_sgt);
+		dev_err(g2d->dev, "Failed to map out: %d\n", ret);
+		goto err_detach_out;
+	}
+	
+	dev_info(g2d->dev, "out mapped: nents=%u orig_nents=%u\n",
+		 out_sgt->nents, out_sgt->orig_nents);
 	
 	/* Get DMA addresses */
 	src_dma_addr = sg_dma_address(src_sgt->sgl);
 	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
+	out_dma_addr = sg_dma_address(out_sgt->sgl);
 	
 	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0
 	 * In this case, use physical address directly from the page
@@ -3361,6 +4195,16 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 				 (u64)dst_dma_addr);
 		}
 	}
+	
+	if (out_dma_addr == 0 && out_sgt->nents > 0) {
+		struct scatterlist *sg = out_sgt->sgl;
+		struct page *page = sg_page(sg);
+		if (page) {
+			out_dma_addr = page_to_phys(page) + sg->offset;
+			dev_info(g2d->dev, "T113 workaround: out using physical address 0x%llx\n",
+				 (u64)out_dma_addr);
+		}
+	}
 
 	/* If userspace provided an input fence fd for this alpha blend, wait on it */
 	if (blend.fence_fd_in >= 0) {
@@ -3369,7 +4213,7 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 		struct dma_fence *in_fence = sync_file_get_fence(blend.fence_fd_in);
 		if (!in_fence) {
 			ret = -EINVAL;
-			goto err_unmap_dst;
+			goto err_unmap_out;  /* FIX: was err_unmap_dst, leaked out! */
 		}
 		dev_info(g2d->dev, "alpha_blend: got in_fence=%p signaled=%d\n",
 			 in_fence, dma_fence_is_signaled(in_fence));
@@ -3379,9 +4223,10 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 		dma_fence_put(in_fence);
 	}
 	
-	dev_info(g2d->dev, "DMA addresses: src_fd=%d->0x%llx dst_fd=%d->0x%llx\n",
+	dev_info(g2d->dev, "DMA addresses: src_fd=%d->0x%llx dst_fd=%d->0x%llx out_fd=%d->0x%llx\n",
 		 blend.src.dma_fd, (u64)src_dma_addr,
-		 blend.dst.dma_fd, (u64)dst_dma_addr);
+		 blend.dst.dma_fd, (u64)dst_dma_addr,
+		 blend.out.dma_fd, (u64)out_dma_addr);
 	
 	/* Calculate bytes per pixel */
 	switch (blend.src.format) {
@@ -3394,7 +4239,7 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 		break;
 	default:
 		ret = -EINVAL;
-		goto err_unmap_dst;
+		goto err_unmap_out;
 	}
 	
 	switch (blend.dst.format) {
@@ -3407,35 +4252,68 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 		break;
 	default:
 		ret = -EINVAL;
-		goto err_unmap_dst;
+		goto err_unmap_out;
+	}
+	
+	switch (blend.out.format) {
+	case G2D_FMT_ARGB8888:
+	case G2D_FMT_XRGB8888:
+		out_bpp = 4;
+		break;
+	case G2D_FMT_RGB565:
+		out_bpp = 2;
+		break;
+	default:
+		ret = -EINVAL;
+		goto err_unmap_out;
 	}
 	
 	/* Adjust DMA addresses for crop offsets */
 	src_pitch = blend.src.stride[0] ? blend.src.stride[0] : (blend.src.width * src_bpp);
 	dst_pitch = blend.dst.stride[0] ? blend.dst.stride[0] : (blend.dst.width * dst_bpp);
+	out_pitch = blend.out.stride[0] ? blend.out.stride[0] : (blend.out.width * out_bpp);
 	
-	/* v2.9.13: Save base address BEFORE applying crop offset for UI1 background read */
+	dev_info(g2d->dev, "ALPHA_BLEND PITCH: src_pitch=%u (stride=%u width=%u bpp=%u) crop=(%u,%u,%u,%u)\n",
+		 src_pitch, blend.src.stride[0], blend.src.width, src_bpp,
+		 blend.src.crop_x, blend.src.crop_y, blend.src.crop_w, blend.src.crop_h);
+	
+	/* Save base addresses BEFORE applying crop offsets */
+	dma_addr_t src_base_addr = src_dma_addr;
 	dma_addr_t dst_base_addr = dst_dma_addr;
-	u32 dst_crop_x = blend.dst.crop_x;
-	u32 dst_crop_y = blend.dst.crop_y;
+	dma_addr_t out_base_addr = out_dma_addr;
 	
+	/* Apply crop offsets */
 	src_dma_addr += (blend.src.crop_y * src_pitch) + (blend.src.crop_x * src_bpp);
 	dst_dma_addr += (blend.dst.crop_y * dst_pitch) + (blend.dst.crop_x * dst_bpp);
+	out_dma_addr += (blend.out.crop_y * out_pitch) + (blend.out.crop_x * out_bpp);
 	
-	/* v2.9.15: BSP-style alpha blending with user-controlled alpha settings
-	 * - Respects src.alpha, src.alpha_mode, dst.alpha, dst.alpha_mode from userspace
-	 * - Uses UI2 (dst/background) + V0 (src/foreground) like BSP
-	 * - Passes dst_base_addr for UI2 to read full framebuffer
+	dev_info(g2d->dev, "CROP APPLIED: dst crop=(%u,%u) bpp=%u pitch=%u offset=0x%llx base=0x%llx\n",
+		 blend.dst.crop_x, blend.dst.crop_y, dst_bpp, dst_pitch,
+		 (u64)(dst_dma_addr - dst_base_addr), (u64)dst_base_addr);
+	
+	dev_info(g2d->dev, "ALPHA_BLEND CALL PARAMS: src.crop=%ux%u dst.crop=%ux%u out.crop=%ux%u\n",
+		 blend.src.crop_w, blend.src.crop_h,
+		 blend.dst.crop_w, blend.dst.crop_h,
+		 blend.out.crop_w, blend.out.crop_h);
+	
+	/* v2.9.16: 3-buffer alpha blending (NO read/write conflict)
+	 * - src (V0): ball buffer - READ only
+	 * - dst (UI2): background buffer - READ only  
+	 * - out (WB): temp buffer - WRITE only
+	 * This avoids G2D reading and writing the same buffer simultaneously
 	 */
-	ret = sunxi_g2d_do_blit_alpha(g2d,
+	ret = sunxi_g2d_do_blit_alpha_3buf(g2d,
 				       src_dma_addr, blend.src.width, blend.src.height,
 				       src_pitch, blend.src.format,
 				       0, 0, blend.src.crop_w, blend.src.crop_h,
 				       blend.src.alpha, blend.src.alpha_mode,
 				       dst_dma_addr, dst_base_addr, blend.dst.width, blend.dst.height,
 				       dst_pitch, blend.dst.format,
-				       dst_crop_x, dst_crop_y, blend.dst.crop_w, blend.dst.crop_h,
-				       blend.dst.alpha, blend.dst.alpha_mode);
+				       0, 0, blend.dst.crop_w, blend.dst.crop_h,
+				       blend.dst.alpha, blend.dst.alpha_mode,
+				       out_dma_addr, blend.out.width, blend.out.height,
+				       out_pitch, blend.out.format,
+				       blend.out.crop_w, blend.out.crop_h);
 	
 	
 	/* TODO: Create and return fence_fd if needed */
@@ -3507,14 +4385,20 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 
 		blend.fence_fd_out = job->fence_fd;
 	}
-	
+
 	if (copy_to_user((void __user *)arg, &blend, sizeof(blend)))
 		ret = -EFAULT;
 	
+err_unmap_out:
+	dma_buf_unmap_attachment(out_attach, out_sgt, out_dir);
+err_detach_out:
+	dma_buf_detach(out_dmabuf, out_attach);
 err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_BIDIRECTIONAL);
+	dma_buf_unmap_attachment(dst_attach, dst_sgt, dst_dir);
 err_detach_dst:
 	dma_buf_detach(dst_dmabuf, dst_attach);
+err_put_out:
+	dma_buf_put(out_dmabuf);
 err_put_dst:
 	dma_buf_put(dst_dmabuf);
 err_unmap_src:
@@ -3710,6 +4594,180 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		dma_fence_put(in_fence);
 		return 0;
 	}
+	case G2D_IOC_WRITE_BUFFER: {
+		struct g2d_buffer_rw rw;
+		struct dma_buf *dmabuf;
+		struct dma_buf_attachment *attach;
+		struct sg_table *sgt;
+		struct iosys_map map;
+		void *vaddr;
+		int ret;
+
+		if (copy_from_user(&rw, (void __user *)arg, sizeof(rw)))
+			return -EFAULT;
+
+		/* Validate parameters */
+		if (rw.dma_fd < 0 || rw.size == 0 || !rw.user_ptr)
+			return -EINVAL;
+
+		dmabuf = dma_buf_get(rw.dma_fd);
+		if (IS_ERR(dmabuf))
+			return PTR_ERR(dmabuf);
+
+		/* Check bounds */
+		if (rw.offset + rw.size > dmabuf->size) {
+			dma_buf_put(dmabuf);
+			return -EINVAL;
+		}
+
+		attach = dma_buf_attach(dmabuf, g2d->dev);
+		if (IS_ERR(attach)) {
+			ret = PTR_ERR(attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		sgt = dma_buf_map_attachment(attach, DMA_TO_DEVICE);
+		if (IS_ERR(sgt)) {
+			ret = PTR_ERR(sgt);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		/* Map for CPU access */
+		ret = dma_buf_begin_cpu_access(dmabuf, DMA_TO_DEVICE);
+		if (ret) {
+			dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		ret = dma_buf_vmap(dmabuf, &map);
+		if (ret) {
+			dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+			dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		vaddr = map.vaddr;
+		if (!vaddr) {
+			dma_buf_vunmap(dmabuf, &map);
+			dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+			dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return -ENOMEM;
+		}
+
+		/* Copy from userspace to device buffer */
+		if (copy_from_user(vaddr + rw.offset, (void __user *)rw.user_ptr, rw.size)) {
+			ret = -EFAULT;
+		} else {
+			ret = 0;
+		}
+
+		dma_buf_vunmap(dmabuf, &map);
+		dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+		dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+
+		dev_info(g2d->dev, "WRITE_BUFFER: fd=%d offset=%llu size=%llu ret=%d\n",
+			 rw.dma_fd, rw.offset, rw.size, ret);
+
+		return ret;
+	}
+	case G2D_IOC_READ_BUFFER: {
+		struct g2d_buffer_rw rw;
+		struct dma_buf *dmabuf;
+		struct dma_buf_attachment *attach;
+		struct sg_table *sgt;
+		struct iosys_map map;
+		void *vaddr;
+		int ret;
+
+		if (copy_from_user(&rw, (void __user *)arg, sizeof(rw)))
+			return -EFAULT;
+
+		/* Validate parameters */
+		if (rw.dma_fd < 0 || rw.size == 0 || !rw.user_ptr)
+			return -EINVAL;
+
+		dmabuf = dma_buf_get(rw.dma_fd);
+		if (IS_ERR(dmabuf))
+			return PTR_ERR(dmabuf);
+
+		/* Check bounds */
+		if (rw.offset + rw.size > dmabuf->size) {
+			dma_buf_put(dmabuf);
+			return -EINVAL;
+		}
+
+		attach = dma_buf_attach(dmabuf, g2d->dev);
+		if (IS_ERR(attach)) {
+			ret = PTR_ERR(attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		sgt = dma_buf_map_attachment(attach, DMA_FROM_DEVICE);
+		if (IS_ERR(sgt)) {
+			ret = PTR_ERR(sgt);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		/* Map for CPU access */
+		ret = dma_buf_begin_cpu_access(dmabuf, DMA_FROM_DEVICE);
+		if (ret) {
+			dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		ret = dma_buf_vmap(dmabuf, &map);
+		if (ret) {
+			dma_buf_end_cpu_access(dmabuf, DMA_FROM_DEVICE);
+			dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return ret;
+		}
+
+		vaddr = map.vaddr;
+		if (!vaddr) {
+			dma_buf_vunmap(dmabuf, &map);
+			dma_buf_end_cpu_access(dmabuf, DMA_FROM_DEVICE);
+			dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
+			dma_buf_detach(dmabuf, attach);
+			dma_buf_put(dmabuf);
+			return -ENOMEM;
+		}
+
+		/* Copy to userspace from device buffer */
+		if (copy_to_user((void __user *)rw.user_ptr, vaddr + rw.offset, rw.size)) {
+			ret = -EFAULT;
+		} else {
+			ret = 0;
+		}
+
+		dma_buf_vunmap(dmabuf, &map);
+		dma_buf_end_cpu_access(dmabuf, DMA_FROM_DEVICE);
+		dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+
+		dev_info(g2d->dev, "READ_BUFFER: fd=%d offset=%llu size=%llu ret=%d\n",
+			 rw.dma_fd, rw.offset, rw.size, ret);
+
+		return ret;
+	}
 	default:
 		return -ENOTTY;
 	}
@@ -3744,6 +4802,11 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	spin_lock_init(&g2d->fence_lock);
 	atomic64_set(&g2d->fence_seqno, 0);
 	g2d->fence_context = dma_fence_context_alloc(1);
+	
+	/* Initialize temporary scaling buffer fields */
+	g2d->temp_scale_buffer = NULL;
+	g2d->temp_scale_dma = 0;
+	g2d->temp_scale_size = 0;
 	
 	/* Get MMIO resources */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);

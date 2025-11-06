@@ -295,6 +295,7 @@
 #define VS_CTRL           (0x000 + G2D_VSU)
 #define  VS_CTRL_EN                BIT(0)
 #define  VS_CTRL_COEF_ACCESS_SEL   BIT(1)
+#define  VS_CTRL_FILTER_TYPE_RGB   BIT(16)  /* 1=RGB, 0=YUV */
 
 #define VS_OUT_SIZE       (0x040 + G2D_VSU)
 #define VS_GLB_ALPHA      (0x044 + G2D_VSU)
@@ -311,25 +312,28 @@
 #define VS_C_HPHASE       (0x0D0 + G2D_VSU)
 #define VS_C_VPHASE0      (0x0D8 + G2D_VSU)
 
+// VSU format types (matches BSP g2d_bsp.h vsu_pixel_format enum)
+#define VSU_FORMAT_YUV422  0x00
+#define VSU_FORMAT_YUV420  0x01
+#define VSU_FORMAT_YUV411  0x02
+#define VSU_FORMAT_RGB     0x03
+
 // VSU coefficient tables
 #define VS_Y_HCOEF0       (0x200 + G2D_VSU)  // Y horizontal coefficients (32 entries)
 #define VS_Y_VCOEF0       (0x300 + G2D_VSU)  // Y vertical coefficients (32 entries)
 #define VS_C_HCOEF0       (0x400 + G2D_VSU)  // Chroma horizontal coefficients (32 entries)
+#define VS_C_VCOEF0       (0x500 + G2D_VSU)  // Chroma vertical coefficients (32 entries)
 
 // VSU phase fractional bits and constants (from BSP)
-#define VSU_PHASE_FRAC_BITWIDTH  18
+// CRITICAL: BSP uses 19 bits, NOT 18!
+// Combined with << 1 shift when writing to register, this gives 20-bit precision total
+#define VSU_PHASE_FRAC_BITWIDTH  19
 #define VSU_PHASE_NUM            32
 #define VSU_ZOOM0_SIZE           1
 #define VSU_ZOOM1_SIZE           8
 #define VSU_ZOOM2_SIZE           4
 #define VSU_ZOOM3_SIZE           1
 #define VSU_ZOOM4_SIZE           1
-
-// VSU format types
-#define VSU_FORMAT_RGB           0
-#define VSU_FORMAT_YUV422        1
-#define VSU_FORMAT_YUV420        2
-#define VSU_FORMAT_YUV411        3
 
 // ROT (rotator) - for scaling and rotation
 #define ROT_CTL        (0x00 + G2D_ROT)

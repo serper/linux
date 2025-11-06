@@ -830,9 +830,9 @@ union g2d_mixer_rop_ch3_index0 {
  * @color_key_min: Color key min values (0x5C)
  * @out_color: Output color mode (0x60)
  * @res4: Reserved (0x64-0x7C)
- * @rop_ctrl: ROP control (0x80) - not yet defined
- * @ch3_index0: ROP channel 3 index 0 (0x84) - not yet defined
- * @ch3_index1: ROP channel 3 index 1 (0x88) - not yet defined
+ * @rop_ctrl: ROP control (0x80)
+ * @ch3_index0: ROP channel 3 index 0 (0x84)
+ * @ch3_index1: ROP channel 3 index 1 (0x88)
  * @res5: Reserved (0x8C-0xFC)
  * @cs_ctrl: Color space conversion control (0x100)
  * @res6: Reserved (0x104-0x10C)

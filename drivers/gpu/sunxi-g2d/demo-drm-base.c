@@ -18,9 +18,12 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
 #include <linux/dma-heap.h>
 #include <linux/sunxi_g2d.h>
 #include "demo-drm-base.h"
@@ -199,6 +202,42 @@ int drm_display_init(struct drm_display *disp)
 		goto err_destroy_dumb;
 	}
 	
+	/* Create additional framebuffers for individual pages
+	 * These use drmModeAddFB2 with offsets to point to each page separately.
+	 * This allows exporting separate dmabufs per page for G2D operations.
+	 */
+	{
+		uint32_t handles[4] = {disp->handle, 0, 0, 0};
+		uint32_t pitches[4] = {disp->pitch, 0, 0, 0};
+		uint32_t offsets[4];
+		uint32_t pixel_format = DRM_FORMAT_XRGB8888;
+		
+		/* Page 0: offset 0 */
+		offsets[0] = 0;
+		offsets[1] = offsets[2] = offsets[3] = 0;
+		ret = drmModeAddFB2(disp->drm_fd, disp->width, disp->height,
+		                    pixel_format, handles, pitches, offsets,
+		                    &disp->fb_page0_id, 0);
+		if (ret) {
+			perror("drmModeAddFB2 (page 0)");
+			goto err_rm_fb;
+		}
+		
+		/* Page 1: offset = height * pitch */
+		offsets[0] = disp->height * disp->pitch;
+		ret = drmModeAddFB2(disp->drm_fd, disp->width, disp->height,
+		                    pixel_format, handles, pitches, offsets,
+		                    &disp->fb_page1_id, 0);
+		if (ret) {
+			perror("drmModeAddFB2 (page 1)");
+			drmModeRmFB(disp->drm_fd, disp->fb_page0_id);
+			goto err_rm_fb;
+		}
+		
+		printf("Created per-page FBs: page0=%u, page1=%u\n",
+		       disp->fb_page0_id, disp->fb_page1_id);
+	}
+	
 	/* Map buffer */
 	map.handle = disp->handle;
 	ret = drmIoctl(disp->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map);
@@ -272,6 +311,10 @@ void drm_display_cleanup(struct drm_display *disp)
 	
 	munmap(disp->map, disp->size);
 	drmModeRmFB(disp->drm_fd, disp->fb_id);
+	if (disp->fb_page0_id)
+		drmModeRmFB(disp->drm_fd, disp->fb_page0_id);
+	if (disp->fb_page1_id)
+		drmModeRmFB(disp->drm_fd, disp->fb_page1_id);
 	drmIoctl(disp->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
 	
 	close(disp->g2d_fd);
@@ -326,10 +369,82 @@ int drm_flip_page(struct drm_display *disp)
 	
 	/* UPDATE PAGE TRACKER AFTER IOCTL (when display actually changed) */
 	g_current_page = next_page;
+	
+	return 0;
+}
 
-	/* Debug: report page flip info */
-	printf("[drm_flip_page] y_offset=%d next_page=%d g_current_page=%d\n",
-	       y_offset, next_page, g_current_page);
+/*
+ * Page flip event handler
+ */
+static void drm_page_flip_handler(int fd, unsigned int sequence,
+                                   unsigned int tv_sec, unsigned int tv_usec,
+                                   void *user_data)
+{
+	(void)fd; (void)sequence; (void)tv_sec; (void)tv_usec;
+	int *flip_done = (int *)user_data;
+	*flip_done = 1;
+}
+
+/*
+ * Flip to backbuffer synchronized with VSYNC
+ * Uses drmModePageFlip with event to wait for actual VBLANK
+ */
+int drm_flip_page_vsync(struct drm_display *disp)
+{
+	int next_page = 1 - g_current_page;
+	int y_offset = next_page * disp->height;
+	int ret;
+	volatile int flip_done = 0;
+	drmEventContext evctx = {
+		.version = DRM_EVENT_CONTEXT_VERSION,
+		.page_flip_handler = drm_page_flip_handler,
+	};
+	fd_set fds;
+	struct timeval timeout;
+	
+	/* Pan display to next page with page flip event */
+	ret = drmModePageFlip(disp->drm_fd, disp->crtc_id, disp->fb_id,
+	                      DRM_MODE_PAGE_FLIP_EVENT, (void *)&flip_done);
+	if (ret) {
+		/* Fallback to immediate SetCrtc if PageFlip not supported */
+		ret = drmModeSetCrtc(disp->drm_fd, disp->crtc_id, disp->fb_id,
+		                     0, y_offset,
+		                     &disp->conn_id, 1, &disp->mode);
+		if (ret) {
+			perror("drmModeSetCrtc (pan)");
+			return -1;
+		}
+		g_current_page = next_page;
+		return 0;
+	}
+	
+	/* Wait for page flip event (VSYNC) */
+	while (!flip_done) {
+		FD_ZERO(&fds);
+		FD_SET(disp->drm_fd, &fds);
+		timeout.tv_sec = 1;
+		timeout.tv_usec = 0;
+		
+		ret = select(disp->drm_fd + 1, &fds, NULL, NULL, &timeout);
+		if (ret < 0) {
+			perror("select (waiting for vsync)");
+			return -1;
+		} else if (ret == 0) {
+			fprintf(stderr, "Timeout waiting for page flip event\n");
+			return -1;
+		}
+		
+		if (FD_ISSET(disp->drm_fd, &fds)) {
+			ret = drmHandleEvent(disp->drm_fd, &evctx);
+			if (ret) {
+				perror("drmHandleEvent");
+				return -1;
+			}
+		}
+	}
+	
+	/* UPDATE PAGE TRACKER AFTER VSYNC */
+	g_current_page = next_page;
 	
 	return 0;
 }
@@ -350,6 +465,47 @@ int drm_export_dmabuf(struct drm_display *disp)
 	ret = drmIoctl(disp->drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
 	if (ret) {
 		perror("DRM_IOCTL_PRIME_HANDLE_TO_FD");
+		return -1;
+	}
+	
+	return prime.fd;
+}
+
+/*
+ * Export a dmabuf for a specific page (0 or 1)
+ * Uses the per-page framebuffer IDs created during init
+ */
+int drm_export_page_dmabuf(struct drm_display *disp, int page)
+{
+	drmModeFBPtr fb;
+	struct drm_prime_handle prime = {
+		.flags = DRM_CLOEXEC | DRM_RDWR,
+		.fd = -1,
+	};
+	int ret;
+	
+	if (page != 0 && page != 1) {
+		fprintf(stderr, "Invalid page number: %d (must be 0 or 1)\n", page);
+		return -1;
+	}
+	
+	/* Get FB info to extract the handle (same handle, different FB IDs) */
+	fb = drmModeGetFB(disp->drm_fd, page == 0 ? disp->fb_page0_id : disp->fb_page1_id);
+	if (!fb) {
+		perror("drmModeGetFB");
+		return -1;
+	}
+	
+	prime.handle = fb->handle;
+	drmModeFreeFB(fb);
+	
+	/* Export handle to dmabuf fd
+	 * NOTE: This exports the FULL buffer, but G2D will use the offset
+	 * from the FB configuration when accessing it via this dmabuf.
+	 */
+	ret = drmIoctl(disp->drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime);
+	if (ret) {
+		perror("DRM_IOCTL_PRIME_HANDLE_TO_FD (page)");
 		return -1;
 	}
 	
