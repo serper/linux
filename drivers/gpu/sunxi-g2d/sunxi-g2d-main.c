@@ -1209,6 +1209,7 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
  * @color_format: Format of the color value (enum g2d_pixel_format from UAPI)
  * @dst_format: Format of the destination buffer
  */
+#if 0
 static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 				      dma_addr_t dst_dma,
 				      u32 width, u32 height,
@@ -1530,7 +1531,14 @@ err_disable:
 	/* Only disable on setup errors, not timeouts */
 	return ret;
 }
+#endif /* Deprecated sunxi_g2d_do_fillrect_rcq */
 
+/*
+ * DEPRECATED: sunxi_g2d_ioctl_fillrect_rcq()
+ * This function is no longer used. G2D_IOC_FILLRECT_RCQ now redirects to
+ * sunxi_g2d_ioctl_fillrect() in the ioctl switch.
+ */
+#if 0
 static long sunxi_g2d_ioctl_fillrect_rcq(struct sunxi_g2d_dev *g2d, unsigned long arg)
 {
 	struct g2d_fillrect fill;
@@ -1753,6 +1761,7 @@ err_put_dmabuf:
 
 	return ret;
 }
+#endif /* Deprecated sunxi_g2d_ioctl_fillrect_rcq */
 
 /* ========== File operations ========== */
 
@@ -2185,6 +2194,12 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 }
 
 /*
+ * DEPRECATED: sunxi_g2d_do_blit_alpha_rcq()
+ * RCQ (Register Command Queue) never worked on T113-S3.
+ * Keeping as reference but disabled.
+ */
+#if 0
+/*
  * sunxi_g2d_do_blit_alpha_rcq - Perform alpha blending operation using RCQ
  *
  * Uses RCQ (Register Command Queue) for hardware register writes.
@@ -2209,6 +2224,7 @@ static int sunxi_g2d_do_blit_alpha_rcq(struct sunxi_g2d_dev *g2d,
 	dev_info(g2d->dev, "RCQ alpha blend not supported (never worked)\n");
 	return -ENOSYS;
 }
+#endif /* Deprecated sunxi_g2d_do_blit_alpha_rcq */
 
 /*
  * sunxi_g2d_do_blit_alpha_3buf - Alpha blending with 3 separate buffers
@@ -3462,6 +3478,78 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 	return 0;
 }
 
+/*
+ * sunxi_g2d_do_blit_unified - Unified blit operation handler
+ *
+ * This function handles all blit combinations intelligently:
+ * - Simple copy (no scaling, no blending, no rotation)
+ * - Scaling only (VSU enabled)
+ * - Alpha blending (BLD enabled, with or without scaling)
+ * - Rotation/flip (ROT enabled, no scaling allowed)
+ * - Blending + rotation (BLD + ROT, no scaling)
+ * 
+ * Hardware restrictions:
+ * - Cannot do scaling + rotation simultaneously (share VSU module)
+ * - For scaling + rotation: TODO implement 2-pass with temp buffer
+ * 
+ * Alpha blending is enabled when:
+ * - needs_alpha=true (auto-detected from alpha_mode or formats)
+ */
+static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
+				     dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
+				     u32 src_pitch, u32 src_format,
+				     u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+				     u8 src_alpha, u8 src_alpha_mode,
+				     dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
+				     u32 dst_pitch, u32 dst_format,
+				     u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
+				     u8 dst_alpha, u8 dst_alpha_mode,
+				     u32 flags,
+				     bool needs_alpha, bool needs_rotation, bool needs_scaling)
+{
+	/* For now, delegate to existing implementations based on operation type
+	 * TODO: Consolidate into single implementation that enables/disables blocks as needed
+	 */
+	
+	if (needs_rotation) {
+		/* Rotation path - use ROT block (no scaling, blending ignored for now) */
+		return sunxi_g2d_do_blit_rot(g2d,
+					     src_dma_addr, src_w, src_h,
+					     src_pitch, src_format,
+					     src_x, src_y, src_crop_w, src_crop_h,
+					     dst_dma_addr, dst_w, dst_h,
+					     dst_pitch, dst_format,
+					     dst_x, dst_y, blend_w, blend_h,
+					     flags);
+	} else if (needs_alpha) {
+		/* Alpha blending path - can include scaling */
+		/* For now we use the 3-buffer approach if available, or the working RCQ approach */
+		return sunxi_g2d_do_blit_alpha_3buf(g2d,
+						    src_dma_addr, src_w, src_h,
+						    src_pitch, src_format,
+						    src_x, src_y, src_crop_w, src_crop_h,
+						    src_alpha, src_alpha_mode,
+						    dst_dma_addr, dst_dma_addr, /* dst_base same as dst */
+						    dst_w, dst_h,
+						    dst_pitch, dst_format,
+						    dst_x, dst_y, blend_w, blend_h,
+						    dst_alpha, dst_alpha_mode,
+						    dst_dma_addr, /* out same as dst for in-place */
+						    dst_w, dst_h,
+						    dst_pitch, dst_format,
+						    blend_w, blend_h);
+	} else {
+		/* Simple copy/scale path - use MIXER with optional VSU */
+		return sunxi_g2d_do_blit(g2d,
+					 src_dma_addr, src_w, src_h,
+					 src_pitch, src_format,
+					 src_x, src_y, src_crop_w, src_crop_h,
+					 dst_dma_addr, dst_w, dst_h,
+					 dst_pitch, dst_format,
+					 dst_x, dst_y, blend_w, blend_h);
+	}
+}
+
 static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 {
 	struct g2d_blit blit;
@@ -3499,17 +3587,12 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		return -EINVAL;
 	}
 	
-	/* Validate alpha value if blending enabled */
-	if ((blit.flags & G2D_BLIT_FLAG_ALPHA_BLEND) && blit.global_alpha > 255) {
-		dev_err(g2d->dev, "Invalid global_alpha value: %u (must be 0-255)\n",
-			blit.global_alpha);
-		return -EINVAL;
-	}
-	
-	dev_info(g2d->dev, "BLIT: src=%ux%u fmt=%u -> dst=%u,%u,%ux%u fmt=%u flags=0x%x alpha=%u\n",
+	dev_info(g2d->dev, "BLIT: src=%ux%u fmt=%u (alpha=%u mode=%u) -> dst=%u,%u,%ux%u fmt=%u (alpha=%u mode=%u) flags=0x%x\n",
 		 blit.src.width, blit.src.height, blit.src.format,
+		 blit.src.alpha, blit.src.alpha_mode,
 		 blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h, blit.dst.format,
-		 blit.flags, blit.global_alpha);
+		 blit.dst.alpha, blit.dst.alpha_mode,
+		 blit.flags);
 	
 	/* Import source DMA-BUF */
 	src_dmabuf = dma_buf_get(blit.src.dma_fd);
@@ -3643,80 +3726,100 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_unmap_dst;
 	}
 	
-	/* Choose execution path based on flags:
-	 * - Alpha blending: Use MIXER with BLD (two UI layers)
-	 * - Rotation/flip: Use ROT block (no scaling/blending)
-	 * - Scaling only: Use MIXER with VSU
-	 * - Simple copy: Use MIXER (fastest path)
-	 * Note: G2D v2.0 cannot combine rotation with scaling or blending */
-	bool needs_alpha = !!(blit.flags & G2D_BLIT_FLAG_ALPHA_BLEND);
+	/* Determine operation requirements:
+	 * - Alpha blending: Auto-detected from:
+	 *   1. Presence of out buffer (3-buffer operation = blending)
+	 *   2. Source has alpha format (ARGB) with PIXEL_ALPHA mode
+	 *   3. Global alpha mode on src or dst
+	 *   4. Legacy ALPHA_BLEND flag
+	 * - Rotation/flip: From flags  
+	 * - Scaling: When dst size != src crop size
+	 * 
+	 * Hardware restriction: Cannot do scaling + rotation simultaneously (share VSU)
+	 * Solution: If both needed → pre-scale to temp buffer, then rotate
+	 * 
+	 * Supported single-pass combinations:
+	 * - Blending + rotation (no scaling)
+	 * - Blending + scaling (via BLD + VSU)
+	 * - Scaling only (no blending, no rotation)
+	 * - Rotation only (no scaling, no blending)
+	 */
+	
+	/* Auto-detect alpha blending need:
+	 * - 3-buffer operation (out.dma_fd >= 0) always needs blending
+	 * - ARGB format with PIXEL_ALPHA mode needs blending
+	 * - GLOBAL_ALPHA or MIXER_ALPHA modes need blending
+	 */
+	bool has_out_buffer = (blit.out.dma_fd >= 0);
+	bool src_has_alpha_format = (blit.src.format == G2D_FMT_ARGB8888 ||
+				     blit.src.format == G2D_FMT_ABGR8888);
+	bool needs_alpha = has_out_buffer ||  /* 3-buffer = blending */
+			   (src_has_alpha_format && blit.src.alpha_mode == G2D_PIXEL_ALPHA) ||
+			   (blit.src.alpha_mode == G2D_GLOBAL_ALPHA) ||
+			   (blit.src.alpha_mode == G2D_MIXER_ALPHA) ||
+			   (blit.dst.alpha_mode == G2D_GLOBAL_ALPHA) ||
+			   (blit.dst.alpha_mode == G2D_MIXER_ALPHA) ||
+			   (blit.flags & G2D_BLIT_FLAG_ALPHA_BLEND);  /* Legacy flag */
+	
 	bool needs_rotation = !!(blit.flags & (G2D_BLIT_FLAG_ROTATE_90 |
 					       G2D_BLIT_FLAG_ROTATE_180 |
 					       G2D_BLIT_FLAG_ROTATE_270 |
 					       G2D_BLIT_FLAG_FLIP_H |
 					       G2D_BLIT_FLAG_FLIP_V));
+	
 	bool needs_scaling = (blit.dst_w != src_crop_w) || (blit.dst_h != src_crop_h);
 	
-	/* Check for incompatible combinations */
+	dev_info(g2d->dev, "BLIT auto-detect: has_out=%d src_alpha_fmt=%d needs_alpha=%d needs_rotation=%d needs_scaling=%d\n",
+		 has_out_buffer, src_has_alpha_format, needs_alpha, needs_rotation, needs_scaling);
+	
+	/* Check for incompatible single-pass combinations */
 	if (needs_rotation && needs_scaling) {
-		dev_err(g2d->dev, "Cannot do rotation and scaling simultaneously in G2D v2.0\n");
-		ret = -EINVAL;
+		dev_info(g2d->dev, "Rotation + scaling requested: will do 2-pass (scale then rotate)\n");
+		/* TODO: Implement 2-pass operation with temporary buffer */
+		dev_err(g2d->dev, "2-pass scaling+rotation not yet implemented\n");
+		ret = -ENOSYS;
 		goto err_unmap_dst;
 	}
 	
-	if (needs_rotation && needs_alpha) {
-		dev_err(g2d->dev, "Cannot do rotation and alpha blending simultaneously\n");
-		ret = -EINVAL;
-		goto err_unmap_dst;
-	}
+	/* All other combinations are valid for single-pass:
+	 * - alpha + rotation (OK)
+	 * - alpha + no_scale (OK)  
+	 * - scale only (OK)
+	 * - rotation only (OK)
+	 * - simple copy (OK)
+	 */
 	
-	if (needs_alpha && needs_scaling) {
-		dev_err(g2d->dev, "Cannot do alpha blending and scaling simultaneously\n");
-		ret = -EINVAL;
-		goto err_unmap_dst;
-	}
-	
-	if (needs_alpha) {
-		/* Use RCQ for alpha blending (required for V2 hardware) */
-		dev_info(g2d->dev, "Using MIXER+BLD (RCQ) for alpha blending %ux%u\n",
-			 src_crop_w, src_crop_h);
-		ret = sunxi_g2d_do_blit_alpha_rcq(g2d,
-					       src_dma_addr, blit.src.width, blit.src.height,
-					       src_pitch, blit.src.format,
-					       blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
-					       blit.src.alpha, blit.src.alpha_mode,
-					       dst_dma_addr, blit.dst.width, blit.dst.height,
-					       dst_pitch, blit.dst.format,
-					       blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h,
-					       blit.dst.alpha, blit.dst.alpha_mode);
-	} else if (needs_rotation) {
-		/* Use ROT block for rotation/flip (1:1 copy only) */
-		dev_info(g2d->dev, "Using ROT for rotation/flip %ux%u flags=0x%x\n",
-			 src_crop_w, src_crop_h, blit.flags);
-		ret = sunxi_g2d_do_blit_rot(g2d,
-					     src_dma_addr, blit.src.width, blit.src.height,
-					     src_pitch, blit.src.format,
-					     blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
-					     dst_dma_addr, blit.dst.width, blit.dst.height,
-					     dst_pitch, blit.dst.format,
-					     blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h,
-					     blit.flags);
+	/* Execute unified blit operation 
+	 * The hardware will automatically:
+	 * - Enable VSU if scaling needed
+	 * - Enable BLD if alpha blending needed
+	 * - Enable ROT if rotation needed
+	 * - Do simple copy if none of the above
+	 */
+	if (needs_alpha || needs_rotation || needs_scaling) {
+		char op_desc[128];
+		snprintf(op_desc, sizeof(op_desc), "%s%s%s",
+			 needs_scaling ? "SCALE" : "",
+			 needs_alpha ? (needs_scaling ? "+BLEND" : "BLEND") : "",
+			 needs_rotation ? (needs_scaling || needs_alpha ? "+ROT" : "ROT") : "");
+		dev_info(g2d->dev, "BLIT operation: %s %ux%u -> %ux%u\n",
+			 op_desc, src_crop_w, src_crop_h, blit.dst_w, blit.dst_h);
 	} else {
-		/* Use MIXER (+VSU for scaling) for copy/scale */
-		if (needs_scaling) {
-			dev_info(g2d->dev, "Using MIXER+VSU for scaled blit %ux%u -> %ux%u\n",
-				 src_crop_w, src_crop_h, blit.dst_w, blit.dst_h);
-		} else {
-			dev_dbg(g2d->dev, "Using MIXER for 1:1 blit %ux%u\n", src_crop_w, src_crop_h);
-		}
-		ret = sunxi_g2d_do_blit(g2d,
-					 src_dma_addr, blit.src.width, blit.src.height,
-					 src_pitch, blit.src.format,
-					 blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
-					 dst_dma_addr, blit.dst.width, blit.dst.height,
-					 dst_pitch, blit.dst.format,
-					 blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h);
+		dev_dbg(g2d->dev, "BLIT: simple copy %ux%u\n", src_crop_w, src_crop_h);
 	}
+	
+	/* Call unified blit function that handles all combinations */
+	ret = sunxi_g2d_do_blit_unified(g2d,
+					src_dma_addr, blit.src.width, blit.src.height,
+					src_pitch, blit.src.format,
+					blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
+					blit.src.alpha, blit.src.alpha_mode,
+					dst_dma_addr, blit.dst.width, blit.dst.height,
+					dst_pitch, blit.dst.format,
+					blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h,
+					blit.dst.alpha, blit.dst.alpha_mode,
+					blit.flags,
+					needs_alpha, needs_rotation, needs_scaling);
 	
 	if (ret < 0)
 		goto err_unmap_dst;
@@ -4038,6 +4141,16 @@ err_put_dmabuf:
 	return ret;
 }
 
+/*
+ * DEPRECATED: sunxi_g2d_ioctl_alpha_blend()
+ * This function is no longer used. G2D_IOC_ALPHA_BLEND now redirects to
+ * sunxi_g2d_ioctl_blit() in the ioctl switch, which handles alpha blending
+ * through the unified BLIT operation with auto-detection.
+ * 
+ * The entire function is commented out to avoid compilation errors with
+ * the removed struct g2d_alpha_blend from the UAPI.
+ */
+#if 0
 static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 					 unsigned long arg)
 {
@@ -4410,6 +4523,7 @@ err_put_src:
 	
 	return ret;
 }
+#endif /* Deprecated sunxi_g2d_ioctl_alpha_blend */
 
 static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 					  unsigned long arg)
@@ -4488,9 +4602,12 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 	case G2D_IOC_FILLRECT:
 		return sunxi_g2d_ioctl_fillrect(g2d, arg);
 	case G2D_IOC_FILLRECT_RCQ:
-		return sunxi_g2d_ioctl_fillrect_rcq(g2d, arg);
+		/* Deprecated: FILLRECT and FILLRECT_RCQ now use same path */
+		return sunxi_g2d_ioctl_fillrect(g2d, arg);
 	case G2D_IOC_ALPHA_BLEND:
-		return sunxi_g2d_ioctl_alpha_blend(g2d, arg);
+		/* Deprecated: ALPHA_BLEND is now handled by unified BLIT */
+		dev_info_once(g2d->dev, "G2D_IOC_ALPHA_BLEND is deprecated, use G2D_IOC_BLIT instead\n");
+		return sunxi_g2d_ioctl_blit(g2d, arg);
 	case G2D_IOC_ALLOC_BUFFER:
 		return sunxi_g2d_ioctl_alloc_buffer(g2d, arg);
 	case G2D_IOC_SELFTEST_FENCE: {

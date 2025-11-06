@@ -1,0 +1,377 @@
+[    0.000000] Booting Linux on physical CPU 0x0
+[    0.000000] Linux version 6.17.0-11372-g8fc01817ffdb-dirty (sergio@pop-os) (arm-linux-musleabihf-gcc (GCC) 9.4.0, GNU ld (GNU Binutils) 2.33.1) #71 SMP PREEMPT Thu Oct 30 22:58:44 CET 2025
+[    0.000000] CPU: ARMv7 Processor [410fc075] revision 5 (ARMv7), cr=10c5387d
+[    0.000000] CPU: div instructions available: patching division code
+[    0.000000] CPU: PIPT / VIPT nonaliasing data cache, VIPT aliasing instruction cache
+[    0.000000] OF: fdt: Machine model: SPuC T113
+[    0.000000] earlycon: uart8250 at MMIO32 0x02500000 (options '')
+[    0.000000] printk: legacy bootconsole [uart8250] enabled
+[    0.000000] Memory policy: Data cache writealloc
+[    0.000000] cma: Reserved 32 MiB at 0x45c00000
+[    0.000000] Zone ranges:
+[    0.000000]   Normal   [mem 0x0000000040000000-0x0000000047ffffff]
+[    0.000000]   HighMem  empty
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000040000000-0x0000000047ffffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000040000000-0x0000000047ffffff]
+[    0.000000] OF: reserved mem: Reserved memory: No reserved-memory node in the DT
+[    0.000000] psci: probing for conduit method from DT.
+[    0.000000] psci: PSCIv65535.65535 detected in firmware.
+[    0.000000] psci: Using standard PSCI v0.2 function IDs
+[    0.000000] psci: MIGRATE_INFO_TYPE not supported.
+[    0.000000] psci: SMC Calling Convention v1.0
+[    0.000000] percpu: Embedded 13 pages/cpu s21516 r8192 d23540 u53248
+[    0.000000] pcpu-alloc: s21516 r8192 d23540 u53248 alloc=13*4096
+[    0.000000] pcpu-alloc: [0] 0 [0] 1 
+[    0.000000] Kernel command line: mem=128M cma=32M rootwait console=ttyS0,115200 console=tty1 earlycon=uart8250,mmio32,0x02500000 earlyprintk loglevel=6 vt.global_cursor_default=0 splash  root=PARTUUID=3de79825-7bc0-4434-a9b2-86e7981094d8 rootfstype=squashfs ro  spuc.slot=A spuc.bootmmc=1 
+[    0.000000] Unknown kernel command line parameters "earlyprintk splash", will be passed to user space.
+[    0.000000] printk: log buffer data + meta data: 131072 + 409600 = 540672 bytes
+[    0.000000] Dentry cache hash table entries: 16384 (order: 4, 65536 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 8192 (order: 3, 32768 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 32768
+[    0.000000] mem auto-init: stack:off, heap alloc:off, heap free:off
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=2, Nodes=1
+[    0.000000] rcu: Preemptible hierarchical RCU implementation.
+[    0.000000] rcu: 	RCU event tracing is enabled.
+[    0.000000] rcu: 	RCU restricting CPUs from NR_CPUS=8 to nr_cpu_ids=2.
+[    0.000000] rcu: RCU calculated value of scheduler-enlistment delay is 10 jiffies.
+[    0.000000] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=2
+[    0.000000] NR_IRQS: 16, nr_irqs: 16, preallocated irqs: 16
+[    0.000000] GIC: Using split EOI/Deactivate mode
+[    0.000000] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.000000] arch_timer: cp15 timer running at 24.00MHz (phys).
+[    0.000000] clocksource: arch_sys_counter: mask: 0xffffffffffffff max_cycles: 0x588fe9dc0, max_idle_ns: 440795202592 ns
+[    0.000001] sched_clock: 56 bits at 24MHz, resolution 41ns, wraps every 4398046511097ns
+[    0.000019] Switching to timer-based delay loop, resolution 41ns
+[    0.000207] clocksource: timer: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 79635851949 ns
+[    0.000816] Console: colour dummy device 132x50
+[    0.000850] printk: legacy console [tty1] enabled
+[    0.000863] printk: legacy bootconsole [uart8250] disabled
+[    0.000931] Calibrating delay loop (skipped), value calculated using timer frequency.. 48.00 BogoMIPS (lpj=240000)
+[    0.000952] CPU: Testing write buffer coherency: ok
+[    0.001001] pid_max: default: 32768 minimum: 301
+[    0.001197] Mount-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.001221] Mountpoint-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.002174] CPU0: update cpu_capacity 1024
+[    0.002206] CPU0: thread -1, cpu 0, socket 0, mpidr 80000000
+[    0.002241] cacheinfo: Unable to detect cache hierarchy for CPU 0
+[    0.003884] Setting up static identity map for 0x40100000 - 0x40100060
+[    0.004154] rcu: Hierarchical SRCU implementation.
+[    0.004170] rcu: 	Max phase no-delay instances is 1000.
+[    0.004598] Timer migration: 1 hierarchy levels; 8 children per group; 1 crossnode level
+[    0.005606] smp: Bringing up secondary CPUs ...
+[    0.006650] CPU1: update cpu_capacity 1024
+[    0.006674] CPU1: thread -1, cpu 1, socket 0, mpidr 80000001
+[    0.006917] smp: Brought up 1 node, 2 CPUs
+[    0.006947] SMP: Total of 2 processors activated (96.00 BogoMIPS).
+[    0.006959] CPU: All CPU(s) started in HYP mode.
+[    0.006965] CPU: Virtualization extensions available.
+[    0.007548] Memory: 78348K/131072K available (9216K kernel code, 998K rwdata, 2640K rodata, 1024K init, 230K bss, 19148K reserved, 32768K cma-reserved, 0K highmem)
+[    0.008116] devtmpfs: initialized
+[    0.016455] VFP support v0.3: implementor 41 architecture 2 part 30 variant 7 rev 5
+[    0.016882] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+[    0.016927] posixtimers hash table entries: 1024 (order: 1, 8192 bytes, linear)
+[    0.016993] futex hash table entries: 512 (32768 bytes on 1 NUMA nodes, total 32 KiB, linear).
+[    0.017624] pinctrl core: initialized pinctrl subsystem
+[    0.019539] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.020982] DMA: preallocated 256 KiB pool for atomic coherent allocations
+[    0.022288] thermal_sys: Registered thermal governor 'step_wise'
+[    0.022385] cpuidle: using governor menu
+[    0.022800] hw-breakpoint: found 5 (+1 reserved) breakpoint and 4 watchpoint registers.
+[    0.022821] hw-breakpoint: maximum watchpoint size is 8 bytes.
+[    0.027909] /soc/clock-controller@2001000: Fixed dependency cycle(s) with /soc/rtc@7090000
+[    0.028309] /soc/mixer@5100000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.028366] /soc/mixer@5200000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.028440] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/mixer@5200000
+[    0.028466] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/lcd-controller@5470000
+[    0.028492] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/lcd-controller@5461000
+[    0.028517] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/mixer@5100000
+[    0.028579] /soc/lcd-controller@5461000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.028638] /soc/lcd-controller@5470000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.028680] /soc/clock-controller@7010000: Fixed dependency cycle(s) with /soc/clock-controller@2001000
+[    0.028702] /soc/clock-controller@7010000: Fixed dependency cycle(s) with /soc/rtc@7090000
+[    0.028728] /soc/rtc@7090000: Fixed dependency cycle(s) with /soc/clock-controller@7010000
+[    0.029587] /soc/clock-controller@2001000: Fixed dependency cycle(s) with /soc/rtc@7090000
+[    0.035879] /soc/mixer@5100000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.036184] /soc/mixer@5200000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.037330] /soc/mixer@5200000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.037471] /soc/mixer@5100000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.037579] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/mixer@5200000
+[    0.037690] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/lcd-controller@5470000
+[    0.037730] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/lcd-controller@5461000
+[    0.037757] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/mixer@5100000
+[    0.038119] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/lcd-controller@5461000
+[    0.038255] /soc/lcd-controller@5461000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.038600] /soc/tcon-top@5460000: Fixed dependency cycle(s) with /soc/lcd-controller@5470000
+[    0.038743] /soc/lcd-controller@5470000: Fixed dependency cycle(s) with /soc/tcon-top@5460000
+[    0.039287] /soc/clock-controller@7010000: Fixed dependency cycle(s) with /soc/clock-controller@2001000
+[    0.039397] /soc/clock-controller@7010000: Fixed dependency cycle(s) with /soc/rtc@7090000
+[    0.039563] /soc/clock-controller@7010000: Fixed dependency cycle(s) with /soc/rtc@7090000
+[    0.039822] /soc/clock-controller@2001000: Fixed dependency cycle(s) with /soc/rtc@7090000
+[    0.040009] /soc/rtc@7090000: Fixed dependency cycle(s) with /soc/clock-controller@7010000
+[    0.045758] /soc/lcd-controller@5461000: Fixed dependency cycle(s) with /panel
+[    0.045914] /panel: Fixed dependency cycle(s) with /soc/lcd-controller@5461000
+[    0.049422] iommu: Default domain type: Translated
+[    0.049449] iommu: DMA domain TLB invalidation policy: strict mode
+[    0.050613] SCSI subsystem initialized
+[    0.051712] libata version 3.00 loaded.
+[    0.051995] mc: Linux media interface: v0.10
+[    0.052059] videodev: Linux video capture interface: v2.00
+[    0.052183] pps_core: LinuxPPS API ver. 1 registered
+[    0.052195] pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+[    0.052219] PTP clock support registered
+[    0.054362] clocksource: Switched to clocksource arch_sys_counter
+[    0.067075] NET: Registered PF_INET protocol family
+[    0.067303] IP idents hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.068057] tcp_listen_portaddr_hash hash table entries: 512 (order: 0, 4096 bytes, linear)
+[    0.068101] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.068122] TCP established hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.068234] TCP bind hash table entries: 1024 (order: 2, 16384 bytes, linear)
+[    0.068281] TCP: Hash tables configured (established 1024 bind 1024)
+[    0.068393] UDP hash table entries: 256 (order: 1, 14336 bytes, linear)
+[    0.068446] UDP-Lite hash table entries: 256 (order: 1, 14336 bytes, linear)
+[    0.068673] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.069355] RPC: Registered named UNIX socket transport module.
+[    0.069381] RPC: Registered udp transport module.
+[    0.069390] RPC: Registered tcp transport module.
+[    0.069397] RPC: Registered tcp-with-tls transport module.
+[    0.069404] RPC: Registered tcp NFSv4.1 backchannel transport module.
+[    0.069660] Unpacking initramfs...
+[    0.075800] Initialise system trusted keyrings
+[    0.076283] workingset: timestamp_bits=30 max_order=15 bucket_order=0
+[    0.076739] squashfs: version 4.0 (2009/01/31) Phillip Lougher
+[    0.077270] NFS: Registering the id_resolver key type
+[    0.077346] Key type id_resolver registered
+[    0.077370] Key type id_legacy registered
+[    0.077765] fuse: init (API version 7.45)
+[    0.078935] Key type asymmetric registered
+[    0.078979] Asymmetric key parser 'x509' registered
+[    0.079089] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 245)
+[    0.079107] io scheduler mq-deadline registered
+[    0.079118] io scheduler kyber registered
+[    0.079155] io scheduler bfq registered
+[    0.201939] Serial: 8250/16550 driver, 8 ports, IRQ sharing disabled
+[    0.230456] loop: module loaded
+[    0.231302] zram: Added device: zram0
+[    0.235471] CAN device driver interface
+[    0.239038] sun6i-rtc 7090000.rtc: registered as rtc0
+[    0.239194] sun6i-rtc 7090000.rtc: setting system clock to 1970-01-02T11:56:02 UTC (129362)
+[    0.240127] i2c_dev: i2c /dev entries driver
+[    0.242960] sunxi-wdt 20500a0.watchdog: Watchdog enabled (timeout=16 sec, nowayout=0)
+[    0.244870] /cpus/cpu@0: unsupported enable-method property: psci
+[    0.245041] CPUidle PSCI: /cpus/idle-states/cpu-sleep missing arm,psci-suspend-param property
+[    0.245080] CPUidle PSCI: CPU 0 failed to PSCI idle
+[    0.245102] faux_driver psci-cpuidle: probe with driver faux_driver failed with error -22
+[    0.245208] CPUidle PSCI: Failed to create psci-cpuidle device
+[    0.246543] sun8i-ce 3040000.crypto: Set mod clock to 300000000 (300 Mhz) from 400000000 (400 Mhz)
+[    0.247080] sun8i-ce 3040000.crypto: will run requests pump with realtime priority
+[    0.247745] sun8i-ce 3040000.crypto: will run requests pump with realtime priority
+[    0.248253] sun8i-ce 3040000.crypto: will run requests pump with realtime priority
+[    0.248729] sun8i-ce 3040000.crypto: will run requests pump with realtime priority
+[    0.248986] sun8i-ce 3040000.crypto: Register cbc(aes)
+[    0.249018] sun8i-ce 3040000.crypto: Register ecb(aes)
+[    0.249031] sun8i-ce 3040000.crypto: Register cbc(des3_ede)
+[    0.249043] sun8i-ce 3040000.crypto: Register ecb(des3_ede)
+[    0.249057] sun8i-ce 3040000.crypto: Register md5
+[    0.249074] sun8i-ce 3040000.crypto: Register sha1
+[    0.249090] sun8i-ce 3040000.crypto: Register sha224
+[    0.249104] sun8i-ce 3040000.crypto: Register sha256
+[    0.249119] sun8i-ce 3040000.crypto: Register sha384
+[    0.249133] sun8i-ce 3040000.crypto: Register sha512
+[    0.249146] sun8i-ce 3040000.crypto: Register stdrng
+[    0.249427] sun8i-ce 3040000.crypto: CryptoEngine Die ID 0
+[    0.252530] hw perfevents: enabled with armv7_cortex_a7 PMU driver, 5 (8000000f) counters available
+[    0.253132] random: crng init done
+[    0.254332] NET: Registered PF_PACKET protocol family
+[    0.254555] can: controller area network core
+[    0.254641] NET: Registered PF_CAN protocol family
+[    0.254660] can: raw protocol
+[    0.254674] can: broadcast manager protocol
+[    0.254689] can: netlink gateway - max_hops=1
+[    0.254821] Key type dns_resolver registered
+[    0.255264] Registering SWP/SWPB emulation handler
+[    0.257524] Freeing initrd memory: 3148K
+[    0.264304] Loading compiled-in X.509 certificates
+[    0.287124] gpio gpiochip0: Static allocation of GPIO base is deprecated, use dynamic allocation.
+[    0.295240] sun20i-d1-pinctrl 2000000.pinctrl: initialized sunXi PIO driver
+[    0.300746] printk: legacy console [ttyS0] disabled
+[    0.321609] 2500000.serial: ttyS0 at MMIO 0x2500000 (irq = 233, base_baud = 1500000) is a 16550A
+[    0.321718] printk: legacy console [ttyS0] enabled
+[    0.492562] 2500400.serial: ttyS1 at MMIO 0x2500400 (irq = 234, base_baud = 1500000) is a 16550A
+[    0.492915] serial serial0: tty port ttyS1 registered
+[    0.515145] 2501000.serial: ttyS4 at MMIO 0x2501000 (irq = 235, base_baud = 1500000) is a 16550A
+[    0.520151] pca953x 0-0020: using no AI
+[    0.522530] rtc-ds1307 0-0032: power-on detected
+[    0.527430] rtc-ds1307 0-0032: voltage drop detected
+[    0.533262] rtc-ds1307 0-0032: registered as rtc1
+[    0.547682] sunxi-mmc 4020000.mmc: Got CD GPIO
+[    0.548321] sunxi-mmc 4021000.mmc: allocated mmc-pwrseq
+[    0.548817] sun4i-drm display-engine: bound 5100000.mixer (ops 0xc0a66a00)
+[    0.549360] sun20i-d1-pinctrl 2000000.pinctrl: supply vcc-pc not found, using dummy regulator
+[    0.550994] sun4i-drm display-engine: bound 5200000.mixer (ops 0xc0a66a00)
+[    0.562269] sun4i-drm display-engine: bound 5460000.tcon-top (ops 0xc0a6b260)
+[    0.562945] sun4i-drm display-engine: bound 5461000.lcd-controller (ops 0xc0a629b8)
+[    0.563312] sun4i-drm display-engine: bound 5470000.lcd-controller (ops 0xc0a629b8)
+[    0.564927] [drm] Initialized sun4i-drm 1.0.0 for display-engine on minor 0
+[    0.573950] sunxi-mmc 4021000.mmc: initialized, max. request size: 2048 KB, uses new timings mode
+[    0.574582] sunxi-mmc 4020000.mmc: initialized, max. request size: 2048 KB, uses new timings mode
+[    0.580041] sunxi-mmc 4021000.mmc: card claims to support voltages below defined range
+[    0.587022] sunxi-mmc 4022000.mmc: initialized, max. request size: 2048 KB, uses new timings mode
+[    0.590592] mmc3: new high speed SDIO card at address 0001
+[    0.602210] Console: switching to colour frame buffer device 100x30
+[    0.613542] mmc0: new high speed SDXC card at address 59b4
+[    0.614545] mmcblk0: mmc0:59b4 SK128 119 GiB
+[    0.625831] sun4i-drm display-engine: [drm] fb0: sun4i-drmdrmfb frame buffer device
+[    0.630343]  mmcblk0: p1
+[    0.631901] input: gpio-keys as /devices/platform/gpio-keys/input/input0
+[    0.634547] clk: Disabling unused clocks
+[    0.634746] PM: genpd: Disabling unused power domains
+[    0.636736] Freeing unused kernel image (initmem) memory: 1024K
+[    0.636950] Run /init as init process
+[    0.636964]   with arguments:
+[    0.636974]     /init
+[    0.636982]     earlyprintk
+[    0.636991]     splash
+[    0.636999]   with environment:
+[    0.637006]     HOME=/
+[    0.637014]     TERM=linux
+[    0.656090] mmc2: new high speed SDHC card at address 0001
+[    0.657911] mmcblk2: mmc2:0001 MK 7.26 GiB
+[    0.673210]  mmcblk2: p1 p2 p3 p4 p5 p6 p7
+[    1.085038] F2FS-fs (mmcblk2p7): f2fs_recover_fsync_data: recovery fsync data, check_only: 0
+[    1.094487] F2FS-fs (mmcblk2p7): Mounted with checkpoint version = 64208096
+[    4.306436] udevd[432]: starting version 3.2.14
+[    4.538009] udevd[432]: starting eudev-3.2.14
+[    5.078806] ina2xx 0-0040: power monitor ina219 (Rshunt = 100000 uOhm)
+[    5.264496] bmp280 0-0076: 0x60 is a known chip id for bme280
+[    5.282327] Goodix-TS 1-0014: supply AVDD28 not found, using dummy regulator
+[    5.282747] Goodix-TS 1-0014: supply VDDIO not found, using dummy regulator
+[    5.332252] usbcore: registered new interface driver usbfs
+[    5.332349] usbcore: registered new interface driver hub
+[    5.332432] usbcore: registered new device driver usb
+[    5.374956] Goodix-TS 1-0014: ID 911, version: 1060
+[    5.382757] input: Goodix Capacitive TouchScreen as /devices/platform/soc/2502800.i2c/i2c-1/1-0014/input/input1
+[    5.424962] ohci-platform 4200400.usb: Generic Platform OHCI controller
+[    5.425019] ohci-platform 4200400.usb: new USB bus registered, assigned bus number 1
+[    5.436047] ohci-platform 4200400.usb: irq 248, io mem 0x04200400
+[    5.436342] Warning! ehci_hcd should always be loaded before uhci_hcd and ohci_hcd, not after
+[    5.474618] cfg80211: Loading compiled-in X.509 certificates for regulatory database
+[    5.510695] hub 1-0:1.0: USB hub found
+[    5.512263] hub 1-0:1.0: 1 port detected
+[    5.617910] ehci-platform 4200000.usb: EHCI Host Controller
+[    5.617972] ehci-platform 4200000.usb: new USB bus registered, assigned bus number 2
+[    5.659082] ehci-platform 4200000.usb: irq 250, io mem 0x04200000
+[    5.677042] ehci-platform 4200000.usb: USB 2.0 started, EHCI 1.00
+[    5.694146] Loaded X.509 cert 'sforshee: 00b28ddf47aef9cea7'
+[    5.697038] hub 2-0:1.0: USB hub found
+[    5.697241] hub 2-0:1.0: 1 port detected
+[    5.725614] Loaded X.509 cert 'wens: 61c038651aabdcf94bd0ac7ff06c7248db18c600'
+[    5.748122] usb_phy_generic usb_phy_generic.1.auto: dummy supplies not allowed for exclusive requests (id=vbus)
+[    5.749150] Bluetooth: Core ver 2.22
+[    5.749285] NET: Registered PF_BLUETOOTH protocol family
+[    5.749301] Bluetooth: HCI device and connection manager initialized
+[    5.749326] Bluetooth: HCI socket layer initialized
+[    5.749341] Bluetooth: L2CAP socket layer initialized
+[    5.749374] Bluetooth: SCO socket layer initialized
+[    5.914524] Bluetooth: HCI UART driver ver 2.3
+[    5.914568] Bluetooth: HCI UART protocol H4 registered
+[    5.914579] Bluetooth: HCI UART protocol BCSP registered
+[    5.914866] Bluetooth: HCI UART protocol Three-wire (H5) registered
+[    5.973215] usb 2-1: new high-speed USB device number 2 using ehci-platform
+[    6.175092] hub 2-1:1.0: USB hub found
+[    6.175553] hub 2-1:1.0: 4 ports detected
+[    6.594521] usb 2-1.2: new full-speed USB device number 3 using ehci-platform
+[    6.663649] Bluetooth: hci0: RTL: examining hci_ver=08 hci_rev=000c lmp_ver=08 lmp_subver=8821
+[    6.667784] Bluetooth: hci0: RTL: rom_version status=0 version=1
+[    6.667828] Bluetooth: hci0: RTL: loading rtl_bt/rtl8821cs_fw.bin
+[    6.728879] Bluetooth: hci0: RTL: loading rtl_bt/rtl8821cs_config.bin
+[    6.744705] Bluetooth: hci0: RTL: cfg_sz 25, total sz 36953
+[    6.771231] rtw88_8821cs mmc3:0001:1: Firmware version 24.11.0, H2C version 12
+[    6.994484] usb 2-1.3: new full-speed USB device number 4 using ehci-platform
+[    7.330366] usbcore: registered new interface driver ch341
+[    7.330477] usbserial: USB Serial support registered for ch341-uart
+[    7.330592] ch341 2-1.2:1.0: ch341-uart converter detected
+[    7.344431] usb 2-1.2: ch341-uart converter now attached to ttyUSB0
+[    7.357358] usbcore: registered new interface driver spi-ch341
+[    7.651886] Bluetooth: hci0: RTL: fw version 0x75b8f098
+[    8.760967] EXT4-fs (mmcblk0p1): mounted filesystem 51f228db-de3b-43ea-ab79-0cecf412ca0d r/w without journal. Quota mode: disabled.
+[   10.494864] NET: Registered PF_INET6 protocol family
+[   10.496207] Segment Routing with IPv6
+[   10.496290] In-situ OAM (IOAM) with IPv6
+[   13.504147] zram0: detected capacity change from 0 to 131072
+[   13.565571] Adding 65532k swap on /dev/zram0.  Priority:16383 extents:1 across:65532k SSDsc
+[   14.242773] NET: Registered PF_ALG protocol family
+[   15.688998] configfs-gadget.spucusb gadget.0: HOST MAC 12:34:56:78:9a:bc
+[   15.689039] configfs-gadget.spucusb gadget.0: MAC 02:12:34:56:78:9a
+[   17.984138] wlan0: authenticate with 94:18:65:73:05:4e (local address=48:d8:90:a5:89:ee)
+[   18.014518] wlan0: send auth to 94:18:65:73:05:4e (try 1/3)
+[   18.018315] wlan0: authenticated
+[   18.024424] wlan0: associate with 94:18:65:73:05:4e (try 1/3)
+[   18.134379] wlan0: associate with 94:18:65:73:05:4e (try 2/3)
+[   18.179062] wlan0: RX AssocResp from 94:18:65:73:05:4e (capab=0x1511 status=0 aid=11)
+[   18.184724] wlan0: associated
+[   18.252265] wlan0: Limiting TX power to 20 (23 - 3) dBm as advertised by 94:18:65:73:05:4e
+[   26.077115] cedrus 1c0e000.video-codec: Device registered as /dev/video0
+[  203.849290] wlan0: deauthenticating from 94:18:65:73:05:4e by local choice (Reason: 3=DEAUTH_LEAVING)
+[  209.273955] sunxi_g2d: loading out-of-tree module taints kernel.
+[  209.275431] sunxi-g2d 5410000.g2d: Probing G2D driver v2.9.15
+[  209.275513] sunxi-g2d 5410000.g2d: G2D MMIO base=0x05410000 size=0x40000
+[  209.275539] sunxi-g2d 5410000.g2d: CCU base=0x02001000 (hardcoded)
+[  209.275568] sunxi-g2d 5410000.g2d: Reset deasserted
+[  209.275804] sunxi-g2d 5410000.g2d: IRQ 253 registered
+[  209.276432] sunxi-g2d 5410000.g2d: RCQ buffer allocated: virt=49327d1a phys=0x0x05c4b000 size=4096
+[  209.276473] sunxi-g2d 5410000.g2d: RCQ enabled with 4096 byte buffer
+[  209.278054] sunxi-g2d 5410000.g2d: Character device /dev/g2d created
+[  209.278092] sunxi-g2d 5410000.g2d: G2D driver v2.9.15 loaded successfully
+[ 1155.545267] sunxi-g2d 5410000.g2d: === G2D hardware enable (fillrect v1.0.0 sequence) ===
+[ 1155.554576] sunxi-g2d 5410000.g2d: Clocks: mod=300000000 bus=200000000 mbus=396000000
+[ 1155.563218] sunxi-g2d 5410000.g2d: TOP: SCLK=0x00000003 HCLK=0x00000003 RESET=0x00000003 CMD_CTL=0x00010001
+[ 1155.574860] sunxi-g2d 5410000.g2d: G2D_VERSION=0x01100114 (IP version=0x0110)
+[ 1155.582860] sunxi-g2d 5410000.g2d: CCU: CLK_REG=0x80000003 BGR_REG=0x00010001
+[ 1155.590845] sunxi-g2d 5410000.g2d: Configuring MBUS priority for G2D master 3...
+[ 1155.599169] sunxi-g2d 5410000.g2d:   Target register: MBUS_MAST_CFG0(3) @ 0x0240
+[ 1155.607481] sunxi-g2d 5410000.g2d:   CFG0 before: 0x00000000 (pri=0 qos=0)
+[ 1155.615300] sunxi-g2d 5410000.g2d:   CFG0 writing: 0x0000000e (pri=1 qos=3)
+[ 1155.623130] sunxi-g2d 5410000.g2d:   CFG0 after:  0x0000000e (pri=1 qos=3)
+[ 1155.630879] sunxi-g2d 5410000.g2d: MBUS quirk SUCCESS: G2D master 3 priority configured
+[ 1155.639854] sunxi-g2d 5410000.g2d: RCQ_CTRL=0x00000000 RCQ_STATUS=0x00000000
+[ 1155.647840] sunxi-g2d 5410000.g2d: === G2D hardware enabled successfully ===
+[ 1155.672529] sunxi-g2d 5410000.g2d: FILLRECT: 80x80 at (0,0) color=0xffffffff dma_fd=5
+[ 1155.681415] sunxi-g2d 5410000.g2d: T113 workaround: fillrect using physical address 0x45c50000
+[ 1155.690954] sunxi-g2d 5410000.g2d: FILLRECT: 80x80 color=0xffffffff fmt=0->0x01 dst_fmt=0->0x01
+[ 1155.700640] sunxi-g2d 5410000.g2d: MIXER IRQ: completion! mixer_int=0x00000011 (MIXER reset done)
+[ 1155.710517] sunxi-g2d 5410000.g2d: sunxi_g2d: fence_create seq=1 fence=cb1bc602
+[ 1155.718869] sunxi-g2d 5410000.g2d: fillrect: installing fd=8 file=505c4785 job=4f018ff4 fence=cb1bc602 seq=1
+[ 1155.730666] sunxi-g2d 5410000.g2d: FILLRECT: 800x240 at (0,0) color=0xff004080 dma_fd=6
+[ 1155.739797] sunxi-g2d 5410000.g2d: T113 workaround: fillrect using physical address 0x46000000
+[ 1155.749512] sunxi-g2d 5410000.g2d: FILLRECT: 800x240 color=0xff004080 fmt=0->0x01 dst_fmt=4->0x05
+[ 1155.759530] sunxi-g2d 5410000.g2d: Color swap for XBGR framebuffer: 0xff004080 -> 0xff804000
+[ 1155.769765] sunxi-g2d 5410000.g2d: MIXER IRQ: completion! mixer_int=0x00000011 (MIXER reset done)
+[ 1155.779787] sunxi-g2d 5410000.g2d: irq: about to signal fence=cb1bc602 seq=1 job=4f018ff4 fd=8
+[ 1155.779832] sunxi-g2d 5410000.g2d: sunxi_g2d: fence_create seq=2 fence=775ba03f
+[ 1155.780925] sunxi-g2d 5410000.g2d: irq: fence signalled fence=cb1bc602 seq=1 signaled=1 job=4f018ff4 fd=8
+[ 1155.782066] sunxi-g2d 5410000.g2d: fillrect: installing fd=9 file=5ee4a357 job=4deb2755 fence=775ba03f seq=2
+[ 1155.821994] sunxi-g2d 5410000.g2d: FILLRECT: 800x240 at (0,240) color=0xff0080ff dma_fd=6
+[ 1155.831435] sunxi-g2d 5410000.g2d: T113 workaround: fillrect using physical address 0x46000000
+[ 1155.841288] sunxi-g2d 5410000.g2d: FILLRECT: 800x240 color=0xff0080ff fmt=0->0x01 dst_fmt=4->0x05
+[ 1155.851404] sunxi-g2d 5410000.g2d: Color swap for XBGR framebuffer: 0xff0080ff -> 0xffff8000
+[ 1155.861751] sunxi-g2d 5410000.g2d: MIXER IRQ: completion! mixer_int=0x00000011 (MIXER reset done)
+[ 1155.871868] sunxi-g2d 5410000.g2d: irq: about to signal fence=775ba03f seq=2 job=4deb2755 fd=9
+[ 1155.871902] sunxi-g2d 5410000.g2d: sunxi_g2d: fence_create seq=3 fence=af2aea1a
+[ 1155.873114] sunxi-g2d 5410000.g2d: irq: fence signalled fence=775ba03f seq=2 signaled=1 job=4deb2755 fd=9
+[ 1155.874400] sunxi-g2d 5410000.g2d: fillrect: installing fd=10 file=a368f72c job=00e6cbc1 fence=af2aea1a seq=3
+[ 1155.914930] sunxi-g2d 5410000.g2d: FILLRECT: 800x480 at (0,0) color=0xffff00ff dma_fd=7
+[ 1155.924322] sunxi-g2d 5410000.g2d: T113 workaround: fillrect using physical address 0x46500000
+[ 1155.934409] sunxi-g2d 5410000.g2d: FILLRECT: 800x480 color=0xffff00ff fmt=0->0x01 dst_fmt=0->0x01
+[ 1155.945981] sunxi-g2d 5410000.g2d: MIXER IRQ: completion! mixer_int=0x00000011 (MIXER reset done)
+[ 1155.956250] sunxi-g2d 5410000.g2d: irq: about to signal fence=af2aea1a seq=3 job=00e6cbc1 fd=10
+[ 1155.956293] sunxi-g2d 5410000.g2d: sunxi_g2d: fence_create seq=4 fence=c7b7815f
+[ 1155.957625] sunxi-g2d 5410000.g2d: irq: fence signalled fence=af2aea1a seq=3 signaled=1 job=00e6cbc1 fd=10
+[ 1155.958991] sunxi-g2d 5410000.g2d: fillrect: installing fd=11 file=2d7c26f1 job=7f98d5c5 fence=c7b7815f seq=4
+[ 1155.999993] sunxi-g2d 5410000.g2d: BLIT: src=800x480 fmt=4 -> dst=0,0,800x480 fmt=4 flags=0x0 alpha=0
+[ 1156.013797] sunxi-g2d 5410000.g2d: MIXER IRQ: completion! mixer_int=0x00000011 (MIXER reset done)
+[ 1156.024148] sunxi-g2d 5410000.g2d: irq: about to signal fence=c7b7815f seq=4 job=7f98d5c5 fd=11
+[ 1156.024194] sunxi-g2d 5410000.g2d: sunxi_g2d: fence_create seq=5 fence=901e6dcd
+[ 1156.025603] sunxi-g2d 5410000.g2d: irq: fence signalled fence=c7b7815f seq=4 signaled=1 job=7f98d5c5 fd=11
+[ 1156.055602] sunxi-g2d 5410000.g2d: blit: installing fd=13 file=f7f01da5 job=a1679de1 fence=901e6dcd seq=5

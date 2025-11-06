@@ -1,0 +1,6 @@
+G2D + DRM Bouncing Ball Demo v2.9.31 - CORRECT UI2+V0 ALPHA BLENDING
+open /dev/g2d: No such file or directory
+Failed to initialize DRM display
+Single V0 layer with alpha (EXACT same pattern as working fillrect)
+==============================
+

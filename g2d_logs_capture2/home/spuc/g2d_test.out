@@ -1,0 +1,3 @@
+issuing selftest ioctl (timeout=200 ms)
+got fence fd: 4
+fence signalled (POLLIN)

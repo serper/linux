@@ -165,7 +165,6 @@ static int generate_ball_pattern(int g2d_fd, int ball_ion_fd, int ball_size)
 	return ret;
 }
 
-/*
 /* Composite ball with alpha blending and hardware scaling onto background.
  * 
  * YUV TEST MODE: To test if VSU is using YUV path internally
@@ -226,7 +225,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	blit_bg.dst_w = disp->width;
 	blit_bg.dst_h = disp->height;
 	blit_bg.flags = 0;
-	blit_bg.global_alpha = 255;
+	blit_bg._reserved = 0;  /* No global_alpha field anymore */
 	blit_bg.fence_fd_in = -1;
 	blit_bg.fence_fd_out = -1;
 
@@ -240,62 +239,72 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 		close(blit_bg.fence_fd_out);
 	}
 	
-	/* Step 2: ALPHA_BLEND ball (110x110 FULL, no crop) + temp → temp at (x,y)
-	 * KEY: Source reads FULL 110×110 buffer, destination crops to ball_size
-	 * VSU will scale from 110×110 → ball_size×ball_size automatically
+	/* Step 2: BLIT ball (110x110 FULL) + temp → temp at (x,y) with scaling
+	 * Using unified BLIT operation with auto-detection:
+	 * - Scaling: 110×110 → ball_size×ball_size (VSU auto-enabled)
+	 * - Alpha blending: src.alpha_mode triggers blending
+	 * - 3-buffer: separate dst (read) and out (write) buffers
 	 */
-	struct g2d_alpha_blend blend = {0};
+	struct g2d_blit blit = {0};
 	
-	/* Source (V0/foreground): ball FULL 110×110 buffer (RGB format) */
-	blend.src.width = ball_buffer_size;   /* FIXED 110 */
-	blend.src.height = ball_buffer_size;  /* FIXED 110 */
-	blend.src.format = G2D_FMT_ARGB8888;
-	blend.src.stride[0] = ball_buffer_size * 4;  /* pitch = 440 (matches width) */
-	blend.src.dma_fd = ball_ion_fd;
-	blend.src.crop_x = 0;
-	blend.src.crop_y = 0;
-	blend.src.crop_w = ball_buffer_size;  /* FULL: Read entire 110×110 */
-	blend.src.crop_h = ball_buffer_size;  /* FULL: Read entire 110×110 */
-	blend.src.alpha = 255;
-	blend.src.alpha_mode = G2D_PIXEL_ALPHA;
+	/* Source (V0/foreground): ball FULL 110×110 buffer (ARGB with per-pixel alpha) */
+	blit.src.width = ball_buffer_size;   /* FIXED 110 */
+	blit.src.height = ball_buffer_size;  /* FIXED 110 */
+	blit.src.format = G2D_FMT_ARGB8888;
+	blit.src.stride[0] = ball_buffer_size * 4;  /* pitch = 440 */
+	blit.src.dma_fd = ball_ion_fd;
+	blit.src.crop_x = 0;
+	blit.src.crop_y = 0;
+	blit.src.crop_w = ball_buffer_size;  /* Read entire 110×110 */
+	blit.src.crop_h = ball_buffer_size;
+	blit.src.alpha = 255;
+	blit.src.alpha_mode = G2D_PIXEL_ALPHA;  /* Auto-enables alpha blending */
 
-	/* Destination (UI2/background): temp buffer with VARIABLE crop size */
-	blend.dst.width = disp->width;
-	blend.dst.height = disp->height;
-	blend.dst.format = G2D_FMT_XRGB8888;
-	blend.dst.stride[0] = disp->width * 4;
-	blend.dst.dma_fd = temp_ion_fd;
-	blend.dst.crop_x = x;  /* Ball position */
-	blend.dst.crop_y = y;
-	blend.dst.crop_w = ball_size;  /* VARIABLE: VSU scales 110→ball_size */
-	blend.dst.crop_h = ball_size;  /* VARIABLE: VSU scales 110→ball_size */
-	blend.dst.alpha = 128;
-	blend.dst.alpha_mode = G2D_GLOBAL_ALPHA;
+	/* Destination (UI2/background): temp buffer at ball position */
+	blit.dst.width = disp->width;
+	blit.dst.height = disp->height;
+	blit.dst.format = G2D_FMT_XRGB8888;
+	blit.dst.stride[0] = disp->width * 4;
+	blit.dst.dma_fd = temp_ion_fd;
+	blit.dst.crop_x = x;  /* Ball position */
+	blit.dst.crop_y = y;
+	blit.dst.crop_w = ball_size;  /* Region to blend */
+	blit.dst.crop_h = ball_size;
+	blit.dst.alpha = 128;  /* Background 50% transparent */
+	blit.dst.alpha_mode = G2D_GLOBAL_ALPHA;  /* Auto-enables alpha blending */
 
-	/* Output: temp buffer (3-buffer mode with same buffer as dst) */
-	blend.out.width = disp->width;
-	blend.out.height = disp->height;
-	blend.out.format = G2D_FMT_XRGB8888;
-	blend.out.stride[0] = disp->width * 4;
-	blend.out.dma_fd = temp_ion_fd;
-	blend.out.crop_x = x;
-	blend.out.crop_y = y;
-	blend.out.crop_w = ball_size;  /* Output size matches dst crop */
-	blend.out.crop_h = ball_size;
-	blend.out.alpha = 0;
-	blend.out.alpha_mode = 0;
+	/* Output: temp buffer (3-buffer mode - write to same buffer as dst) */
+	blit.out.width = disp->width;
+	blit.out.height = disp->height;
+	blit.out.format = G2D_FMT_XRGB8888;
+	blit.out.stride[0] = disp->width * 4;
+	blit.out.dma_fd = temp_ion_fd;
+	blit.out.crop_x = x;
+	blit.out.crop_y = y;
+	blit.out.crop_w = ball_size;
+	blit.out.crop_h = ball_size;
+	blit.out.alpha = 0;
+	blit.out.alpha_mode = 0;
 
-	blend.fence_fd_in = -1;
-	blend.fence_fd_out = -1;
+	/* Destination position and size (for scaling: 110×110 → ball_size) */
+	blit.dst_x = x;
+	blit.dst_y = y;
+	blit.dst_w = ball_size;  /* VSU scales 110 → ball_size */
+	blit.dst_h = ball_size;
 
-	ret = ioctl(g2d_fd, G2D_IOC_ALPHA_BLEND, &blend);
+	blit.flags = 0;  /* No rotation, scaling+blending auto-detected */
+	blit._reserved = 0;
+	blit.fence_fd_in = -1;
+	blit.fence_fd_out = -1;
+
+	ret = ioctl(g2d_fd, G2D_IOC_BLIT, &blit);
 	if (ret < 0) {
-		perror("G2D_IOC_ALPHA_BLEND (ball + temp → temp with scaling)");
+		perror("G2D_IOC_BLIT (ball + temp → temp with scaling+blending)");
 		return -1;
 	}
 	
-	if (blend.fence_fd_out >= 0) {
-		close(blend.fence_fd_out);
+	if (blit.fence_fd_out >= 0) {
+		close(blit.fence_fd_out);
 	}
 
 	/* Step 3: BLIT temp → framebuffer */
@@ -334,7 +343,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	blit_debug.dst_h = ball_size;
 	
 	blit_debug.flags = 0;  /* No flags, just plain copy */
-	blit_debug.global_alpha = 255;
+	blit_debug._reserved = 0;  /* No global_alpha field anymore */
 	blit_debug.fence_fd_in = -1;
 	blit_debug.fence_fd_out = -1;
 	
@@ -411,38 +420,38 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 #endif  /* End disabled alpha blend */
 
 	/* Step 3: BLIT temp_buffer → framebuffer (copy composited result with ball) */
-	struct g2d_blit blit = {0};
-	blit.out.dma_fd = -1;  /* Legacy 2-buffer mode: dst is also output */
+	struct g2d_blit blit_copy = {0};
+	blit_copy.out.dma_fd = -1;  /* Legacy 2-buffer mode: dst is also output */
 	
-	blit.src.width = disp->width;
-	blit.src.height = disp->height;
-	blit.src.format = G2D_FMT_XRGB8888;
-	blit.src.stride[0] = disp->width * 4;
-	blit.src.dma_fd = temp_ion_fd;  /* Read from temp buffer (has blended result) */
-	blit.src.crop_x = 0;
-	blit.src.crop_y = 0;
-	blit.src.crop_w = disp->width;
-	blit.src.crop_h = disp->height;
+	blit_copy.src.width = disp->width;
+	blit_copy.src.height = disp->height;
+	blit_copy.src.format = G2D_FMT_XRGB8888;
+	blit_copy.src.stride[0] = disp->width * 4;
+	blit_copy.src.dma_fd = temp_ion_fd;  /* Read from temp buffer (has blended result) */
+	blit_copy.src.crop_x = 0;
+	blit_copy.src.crop_y = 0;
+	blit_copy.src.crop_w = disp->width;
+	blit_copy.src.crop_h = disp->height;
 
-	blit.dst.width = disp->width;
-	blit.dst.height = disp->height * 2;  /* Double buffered framebuffer */
-	blit.dst.format = G2D_FMT_XRGB8888;
-	blit.dst.stride[0] = disp->pitch;
-	blit.dst.dma_fd = dmabuf_fd;
-	blit.dst.crop_x = 0;
-	blit.dst.crop_y = 0;  /* No crop on destination buffer */
-	blit.dst.crop_w = 0;  /* No crop (use full source) */
-	blit.dst.crop_h = 0;  /* No crop (use full source) */
+	blit_copy.dst.width = disp->width;
+	blit_copy.dst.height = disp->height * 2;  /* Double buffered framebuffer */
+	blit_copy.dst.format = G2D_FMT_XRGB8888;
+	blit_copy.dst.stride[0] = disp->pitch;
+	blit_copy.dst.dma_fd = dmabuf_fd;
+	blit_copy.dst.crop_x = 0;
+	blit_copy.dst.crop_y = 0;  /* No crop on destination buffer */
+	blit_copy.dst.crop_w = 0;  /* No crop (use full source) */
+	blit_copy.dst.crop_h = 0;  /* No crop (use full source) */
 
-	blit.dst_x = 0;
-	blit.dst_y = backbuffer_y_offset;  /* CRITICAL: Write to backbuffer page offset */
-	blit.dst_w = disp->width;
-	blit.dst_h = disp->height;
-	blit.flags = 0;  /* Simple copy */
-	blit.fence_fd_in = -1;
-	blit.fence_fd_out = -1;
+	blit_copy.dst_x = 0;
+	blit_copy.dst_y = backbuffer_y_offset;  /* CRITICAL: Write to backbuffer page offset */
+	blit_copy.dst_w = disp->width;
+	blit_copy.dst_h = disp->height;
+	blit_copy.flags = 0;  /* Simple copy */
+	blit_copy.fence_fd_in = -1;
+	blit_copy.fence_fd_out = -1;
 
-	ret = ioctl(g2d_fd, G2D_IOC_BLIT, &blit);
+	ret = ioctl(g2d_fd, G2D_IOC_BLIT, &blit_copy);
 	if (ret < 0) {
 		perror("G2D_IOC_BLIT (temp → framebuffer)");
 		return -1;
@@ -453,9 +462,9 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	 * NOTE: Currently disabled due to poll() timing issues with already-signaled fences.
 	 * The G2D operations complete very quickly (~1-2ms) so the risk of tearing is minimal.
 	 */
-	if (blit.fence_fd_out >= 0) {
+	if (blit_copy.fence_fd_out >= 0) {
 		/* Fence wait disabled - just close the fd */
-		close(blit.fence_fd_out);
+		close(blit_copy.fence_fd_out);
 	}
 
 	/* Removed diagnostic second blit to other page. The proper frame is
@@ -911,7 +920,7 @@ int main(int argc, char **argv)
 	scale_gradient.dst_w = disp.width;
 	scale_gradient.dst_h = disp.height;
 	scale_gradient.flags = 0;
-	scale_gradient.global_alpha = 255;
+	scale_gradient._reserved = 0;  /* No global_alpha field anymore */
 	scale_gradient.fence_fd_in = -1;
 	scale_gradient.fence_fd_out = -1;
 	

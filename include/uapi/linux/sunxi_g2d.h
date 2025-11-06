@@ -79,10 +79,29 @@ struct g2d_buf {
 	__u16 _pad;		/* Padding for alignment to 4-byte boundary */
 };
 
-/* G2D blit operation */
+/* G2D blit operation - UNIFIED operation for all blitting needs
+ * 
+ * This single operation handles:
+ * - Simple copy (no flags)
+ * - Scaling (when dst_w/dst_h differ from src crop size)
+ * - Alpha blending (via src/dst alpha_mode and alpha values)
+ * - Rotation/flip (via flags, cannot combine with scaling)
+ * 
+ * Hardware limitation: Cannot do scaling + rotation simultaneously.
+ * If both are needed, perform in two passes.
+ * 
+ * Alpha blending is automatic when:
+ * - src.alpha_mode != G2D_PIXEL_ALPHA (uses src.alpha value), OR
+ * - dst.alpha_mode != G2D_PIXEL_ALPHA (uses dst.alpha value), OR
+ * - Source format has alpha channel and pixel alpha is non-opaque
+ * 
+ * If out.dma_fd == -1: in-place operation (dst is both input background and output)
+ * If out.dma_fd >= 0: three-buffer operation (dst=background, src=foreground, out=result)
+ */
 struct g2d_blit {
-	struct g2d_buf src;
-	struct g2d_buf dst;
+	struct g2d_buf src;	/* Source/foreground image */
+	struct g2d_buf dst;	/* Destination/background image */
+	struct g2d_buf out;	/* Output buffer (optional: -1 for in-place) */
 	
 	__u32 dst_x;		/* Destination position */
 	__u32 dst_y;
@@ -90,23 +109,33 @@ struct g2d_blit {
 	__u32 dst_h;
 	
 	__u32 flags;		/* G2D_BLIT_FLAG_* */
-	__u32 global_alpha;	/* Global alpha value 0-255 (for ALPHA_BLEND) */
+	__u32 _reserved;	/* Reserved for future use */
 	
 	/* Sync fence support */
 	__s32 fence_fd_in;	/* Wait on this fence before blit, or -1 */
 	__s32 fence_fd_out;	/* OUT: fence that signals when done */
 };
 
-/* Blit flags */
-#define G2D_BLIT_FLAG_ALPHA_BLEND	(1 << 0)
+/* Blit flags 
+ * Note: ALPHA_BLEND flag is deprecated - alpha blending is now automatic
+ * based on src/dst alpha_mode and alpha values in g2d_buf structures.
+ */
 #define G2D_BLIT_FLAG_ROTATE_90		(1 << 1)
 #define G2D_BLIT_FLAG_ROTATE_180	(1 << 2)
 #define G2D_BLIT_FLAG_ROTATE_270	(1 << 3)
 #define G2D_BLIT_FLAG_FLIP_H		(1 << 4)
 #define G2D_BLIT_FLAG_FLIP_V		(1 << 5)
-#define G2D_BLIT_FLAG_ASYNC		(1 << 6)  /* Return immediately */
 
-/* G2D fillrect operation */
+/* Deprecated flags - kept for compatibility but ignored */
+#define G2D_BLIT_FLAG_ALPHA_BLEND	(1 << 0)  /* Deprecated: auto-detected */
+#define G2D_BLIT_FLAG_ASYNC		(1 << 6)  /* Deprecated: always async */
+
+/* G2D fillrect operation 
+ * 
+ * Fills a rectangular region with a solid color.
+ * Can optionally perform alpha blending with existing content if dst buffer
+ * format has alpha channel.
+ */
 struct g2d_fillrect {
 	struct g2d_buf dst;
 	
@@ -137,15 +166,6 @@ struct g2d_alloc_buffer {
 	__u32 flags;		/* Reserved for future use */
 };
 
-/* G2D alpha blending operation */
-struct g2d_alpha_blend {
-	struct g2d_buf dst;	/* Background/destination image */
-	struct g2d_buf src;	/* Foreground/source image */
-	
-	__s32 fence_fd_in;
-	__s32 fence_fd_out;	/* OUT */
-};
-
 /* Selftest helper for userspace to create a kernel-backed fence that will
  * be signalled after a timeout. Used for isolating fence lifecycle bugs
  * without touching hardware.
@@ -163,11 +183,20 @@ struct g2d_selftest {
 #define G2D_IOC_FILLRECT	_IOWR(G2D_IOC_MAGIC, 2, struct g2d_fillrect)
 #define G2D_IOC_SYNC		_IOW(G2D_IOC_MAGIC, 3, __s32)  /* Wait on fence */
 #define G2D_IOC_ALLOC_BUFFER	_IOWR(G2D_IOC_MAGIC, 4, struct g2d_alloc_buffer)
-#define G2D_IOC_ALPHA_BLEND	_IOWR(G2D_IOC_MAGIC, 5, struct g2d_alpha_blend)
+/* Deprecated ioctls - kept for compatibility */
+#define G2D_IOC_ALPHA_BLEND	_IOWR(G2D_IOC_MAGIC, 5, struct g2d_blit)  /* Use G2D_IOC_BLIT instead */
 #define G2D_IOC_SELFTEST_FENCE _IOWR(G2D_IOC_MAGIC, 6, struct g2d_selftest)
-/* New: RCQ-based fillrect - allows userspace to explicitly request the
- * RCQ path while keeping the legacy FILLRECT ioctl for direct writes.
- */
-#define G2D_IOC_FILLRECT_RCQ	_IOWR(G2D_IOC_MAGIC, 7, struct g2d_fillrect)
+#define G2D_IOC_FILLRECT_RCQ	_IOWR(G2D_IOC_MAGIC, 7, struct g2d_fillrect)  /* Use G2D_IOC_FILLRECT instead */
+
+/* Buffer read/write operations for userspace manipulation */
+struct g2d_buffer_rw {
+	__s32 dma_fd;		/* DMA-BUF fd from G2D_IOC_ALLOC_BUFFER */
+	__u64 offset;		/* Offset in bytes from buffer start */
+	__u64 size;		/* Number of bytes to read/write */
+	__u64 user_ptr;		/* Userspace buffer pointer (void __user *) */
+};
+
+#define G2D_IOC_WRITE_BUFFER	_IOW(G2D_IOC_MAGIC, 8, struct g2d_buffer_rw)
+#define G2D_IOC_READ_BUFFER	_IOR(G2D_IOC_MAGIC, 9, struct g2d_buffer_rw)
 
 #endif /* _UAPI_SUNXI_G2D_H */
