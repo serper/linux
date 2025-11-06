@@ -1152,24 +1152,31 @@ int main(int argc, char **argv)
 	frame_count++;
 	clock_gettime(CLOCK_MONOTONIC, &frame_end);
 	
-	/* Update ball size with smooth sinusoidal animation (BEFORE physics) */
+	/* Update ball size with smooth sinusoidal animation (AFTER rendering, for next frame) */
 	scale_time += delta_time;
 	float scale_factor = 0.5f + 0.5f * sinf(2.0f * M_PI * scale_speed * scale_time);
 	ball_radius = min_radius + (int)((max_radius - min_radius) * scale_factor);
 	ball_size = ball_radius * 2;
 	
-	/* Update ball physics (bouncing) - now uses current radius */
+	/* Update ball physics (bouncing) - uses current radius for next frame */
 	ball_x += vel_x;
 	ball_y += vel_y;
 	
-	/* Bounce off walls - uses current radius to prevent out-of-bounds */
-	if (ball_x - ball_radius < 0 || ball_x + ball_radius > disp.width) {
+	/* Bounce off walls - uses current radius to prevent out-of-bounds on next frame */
+	if (ball_x - ball_radius < 0) {
 		vel_x = -vel_x;
-		ball_x += vel_x;  /* Correct position */
+		ball_x = ball_radius;  /* Clamp to left edge */
+	} else if (ball_x + ball_radius > disp.width) {
+		vel_x = -vel_x;
+		ball_x = disp.width - ball_radius;  /* Clamp to right edge */
 	}
-	if (ball_y - ball_radius < 0 || ball_y + ball_radius > disp.height) {
+	
+	if (ball_y - ball_radius < 0) {
 		vel_y = -vel_y;
-		ball_y += vel_y;  /* Correct position */
+		ball_y = ball_radius;  /* Clamp to top edge */
+	} else if (ball_y + ball_radius > disp.height) {
+		vel_y = -vel_y;
+		ball_y = disp.height - ball_radius;  /* Clamp to bottom edge */
 	}
 	
 	/* FPS display (every second) */
