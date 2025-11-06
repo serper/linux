@@ -2480,11 +2480,13 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		break;
 	}
 
-	/* UI2 reads from dst buffer at the position where the ball is (dst_x, dst_y) */
-	ui2_addr = dst_dma_addr;  /* Use dst_dma_addr which already has the offset applied */
+	/* UI2 reads from dst buffer at the position where the ball is (dst_x, dst_y)
+	 * IMPORTANT: Apply dst_x/dst_y offset to the address
+	 */
+	ui2_addr = dst_dma_addr + (dst_y * dst_pitch) + (dst_x * ui2_bpp);
 
-	dev_info(g2d->dev, "UI2 addressing: dst_dma_addr=0x%llx dst_base_addr=0x%llx diff=0x%llx pitch=%u\n",
-		 (u64)dst_dma_addr, (u64)dst_base_addr, (u64)(dst_dma_addr - dst_base_addr), dst_pitch);
+	dev_info(g2d->dev, "UI2 addressing: base=0x%llx offset=(x=%u y=%u) → addr=0x%llx pitch=%u\n",
+		 (u64)dst_dma_addr, dst_x, dst_y, (u64)ui2_addr, dst_pitch);
 
 	/* Configure UI2 attributes - background with user alpha settings */
 	ui2.ovl_attr.bits.lay_en = 1;
@@ -2647,10 +2649,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 	/* === Configure Writeback - Write result to OUTPUT buffer (separate from inputs) === */
 
-	/* WB address = output buffer (temp_buffer in demo, DIFFERENT from dst) */
-	wb_addr = out_dma_addr;  /* Write to output buffer */
-
-	/* Calculate bytes per pixel for writeback */
+	/* Calculate bytes per pixel for writeback first (needed for offset calculation) */
 	switch (out_format) {
 	case G2D_FMT_ARGB8888:
 	case G2D_FMT_XRGB8888:
@@ -2665,6 +2664,14 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		wb_bpp = 4;
 		break;
 	}
+
+	/* WB address = output buffer + offset for position (dst_x, dst_y)
+	 * IMPORTANT: Apply dst_x/dst_y offset to write at correct position
+	 */
+	wb_addr = out_dma_addr + (dst_y * out_pitch) + (dst_x * wb_bpp);
+
+	dev_info(g2d->dev, "WB addressing: base=0x%llx offset=(x=%u y=%u) → addr=0x%llx pitch=%u\n",
+		 (u64)out_dma_addr, dst_x, dst_y, (u64)wb_addr, out_pitch);
 
 	/* Configure writeback */
 	wb.wb_attr.dwval = 0;  /* Clear all bits first */
@@ -2683,8 +2690,8 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, WB_LADD0, wb.laddr0);
 	g2d_write(g2d, WB_HADD0, wb.haddr0);
 
-	dev_info(g2d->dev, "WB: addr=0x%llx size=%ux%u pitch=%u (WRITE to output buffer)\n",
-		 (u64)wb_addr, blend_w, blend_h, out_pitch);
+	dev_info(g2d->dev, "WB: addr=0x%llx size=%ux%u pitch=%u offset=0x%llx (WRITE to output buffer at position)\n",
+		 (u64)wb_addr, blend_w, blend_h, out_pitch, (u64)(wb_addr - out_dma_addr));
 
 	/* 
 	 * Note: VSU (scaling) is NOT configured here because:
