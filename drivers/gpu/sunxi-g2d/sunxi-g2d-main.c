@@ -3781,11 +3781,91 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	
 	/* Check for incompatible single-pass combinations */
 	if (needs_rotation && needs_scaling) {
+		/* TODO: Support alpha blending with scale+rotate (requires 3-pass) */
+		if (needs_alpha) {
+			dev_warn(g2d->dev, "Scale+rotate+alpha not yet supported (would need 3-pass)\n");
+			ret = -ENOSYS;
+			goto err_unmap_dst;
+		}
+		
 		dev_info(g2d->dev, "Rotation + scaling requested: will do 2-pass (scale then rotate)\n");
-		/* TODO: Implement 2-pass operation with temporary buffer */
-		dev_err(g2d->dev, "2-pass scaling+rotation not yet implemented\n");
-		ret = -ENOSYS;
-		goto err_unmap_dst;
+		
+		/* 2-pass approach:
+		 * STEP 1: Scale src to temporary buffer (no rotation, no alpha)
+		 * STEP 2: Rotate temp buffer to dst (no scaling, no alpha)
+		 * 
+		 * This handles the hardware limitation where VSU and ROT
+		 * cannot operate simultaneously.
+		 */
+		
+		/* Calculate scaled size (before rotation) */
+		u32 temp_w = blit.dst_w;
+		u32 temp_h = blit.dst_h;
+		u32 temp_pitch = ALIGN(temp_w * dst_bpp, 32);
+		size_t temp_size = temp_pitch * temp_h;
+		
+		/* Allocate temporary buffer using CMA */
+		void *temp_vaddr = NULL;
+		dma_addr_t temp_dma_addr = 0;
+		
+		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size, &temp_dma_addr, GFP_KERNEL);
+		if (!temp_vaddr) {
+			dev_err(g2d->dev, "Failed to allocate temp buffer for scale+rotate: size=%zu\n", temp_size);
+			ret = -ENOMEM;
+			goto err_unmap_dst;
+		}
+		
+		dev_info(g2d->dev, "Allocated temp buffer: vaddr=%p dma=0x%llx size=%zu\n",
+			 temp_vaddr, (u64)temp_dma_addr, temp_size);
+		
+		/* STEP 1: Scale src → temp (no rotation, no alpha) */
+		dev_info(g2d->dev, "STEP 1: SCALE %ux%u -> %ux%u to temp buffer\n",
+			 src_crop_w, src_crop_h, temp_w, temp_h);
+		
+		/* Simple scaling only */
+		ret = sunxi_g2d_do_blit(g2d,
+					src_dma_addr, blit.src.width, blit.src.height,
+					src_pitch, blit.src.format,
+					blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
+					temp_dma_addr, temp_w, temp_h,
+					temp_pitch, blit.dst.format,
+					0, 0, temp_w, temp_h);  /* Fill entire temp buffer */
+		
+		if (ret < 0) {
+			dev_err(g2d->dev, "STEP 1 (scale) failed: %d\n", ret);
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			goto err_unmap_dst;
+		}
+		
+		dev_info(g2d->dev, "✅ Step 1 complete: scaled to temp buffer\n");
+		
+		/* STEP 2: Rotate temp → dst (no scaling) */
+		dev_info(g2d->dev, "STEP 2: ROTATE %ux%u -> dst at (%u,%u)\n",
+			 temp_w, temp_h, blit.dst_x, blit.dst_y);
+		
+		ret = sunxi_g2d_do_blit_rot(g2d,
+					    temp_dma_addr, temp_w, temp_h,
+					    temp_pitch, blit.dst.format,
+					    0, 0, temp_w, temp_h,  /* Full temp buffer as source */
+					    dst_dma_addr, blit.dst.width, blit.dst.height,
+					    dst_pitch, blit.dst.format,
+					    blit.dst_x, blit.dst_y, temp_w, temp_h,
+					    blit.flags);  /* Apply rotation flags */
+		
+		/* Free temporary buffer */
+		dev_info(g2d->dev, "Freeing temp buffer: vaddr=%p dma=0x%llx size=%zu\n",
+			 temp_vaddr, (u64)temp_dma_addr, temp_size);
+		dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+		
+		if (ret < 0) {
+			dev_err(g2d->dev, "STEP 2 (rotate) failed: %d\n", ret);
+			goto err_unmap_dst;
+		}
+		
+		dev_info(g2d->dev, "✅ 2-pass scale+rotate completed successfully\n");
+		
+		/* Skip unified path - we already did the work */
+		goto done_blit;
 	}
 	
 	/* All other combinations are valid for single-pass:
@@ -3830,6 +3910,8 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	
 	if (ret < 0)
 		goto err_unmap_dst;
+
+done_blit:
 	/* Create job + fence and return fence_fd_out to userspace. */
 	{
 		struct sunxi_g2d_job *job;
