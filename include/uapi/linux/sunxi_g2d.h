@@ -57,6 +57,12 @@ enum g2d_alpha_mode {
 	G2D_MIXER_ALPHA = 2,	/* Multiply pixel and global alpha */
 };
 
+/* Premultiplication modes for alpha channel handling */
+enum g2d_premul_mode {
+	G2D_PREMUL_NONE = 0,	/* Non-premultiplied alpha (straight alpha) */
+	G2D_PREMUL_ALPHA = 1,	/* Premultiplied alpha (color *= alpha) */
+};
+
 /* Porter-Duff blending modes
  * These define how source and destination are combined during alpha blending.
  * Only used when alpha blending is active.
@@ -95,7 +101,8 @@ struct g2d_buf {
 	/* Alpha control (for alpha blending operations) */
 	__u8 alpha;		/* Global alpha value for this buffer (0-255) */
 	__u8 alpha_mode;	/* enum g2d_alpha_mode */
-	__u16 _pad;		/* Padding for alignment to 4-byte boundary */
+	__u8 premul_mode;	/* enum g2d_premul_mode - alpha premultiplication */
+	__u8 _pad;		/* Padding for alignment to 4-byte boundary */
 };
 
 /* G2D blit operation - UNIFIED operation for all blitting needs

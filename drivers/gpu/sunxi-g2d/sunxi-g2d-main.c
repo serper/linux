@@ -2422,12 +2422,12 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 				    dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
 				    u32 src_pitch, u32 src_format,
 				    u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				    u8 src_alpha, u8 src_alpha_mode,
+				    u8 src_alpha, u8 src_alpha_mode, u8 src_premul,
 				    dma_addr_t dst_dma_addr, dma_addr_t dst_base_addr,
 				    u32 dst_w, u32 dst_h,
 				    u32 dst_pitch, u32 dst_format,
 				    u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				    u8 dst_alpha, u8 dst_alpha_mode,
+				    u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul,
 				    dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
 				    u32 out_pitch, u32 out_format,
 				    u32 out_crop_w, u32 out_crop_h,
@@ -2447,9 +2447,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	unsigned long timeout;
 	int ret;
 
-	dev_info(g2d->dev, "BLIT_ALPHA_3BUF: src=%ux%u@(%u,%u) alpha=%u/%u dst=%ux%u@(%u,%u) alpha=%u/%u out=%ux%u blend=%ux%u\n",
-		 src_crop_w, src_crop_h, src_x, src_y, src_alpha, src_alpha_mode,
-		 dst_w, dst_h, dst_x, dst_y, dst_alpha, dst_alpha_mode,
+	dev_info(g2d->dev, "BLIT_ALPHA_3BUF: src=%ux%u@(%u,%u) alpha=%u/%u premul=%u dst=%ux%u@(%u,%u) alpha=%u/%u premul=%u out=%ux%u blend=%ux%u\n",
+		 src_crop_w, src_crop_h, src_x, src_y, src_alpha, src_alpha_mode, src_premul,
+		 dst_w, dst_h, dst_x, dst_y, dst_alpha, dst_alpha_mode, dst_premul,
 		 out_crop_w, out_crop_h, blend_w, blend_h);
 
 	/* Check if scaling is needed (G2D V2 requires TWO operations for scale+blend) */
@@ -2738,12 +2738,11 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	bld.bld_en_ctrl.bits.p1_fcen = 0;  /* Use V0 layer */
 
 	/* Configure premultiplication for alpha blending
-	 * IMPORTANT: Set to 0 (non-premultiplied) for standard ARGB data.
-	 * Our input pixels have non-premultiplied alpha (e.g., 0x80FF0000).
-	 * If set to 1, hardware expects premultiplied data (e.g., 0x80800000).
+	 * 0 = non-premultiplied alpha (straight alpha) - standard ARGB data
+	 * 1 = premultiplied alpha (color already multiplied by alpha)
 	 */
-	bld.premulti_ctrl.bits.p0_alpha_mode = 1;  /* Pipe0 (UI2/background) alpha mode */
-	bld.premulti_ctrl.bits.p1_alpha_mode = 1;  /* Pipe1 (V0/foreground) alpha mode */
+	bld.premulti_ctrl.bits.p0_alpha_mode = dst_premul;  /* Pipe0 (UI2/background) */
+	bld.premulti_ctrl.bits.p1_alpha_mode = src_premul;  /* Pipe1 (V0/foreground) */
 
 	/* Pipe input sizes - MUST match actual layer sizes for correct alpha blending */
 	bld.mem_size[0].bits.width = blend_w - 1;     /* UI2: blend region size */
@@ -3704,11 +3703,11 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 				     dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
 				     u32 src_pitch, u32 src_format,
 				     u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				     u8 src_alpha, u8 src_alpha_mode,
+				     u8 src_alpha, u8 src_alpha_mode, u8 src_premul,
 				     dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
 				     u32 dst_pitch, u32 dst_format,
 				     u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				     u8 dst_alpha, u8 dst_alpha_mode,
+				     u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul,
 				     dma_addr_t out_dma_addr,  /* Explicit output buffer (may == dst_dma_addr) */
 				     u32 out_w, u32 out_h, u32 out_pitch, u32 out_format,  /* Output dimensions */
 				     u32 flags,
@@ -3738,12 +3737,12 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 						    src_dma_addr, src_w, src_h,
 						    src_pitch, src_format,
 						    src_x, src_y, src_crop_w, src_crop_h,
-						    src_alpha, src_alpha_mode,
+						    src_alpha, src_alpha_mode, src_premul,
 						    dst_dma_addr, dst_dma_addr, /* dst_base same as dst */
 						    dst_w, dst_h,
 						    dst_pitch, dst_format,
 						    dst_x, dst_y, blend_w, blend_h,
-						    dst_alpha, dst_alpha_mode,
+						    dst_alpha, dst_alpha_mode, dst_premul,
 						    out_dma_addr, /* Write to out (may == dst for in-place) */
 						    out_w, out_h,
 						    out_pitch, out_format,
@@ -4157,11 +4156,11 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 					src_dma_addr, blit.src.width, blit.src.height,
 					src_pitch, blit.src.format,
 					blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
-					blit.src.alpha, blit.src.alpha_mode,
+					blit.src.alpha, blit.src.alpha_mode, blit.src.premul_mode,
 					dst_dma_addr, blit.dst.width, blit.dst.height,
 					dst_pitch, blit.dst.format,
 					blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h,
-					blit.dst.alpha, blit.dst.alpha_mode,
+					blit.dst.alpha, blit.dst.alpha_mode, blit.dst.premul_mode,
 					out_dma_addr,  /* Explicit output buffer (or dst if none) */
 					out_w, out_h, out_pitch, out_format,  /* Output dimensions */
 					blit.flags,
@@ -4779,15 +4778,16 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 				       src_dma_addr, blend.src.width, blend.src.height,
 				       src_pitch, blend.src.format,
 				       0, 0, blend.src.crop_w, blend.src.crop_h,
-				       blend.src.alpha, blend.src.alpha_mode,
+				       blend.src.alpha, blend.src.alpha_mode, blend.src.premul_mode,
 				       dst_dma_addr, dst_base_addr, blend.dst.width, blend.dst.height,
 				       dst_pitch, blend.dst.format,
 				       0, 0, blend.dst.crop_w, blend.dst.crop_h,
-				       blend.dst.alpha, blend.dst.alpha_mode,
+				       blend.dst.alpha, blend.dst.alpha_mode, blend.dst.premul_mode,
 				       out_dma_addr, blend.out.width, blend.out.height,
 				       out_pitch, blend.out.format,
 				       blend.out.crop_w, blend.out.crop_h,
-				       blend.bld_mode);  /* Porter-Duff blend mode */
+				       blend.bld_mode,
+				       0, 0, 0, 0);  /* No chromakey for RCQ blend */
 	
 	
 	/* TODO: Create and return fence_fd if needed */

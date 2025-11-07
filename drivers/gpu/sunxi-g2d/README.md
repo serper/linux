@@ -595,6 +595,38 @@ enum g2d_alpha_mode {
 };
 ```
 
+### Premultiplicación de Alpha
+
+El campo `premul_mode` en `struct g2d_buf` controla cómo se interpreta el canal alpha:
+
+```c
+enum g2d_premul_mode {
+    G2D_PREMUL_NONE = 0,   /* Non-premultiplied (straight alpha) */
+    G2D_PREMUL_ALPHA = 1,  /* Premultiplied alpha (color *= alpha) */
+};
+```
+
+**Non-premultiplied alpha (G2D_PREMUL_NONE)** - Por defecto para ARGB estándar:
+- Los componentes RGB son independientes del alpha
+- Ejemplo: `0x80FF0000` = rojo semi-transparente (A=128, R=255, G=0, B=0)
+- Usado por la mayoría de formatos de imagen (PNG, OpenGL por defecto)
+
+**Premultiplied alpha (G2D_PREMUL_ALPHA)** - Optimizado para composición:
+- Los componentes RGB ya están multiplicados por alpha
+- Ejemplo: `0x80800000` = rojo semi-transparente (A=128, R=128, G=0, B=0)
+- Más eficiente para múltiples operaciones de blending
+- Requerido por algunos formatos (Cairo, Direct2D)
+
+**Diferencia clave**: Para el mismo color semi-transparente:
+- Non-premult: `ARGB(0.5, 1.0, 0.0, 0.0)` → `0x80FF0000`
+- Premult: `ARGB(0.5, 0.5, 0.0, 0.0)` → `0x80800000`
+
+**Cuándo usar cada modo**:
+- `G2D_PREMUL_NONE`: Datos de PNG, JPEG con alpha, buffers de aplicación estándar
+- `G2D_PREMUL_ALPHA`: Renderizado Cairo, formatos de video con premult, pipelines de composición múltiple
+
+**Nota**: El modo debe coincidir con el formato real de los datos. Usar el modo incorrecto producirá colores incorrectos en los bordes semi-transparentes.
+
 ### Modos Porter-Duff
 
 El campo `bld_mode` permite seleccionar el modo de composición:
@@ -631,6 +663,7 @@ struct g2d_blit blit = {
         .crop_h = 200,
         .alpha = 128,                 /* 50% transparencia */
         .alpha_mode = G2D_GLOBAL_ALPHA,
+        .premul_mode = G2D_PREMUL_NONE,  /* Datos estándar ARGB */
     },
     .dst = {
         .width = 800,
@@ -639,6 +672,7 @@ struct g2d_blit blit = {
         .dma_fd = background_fd,
         .alpha = 128,                 /* 50% opacidad del fondo */
         .alpha_mode = G2D_GLOBAL_ALPHA,
+        .premul_mode = G2D_PREMUL_NONE,  /* Datos estándar ARGB */
     },
     .dst_x = 300,
     .dst_y = 200,
@@ -672,6 +706,7 @@ struct g2d_blit blit = {
         .crop_h = 200,
         .alpha = 128,
         .alpha_mode = G2D_GLOBAL_ALPHA,
+        .premul_mode = G2D_PREMUL_NONE,  /* Datos estándar */
     },
     .dst = {
         .width = 800,
@@ -680,6 +715,7 @@ struct g2d_blit blit = {
         .dma_fd = background_fd,      /* Fondo - NO SE MODIFICA */
         .alpha = 128,
         .alpha_mode = G2D_GLOBAL_ALPHA,
+        .premul_mode = G2D_PREMUL_NONE,  /* Datos estándar */
     },
     .dst_x = 300,
     .dst_y = 200,
