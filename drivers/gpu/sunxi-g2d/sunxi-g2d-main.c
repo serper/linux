@@ -2507,10 +2507,11 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	unsigned long timeout;
 	int ret;
 
-	dev_info(g2d->dev, "BLIT_ALPHA_3BUF: src=%ux%u@(%u,%u) alpha=%u/%u premul=%u dst=%ux%u@(%u,%u) alpha=%u/%u premul=%u out=%ux%u blend=%ux%u\n",
-		 src_crop_w, src_crop_h, src_x, src_y, src_alpha, src_alpha_mode, src_premul,
-		 dst_w, dst_h, dst_x, dst_y, dst_alpha, dst_alpha_mode, dst_premul,
-		 out_crop_w, out_crop_h, blend_w, blend_h);
+	if (g2d_debug)
+		dev_info(g2d->dev, "BLIT_ALPHA_3BUF: src=%ux%u@(%u,%u) alpha=%u/%u premul=%u dst=%ux%u@(%u,%u) alpha=%u/%u premul=%u out=%ux%u blend=%ux%u\n",
+			 src_crop_w, src_crop_h, src_x, src_y, src_alpha, src_alpha_mode, src_premul,
+			 dst_w, dst_h, dst_x, dst_y, dst_alpha, dst_alpha_mode, dst_premul,
+			 out_crop_w, out_crop_h, blend_w, blend_h);
 
 	/* Check if scaling is needed (G2D V2 requires TWO operations for scale+blend) */
 	bool needs_scaling = (src_crop_w != blend_w) || (src_crop_h != blend_h);
@@ -2690,8 +2691,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	 */
 	ui2_addr = dst_dma_addr + (dst_y * dst_pitch) + (dst_x * ui2_bpp);
 
-	dev_info(g2d->dev, "UI2 addressing: base=0x%llx offset=(x=%u y=%u) → addr=0x%llx pitch=%u\n",
-		 (u64)dst_dma_addr, dst_x, dst_y, (u64)ui2_addr, dst_pitch);
+	if (g2d_debug)
+		dev_info(g2d->dev, "UI2 addressing: base=0x%llx offset=(x=%u y=%u) → addr=0x%llx pitch=%u\n",
+			 (u64)dst_dma_addr, dst_x, dst_y, (u64)ui2_addr, dst_pitch);
 
 	/* Configure UI2 attributes - background with user alpha settings */
 	ui2.ovl_attr.bits.lay_en = 1;
@@ -2699,8 +2701,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	ui2.ovl_attr.bits.lay_fbfmt = dst_fmt_val;
 	ui2.ovl_attr.bits.lay_glbalpha = dst_alpha;  /* User's dst alpha value */
 	
-	dev_info(g2d->dev, "UI2 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
-		 dst_alpha_mode, dst_alpha);
+	if (g2d_debug)
+		dev_info(g2d->dev, "UI2 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
+			 dst_alpha_mode, dst_alpha);
 
 	/* UI2 memory configuration - read the blend region from dst buffer
 	 * The address (ui2_addr = dst_dma_addr) already points to (dst_x, dst_y),
@@ -2725,8 +2728,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, UI2_HADD, ui2.ovl_mem_high_addr);
 	g2d_write(g2d, UI2_SIZE, ui2.ovl_winsize.dwval);
 
-	dev_info(g2d->dev, "UI2 (Pipe0/BG): addr=0x%llx size=%ux%u pitch=%u win=%ux%u alpha=%u mode=%u\n",
-		 (u64)ui2_addr, blend_w, blend_h, dst_pitch, blend_w, blend_h, dst_alpha, dst_alpha_mode);
+	if (g2d_debug)
+		dev_info(g2d->dev, "UI2 (Pipe0/BG): addr=0x%llx size=%ux%u pitch=%u win=%ux%u alpha=%u mode=%u\n",
+			 (u64)ui2_addr, blend_w, blend_h, dst_pitch, blend_w, blend_h, dst_alpha, dst_alpha_mode);
 
 	/* === Configure V0 (Pipe1: foreground/ball with alpha) === */
 
@@ -2749,8 +2753,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	/* V0 address = ball buffer base + offset */
 	v0_addr = src_dma_addr + (src_y * src_pitch) + (src_x * v0_bpp);
 	
-	dev_info(g2d->dev, "ALPHA_BLEND V0 ADDR: base=0x%llx crop_xy=(%u,%u) pitch=%u bpp=%u -> v0_addr=0x%llx\n",
-		 (u64)src_dma_addr, src_x, src_y, src_pitch, v0_bpp, (u64)v0_addr);
+	if (g2d_debug)
+		dev_info(g2d->dev, "ALPHA_BLEND V0 ADDR: base=0x%llx crop_xy=(%u,%u) pitch=%u bpp=%u -> v0_addr=0x%llx\n",
+			 (u64)src_dma_addr, src_x, src_y, src_pitch, v0_bpp, (u64)v0_addr);
 
 	/* Configure V0 attributes - foreground with user alpha */
 	v0.ovl_attr.bits.lay_en = 1;
@@ -2758,8 +2763,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	v0.ovl_attr.bits.lay_fbfmt = src_fmt_val;
 	v0.ovl_attr.bits.lay_glbalpha = src_alpha;  /* User's alpha value */
 	
-	dev_info(g2d->dev, "V0 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
-		 src_alpha_mode, src_alpha);
+	if (g2d_debug)
+		dev_info(g2d->dev, "V0 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
+			 src_alpha_mode, src_alpha);
 
 	/* V0 memory configuration */
 	v0.ovl_mem.bits.lay_width = src_crop_w - 1;
@@ -2772,11 +2778,12 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	v0.ovl_winsize.bits.width = src_crop_w - 1;
 	v0.ovl_winsize.bits.height = src_crop_h - 1;
 
-	dev_info(g2d->dev, "ALPHA_BLEND V0 PITCH WRITE: v0.ovl_mem_pitch0=%u src_pitch=%u\n",
-		 v0.ovl_mem_pitch0, src_pitch);
-	dev_info(g2d->dev, "ALPHA_BLEND V0 REGS: MBSIZE=0x%08X (lay_w=%u lay_h=%u) SIZE=0x%08X (win_w=%u win_h=%u)\n",
-		 v0.ovl_mem.dwval, v0.ovl_mem.bits.lay_width, v0.ovl_mem.bits.lay_height,
-		 v0.ovl_winsize.dwval, v0.ovl_winsize.bits.width, v0.ovl_winsize.bits.height);
+	if (g2d_debug) {
+		dev_info(g2d->dev, "ALPHA_BLEND V0 PITCH: %u\n", v0.ovl_mem_pitch0);
+		dev_info(g2d->dev, "ALPHA_BLEND V0 REGS: MBSIZE=%ux%u SIZE=%ux%u\n",
+			 v0.ovl_mem.bits.lay_width + 1, v0.ovl_mem.bits.lay_height + 1,
+			 v0.ovl_winsize.bits.width + 1, v0.ovl_winsize.bits.height + 1);
+	}
 
 	/* Write V0 to hardware */
 	g2d_write(g2d, V0_ATTCTL, v0.ovl_attr.dwval);
@@ -2787,8 +2794,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, V0_HADD, v0.ovl_mem_high_addr.dwval);
 	g2d_write(g2d, V0_SIZE, v0.ovl_winsize.dwval);
 
-	dev_info(g2d->dev, "V0 (Pipe1/FOREGROUND): attr=0x%08X addr=0x%llx size=%ux%u alpha=%u mode=%u\n",
-		 v0.ovl_attr.dwval, (u64)v0_addr, src_crop_w, src_crop_h, src_alpha, src_alpha_mode);
+	if (g2d_debug)
+		dev_info(g2d->dev, "V0 (Pipe1/FOREGROUND): attr=0x%08X addr=0x%llx size=%ux%u alpha=%u mode=%u\n",
+			 v0.ovl_attr.dwval, (u64)v0_addr, src_crop_w, src_crop_h, src_alpha, src_alpha_mode);
 
 	/* === Configure BLD (Blender) - Two pipe alpha blending === */
 
@@ -2882,16 +2890,18 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		/* CSC0: pipe0 (UI2/destination) YUV→RGB conversion */
 		sunxi_g2d_configure_csc(g2d, 0, dst_color_space);
 		g2d_write(g2d, BLD_CSC_CTL, g2d_read(g2d, BLD_CSC_CTL) | BIT(0));  /* Enable CSC0 */
-		dev_info(g2d->dev, "CSC0 enabled for dst (pipe0/UI2) format=0x%02X %s\n",
-			 dst_format, dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+		if (g2d_debug)
+			dev_info(g2d->dev, "CSC0 enabled for dst (pipe0/UI2) format=0x%02X %s\n",
+				 dst_format, dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
 	}
 	
 	if (sunxi_g2d_is_yuv_format(src_format)) {
 		/* CSC1: pipe1 (V0/source) YUV→RGB conversion */
 		sunxi_g2d_configure_csc(g2d, 1, src_color_space);
 		g2d_write(g2d, BLD_CSC_CTL, g2d_read(g2d, BLD_CSC_CTL) | BIT(1));  /* Enable CSC1 */
-		dev_info(g2d->dev, "CSC1 enabled for src (pipe1/V0) format=0x%02X %s\n",
-			 src_format, src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+		if (g2d_debug)
+			dev_info(g2d->dev, "CSC1 enabled for src (pipe1/V0) format=0x%02X %s\n",
+				 src_format, src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
 	}
 
 	/* Write BLD configuration */
@@ -2907,8 +2917,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, ROP_INDEX0, bld.ch3_index0.dwval);
 	g2d_write(g2d, BLD_OUT_COLOR, bld.out_color.dwval);
 
-	dev_info(g2d->dev, "BLD: en=0x%08X ctl=0x%08X (UI2+alpha V0 blending)\n",
-		 bld.bld_en_ctrl.dwval, bld.bld_ctrl.dwval);
+	if (g2d_debug)
+		dev_info(g2d->dev, "BLD: en=0x%08X ctl=0x%08X (UI2+alpha V0 blending)\n",
+			 bld.bld_en_ctrl.dwval, bld.bld_ctrl.dwval);
 
 	/* === Configure Writeback - Write result to OUTPUT buffer (separate from inputs) === */
 
@@ -2938,13 +2949,15 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	if (out_dma_addr == dst_base_addr) {
 		/* In-place operation: apply position offset */
 		wb_addr = out_dma_addr + (dst_y * out_pitch) + (dst_x * wb_bpp);
-		dev_info(g2d->dev, "WB (IN-PLACE): base=0x%llx offset=(x=%u y=%u) → addr=0x%llx\n",
-			 (u64)out_dma_addr, dst_x, dst_y, (u64)wb_addr);
+		if (g2d_debug)
+			dev_info(g2d->dev, "WB (IN-PLACE): base=0x%llx offset=(x=%u y=%u) → addr=0x%llx\n",
+				 (u64)out_dma_addr, dst_x, dst_y, (u64)wb_addr);
 	} else {
 		/* Separate output buffer: write at (0, 0) */
 		wb_addr = out_dma_addr;
-		dev_info(g2d->dev, "WB (SEPARATE): base=0x%llx (writing at 0,0 of output buffer)\n",
-			 (u64)out_dma_addr);
+		if (g2d_debug)
+			dev_info(g2d->dev, "WB (SEPARATE): base=0x%llx (writing at 0,0 of output buffer)\n",
+				 (u64)out_dma_addr);
 	}
 
 	/* Configure writeback */
@@ -3004,8 +3017,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	
 	/* Free temporary scaling buffer if it was allocated */
 	if (g2d->temp_scale_buffer) {
-		dev_info(g2d->dev, "Freeing temp scale buffer: vaddr=%p dma=0x%llx size=%zu\n",
-			 g2d->temp_scale_buffer, (u64)g2d->temp_scale_dma, g2d->temp_scale_size);
+		if (g2d_debug)
+			dev_info(g2d->dev, "Freeing temp scale buffer: vaddr=%p dma=0x%llx size=%zu\n",
+				 g2d->temp_scale_buffer, (u64)g2d->temp_scale_dma, g2d->temp_scale_size);
 		dma_free_coherent(g2d->dev, g2d->temp_scale_size,
 				  g2d->temp_scale_buffer, g2d->temp_scale_dma);
 		g2d->temp_scale_buffer = NULL;
@@ -3215,13 +3229,14 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
 	 */
 	/* Removed HDS/VDS writes */
 	
-	/* Write V0 registers using struct */
-	dev_info(g2d->dev, "📐 VSU INPUT: src_crop=%ux%u, dst_out=%ux%u\n",
-		 src_crop_w, src_crop_h, dst_out_w, dst_out_h);
-	dev_info(g2d->dev, "📐 V0 CONFIG: mem=%ux%u, win=%ux%u, pitch=%u\n",
-		 src_crop_w - 1, src_crop_h - 1, dst_out_w - 1, dst_out_h - 1, src_pitch);
+	if (g2d_debug) {
+		dev_info(g2d->dev, "📐 VSU INPUT: src_crop=%ux%u, dst_out=%ux%u\n",
+			 src_crop_w, src_crop_h, dst_out_w, dst_out_h);
+		dev_info(g2d->dev, "📐 V0 CONFIG: mem=%ux%u, win=%ux%u, pitch=%u\n",
+			 src_crop_w - 1, src_crop_h - 1, dst_out_w - 1, dst_out_h - 1, src_pitch);
+	}
 	
-	g2d_write(g2d, V0_ATTCTL, v0.ovl_attr.dwval);
+	/* Write V0 registers using struct */
 	g2d_write(g2d, V0_MBSIZE, v0.ovl_mem.dwval);
 	g2d_write(g2d, V0_COOR, v0.ovl_mem_coor.dwval);
 	g2d_write(g2d, V0_PITCH0, v0.ovl_mem_pitch0);
@@ -3466,8 +3481,9 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, V0_LADD0, lower_32_bits(src_offset_dma));
 	g2d_write(g2d, V0_HADD, upper_32_bits(src_offset_dma));
 	
-	dev_info(g2d->dev, "BLIT V0 CONFIG: MBSIZE=%ux%u SIZE=%ux%u PITCH=%u addr=0x%llx\n",
-		 src_crop_w, src_crop_h, src_crop_w, src_crop_h, src_pitch, (u64)src_offset_dma);
+	if (g2d_debug)
+		dev_info(g2d->dev, "BLIT V0 CONFIG: MBSIZE=%ux%u SIZE=%ux%u PITCH=%u addr=0x%llx\n",
+			 src_crop_w, src_crop_h, src_crop_w, src_crop_h, src_pitch, (u64)src_offset_dma);
 	
 	/* V0 fillcolor not used in image mode */
 	g2d_write(g2d, V0_FILLC, 0x00000000);
@@ -3479,16 +3495,18 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	if (sunxi_g2d_is_yuv_format(dst_format)) {
 		sunxi_g2d_configure_csc(g2d, 0, dst_color_space);
 		csc_ctl |= BIT(0);  /* Enable CSC0 for pipe0/UI2 */
-		dev_info(g2d->dev, "CSC0 enabled for YUV dst (color_space=%s)\n",
-			 dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+		if (g2d_debug)
+			dev_info(g2d->dev, "CSC0 enabled for YUV dst (color_space=%s)\n",
+				 dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
 	}
 	
 	/* Configure CSC for source if it's YUV */
 	if (sunxi_g2d_is_yuv_format(src_format)) {
 		sunxi_g2d_configure_csc(g2d, 1, src_color_space);
 		csc_ctl |= BIT(1);  /* Enable CSC1 for pipe1/V0 */
-		dev_info(g2d->dev, "CSC1 enabled for YUV src (color_space=%s)\n",
-			 src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+		if (g2d_debug)
+			dev_info(g2d->dev, "CSC1 enabled for YUV src (color_space=%s)\n",
+				 src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
 	}
 	
 	if (csc_ctl)
@@ -3538,8 +3556,9 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, WB_HADD0, upper_32_bits(dst_offset_dma));
 	g2d_write(g2d, WB_PITCH0, dst_pitch);
 	
-	dev_info(g2d->dev, "BLIT WB CONFIG: size=%ux%u pitch=%u dst_xy=(%u,%u) addr=0x%llx (offset from base=0x%llx)\n",
-		 dst_w, dst_h, dst_pitch, dst_x, dst_y, (u64)dst_offset_dma, (u64)(dst_offset_dma - dst_dma));
+	if (g2d_debug)
+		dev_info(g2d->dev, "BLIT WB CONFIG: size=%ux%u pitch=%u dst_xy=(%u,%u) addr=0x%llx (offset from base=0x%llx)\n",
+			 dst_w, dst_h, dst_pitch, dst_x, dst_y, (u64)dst_offset_dma, (u64)(dst_offset_dma - dst_dma));
 	
 	/* WB size = destination blit size */
 	g2d_write(g2d, WB_SIZE, ((dst_h - 1) << 16) | (dst_w - 1));
@@ -3643,9 +3662,10 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 		out_h = src_crop_h;
 	}
 	
-	dev_info(g2d->dev, "BLIT_ROT: src=%ux%u crop=%u,%u,%ux%u -> dst=%ux%u@(%u,%u) flags=0x%x\n",
-		 src_width, src_height, src_x, src_y, src_crop_w, src_crop_h,
-		 dst_width, dst_height, dst_x, dst_y, flags);
+	if (g2d_debug)
+		dev_info(g2d->dev, "BLIT_ROT: src=%ux%u crop=%u,%u,%ux%u -> dst=%ux%u@(%u,%u) flags=0x%x\n",
+			 src_width, src_height, src_x, src_y, src_crop_w, src_crop_h,
+			 dst_width, dst_height, dst_x, dst_y, flags);
 	
 	/* Reset ROT block */
 	g2d_write(g2d, ROT_CTL, 0x0);
@@ -3902,12 +3922,13 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		return -EINVAL;
 	}
 	
-	dev_info(g2d->dev, "BLIT: src=%ux%u fmt=%u (alpha=%u mode=%u) -> dst=%u,%u,%ux%u fmt=%u (alpha=%u mode=%u) flags=0x%x\n",
-		 blit.src.width, blit.src.height, blit.src.format,
-		 blit.src.alpha, blit.src.alpha_mode,
-		 blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h, blit.dst.format,
-		 blit.dst.alpha, blit.dst.alpha_mode,
-		 blit.flags);
+	if (g2d_debug)
+		dev_info(g2d->dev, "BLIT: src=%ux%u fmt=%u (alpha=%u mode=%u) -> dst=%u,%u,%ux%u fmt=%u (alpha=%u mode=%u) flags=0x%x\n",
+			 blit.src.width, blit.src.height, blit.src.format,
+			 blit.src.alpha, blit.src.alpha_mode,
+			 blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h, blit.dst.format,
+			 blit.dst.alpha, blit.dst.alpha_mode,
+			 blit.flags);
 	
 	/* Import source DMA-BUF */
 	src_dmabuf = dma_buf_get(blit.src.dma_fd);
@@ -3939,18 +3960,21 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 
 	/* If userspace provided an input fence fd, wait on it first */
 	if (blit.fence_fd_in >= 0) {
-		dev_info(g2d->dev, "blit: importing input fence fd=%d pid=%d\n",
-			 blit.fence_fd_in, task_tgid_nr(current));
+		if (g2d_debug)
+			dev_info(g2d->dev, "blit: importing input fence fd=%d pid=%d\n",
+				 blit.fence_fd_in, task_tgid_nr(current));
 		struct dma_fence *in_fence = sync_file_get_fence(blit.fence_fd_in);
 		if (!in_fence) {
 			ret = -EINVAL;
 			goto err_unmap_src;
 		}
-		dev_info(g2d->dev, "blit: got in_fence=%p signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+		if (g2d_debug)
+			dev_info(g2d->dev, "blit: got in_fence=%p signaled=%d\n",
+				 in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_wait(in_fence, false);
-		dev_info(g2d->dev, "blit: in_fence=%p wait done signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+		if (g2d_debug)
+			dev_info(g2d->dev, "blit: in_fence=%p wait done signaled=%d\n",
+				 in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_put(in_fence);
 	}
 	
@@ -4328,13 +4352,15 @@ done_blit:
 		if (job->sync_file && job->sync_file->file) {
 			struct file *tmpf = job->sync_file->file;
 			/* get seqno from fence for correlation */
-			if (job->fence) {
-				struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-				dev_info(g2d->dev, "blit: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
-						 out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
-			} else {
-				dev_info(g2d->dev, "blit: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
-						 out_fd, tmpf, job, task_tgid_nr(current));
+			if (g2d_debug) {
+				if (job->fence) {
+					struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
+					dev_info(g2d->dev, "blit: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
+							 out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
+				} else {
+					dev_info(g2d->dev, "blit: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
+							 out_fd, tmpf, job, task_tgid_nr(current));
+				}
 			}
 			fd_install(out_fd, tmpf);
 			/* After fd_install the fd table owns the file ref */
