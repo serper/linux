@@ -2227,6 +2227,42 @@ static int sunxi_g2d_do_blit_alpha_rcq(struct sunxi_g2d_dev *g2d,
 #endif /* Deprecated sunxi_g2d_do_blit_alpha_rcq */
 
 /*
+ * Get BLD_CTL value for Porter-Duff blending mode
+ * Based on BSP driver implementation
+ */
+static u32 sunxi_g2d_get_bld_mode(u32 mode)
+{
+	switch (mode) {
+	case 0:  /* G2D_BLD_CLEAR */
+		return 0x00000000;
+	case 1:  /* G2D_BLD_COPY */
+		return 0x00010001;
+	case 2:  /* G2D_BLD_DST */
+		return 0x01000100;
+	case 3:  /* G2D_BLD_SRCOVER */
+		return 0x03010301;
+	case 4:  /* G2D_BLD_DSTOVER */
+		return 0x01030103;
+	case 5:  /* G2D_BLD_SRCIN */
+		return 0x00020002;
+	case 6:  /* G2D_BLD_DSTIN */
+		return 0x02000200;
+	case 7:  /* G2D_BLD_SRCOUT */
+		return 0x00030003;
+	case 8:  /* G2D_BLD_DSTOUT */
+		return 0x03000300;
+	case 9:  /* G2D_BLD_SRCATOP */
+		return 0x03020302;
+	case 10: /* G2D_BLD_DSTATOP */
+		return 0x02030203;
+	case 11: /* G2D_BLD_XOR */
+		return 0x03030303;
+	default:
+		return 0x03010301;  /* Default to SRCOVER */
+	}
+}
+
+/*
  * sunxi_g2d_do_blit_alpha_3buf - Alpha blending with 3 separate buffers
  *
  * v2.9.16: 3-buffer alpha blending to avoid read/write conflicts
@@ -2246,7 +2282,8 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 				    u8 dst_alpha, u8 dst_alpha_mode,
 				    dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
 				    u32 out_pitch, u32 out_format,
-				    u32 out_crop_w, u32 out_crop_h)
+				    u32 out_crop_w, u32 out_crop_h,
+				    u32 bld_mode)
 {
 	/* v2.9.16: 3-buffer alpha blending - UI2 (dst READ) + V0 (src READ) → WB (out WRITE) */
 	struct g2d_mixer_ovl_u_reg ui2 = {0};  /* Pipe0: background (dst) - READ ONLY */
@@ -2592,14 +2629,18 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	bld.bld_en_ctrl.bits.p1_en = 1;    /* Enable pipe1 (V0/foreground) */
 	bld.bld_en_ctrl.bits.p1_fcen = 0;  /* Use V0 layer */
 
-	/* Configure premultiplication for alpha blending */
+	/* Configure premultiplication for alpha blending
+	 * IMPORTANT: Set to 0 (non-premultiplied) for standard ARGB data.
+	 * Our input pixels have non-premultiplied alpha (e.g., 0x80FF0000).
+	 * If set to 1, hardware expects premultiplied data (e.g., 0x80800000).
+	 */
 	bld.premulti_ctrl.bits.p0_alpha_mode = 1;  /* Pipe0 (UI2/background) alpha mode */
 	bld.premulti_ctrl.bits.p1_alpha_mode = 1;  /* Pipe1 (V0/foreground) alpha mode */
 
-	/* Pipe input sizes */
-	bld.mem_size[0].bits.width = blend_w - 1;
+	/* Pipe input sizes - MUST match actual layer sizes for correct alpha blending */
+	bld.mem_size[0].bits.width = blend_w - 1;     /* UI2: blend region size */
 	bld.mem_size[0].bits.height = blend_h - 1;
-	bld.mem_size[1].bits.width = blend_w - 1;
+	bld.mem_size[1].bits.width = blend_w - 1;     /* V0: blend region size (NOT src_crop!) */
 	bld.mem_size[1].bits.height = blend_h - 1;
 
 	/* Pipe positions - both at (0,0) for overlay */
@@ -2612,15 +2653,15 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	bld.out_size.bits.width = blend_w - 1;
 	bld.out_size.bits.height = blend_h - 1;
 
-	/* BLD control - SRCOVER mode for proper alpha blending
-	 * SRCOVER: out_color = src_color + dst_color * (1 - src_alpha)
+	/* BLD control - Porter-Duff blending mode
+	 * Default SRCOVER: out_color = src_color + dst_color * (1 - src_alpha)
 	 * This creates proper transparency effect - foreground over background
 	 * 
 	 * BLD_CTL format: [31:24]=pipe3 [23:16]=pipe2 [15:8]=pipe1 [7:0]=pipe0
-	 * BSP driver uses 0x03010301 for SRCOVER:
+	 * SRCOVER uses 0x03010301:
 	 *   pipe3=0x03, pipe2=0x01, pipe1=0x03 (V0/foreground), pipe0=0x01 (UI2/background)
 	 */
-	bld.bld_ctrl.dwval = 0x03010301;  /* SRCOVER mode matching BSP driver */
+	bld.bld_ctrl.dwval = sunxi_g2d_get_bld_mode(bld_mode);
 
 	/* Output in RGB mode (framebuffer is XRGB8888) */
 	bld.out_color.dwval = 0;  /* Clear all first */
@@ -2665,13 +2706,24 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		break;
 	}
 
-	/* WB address = output buffer + offset for position (dst_x, dst_y)
-	 * IMPORTANT: Apply dst_x/dst_y offset to write at correct position
+	/* WB address calculation:
+	 * - If out_dma == dst_dma (in-place): Apply position offset (dst_x, dst_y)
+	 * - If out_dma != dst_dma (separate out buffer): Write at (0, 0) of out buffer
+	 * 
+	 * CRITICAL: When using temp buffer (e.g., demo-bouncing-ball with 110x110 temp),
+	 * dst_x/dst_y are framebuffer positions (345, 185) which would overflow temp buffer!
 	 */
-	wb_addr = out_dma_addr + (dst_y * out_pitch) + (dst_x * wb_bpp);
-
-	dev_info(g2d->dev, "WB addressing: base=0x%llx offset=(x=%u y=%u) → addr=0x%llx pitch=%u\n",
-		 (u64)out_dma_addr, dst_x, dst_y, (u64)wb_addr, out_pitch);
+	if (out_dma_addr == dst_base_addr) {
+		/* In-place operation: apply position offset */
+		wb_addr = out_dma_addr + (dst_y * out_pitch) + (dst_x * wb_bpp);
+		dev_info(g2d->dev, "WB (IN-PLACE): base=0x%llx offset=(x=%u y=%u) → addr=0x%llx\n",
+			 (u64)out_dma_addr, dst_x, dst_y, (u64)wb_addr);
+	} else {
+		/* Separate output buffer: write at (0, 0) */
+		wb_addr = out_dma_addr;
+		dev_info(g2d->dev, "WB (SEPARATE): base=0x%llx (writing at 0,0 of output buffer)\n",
+			 (u64)out_dma_addr);
+	}
 
 	/* Configure writeback */
 	wb.wb_attr.dwval = 0;  /* Clear all bits first */
@@ -3511,7 +3563,10 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 				     u32 dst_pitch, u32 dst_format,
 				     u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
 				     u8 dst_alpha, u8 dst_alpha_mode,
+				     dma_addr_t out_dma_addr,  /* Explicit output buffer (may == dst_dma_addr) */
+				     u32 out_w, u32 out_h, u32 out_pitch, u32 out_format,  /* Output dimensions */
 				     u32 flags,
+				     u32 bld_mode,  /* Porter-Duff blend mode */
 				     bool needs_alpha, bool needs_rotation, bool needs_scaling)
 {
 	/* For now, delegate to existing implementations based on operation type
@@ -3524,13 +3579,13 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 					     src_dma_addr, src_w, src_h,
 					     src_pitch, src_format,
 					     src_x, src_y, src_crop_w, src_crop_h,
-					     dst_dma_addr, dst_w, dst_h,
-					     dst_pitch, dst_format,
+					     out_dma_addr, out_w, out_h,  /* Write to out */
+					     out_pitch, out_format,
 					     dst_x, dst_y, blend_w, blend_h,
 					     flags);
 	} else if (needs_alpha) {
 		/* Alpha blending path - can include scaling */
-		/* For now we use the 3-buffer approach if available, or the working RCQ approach */
+		/* For 3-buffer approach: use explicit out dimensions */
 		return sunxi_g2d_do_blit_alpha_3buf(g2d,
 						    src_dma_addr, src_w, src_h,
 						    src_pitch, src_format,
@@ -3541,18 +3596,19 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 						    dst_pitch, dst_format,
 						    dst_x, dst_y, blend_w, blend_h,
 						    dst_alpha, dst_alpha_mode,
-						    dst_dma_addr, /* out same as dst for in-place */
-						    dst_w, dst_h,
-						    dst_pitch, dst_format,
-						    blend_w, blend_h);
+						    out_dma_addr, /* Write to out (may == dst for in-place) */
+						    out_w, out_h,
+						    out_pitch, out_format,
+						    blend_w, blend_h,  /* out_crop = blend size */
+						    bld_mode);         /* Porter-Duff blend mode */
 	} else {
 		/* Simple copy/scale path - use MIXER with optional VSU */
 		return sunxi_g2d_do_blit(g2d,
 					 src_dma_addr, src_w, src_h,
 					 src_pitch, src_format,
 					 src_x, src_y, src_crop_w, src_crop_h,
-					 dst_dma_addr, dst_w, dst_h,
-					 dst_pitch, dst_format,
+					 out_dma_addr, out_w, out_h,  /* Write to out */
+					 out_pitch, out_format,
 					 dst_x, dst_y, blend_w, blend_h);
 	}
 }
@@ -3560,10 +3616,10 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 {
 	struct g2d_blit blit;
-	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL;
-	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL;
-	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
-	dma_addr_t src_dma_addr, dst_dma_addr;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
 	u32 src_bpp, dst_bpp;
 	u32 src_pitch, dst_pitch;
 	u32 src_crop_w, src_crop_h;
@@ -3733,6 +3789,42 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_unmap_dst;
 	}
 	
+	/* Import output buffer if provided (for 3-buffer operations) */
+	if (blit.out.dma_fd >= 0) {
+		out_dmabuf = dma_buf_get(blit.out.dma_fd);
+		if (IS_ERR(out_dmabuf)) {
+			ret = PTR_ERR(out_dmabuf);
+			dev_err(g2d->dev, "Failed to get output dma_buf: %d\n", ret);
+			goto err_unmap_dst;
+		}
+		
+		out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
+		if (IS_ERR(out_attach)) {
+			ret = PTR_ERR(out_attach);
+			dev_err(g2d->dev, "Failed to attach output dma_buf: %d\n", ret);
+			goto err_put_out_dmabuf;
+		}
+		
+		out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
+		if (IS_ERR(out_sgt)) {
+			ret = PTR_ERR(out_sgt);
+			dev_err(g2d->dev, "Failed to map output dma_buf: %d\n", ret);
+			goto err_detach_out;
+		}
+		
+		out_dma_addr = sg_dma_address(out_sgt->sgl);
+		if (!out_dma_addr) {
+			/* Fallback to physical address if DMA address not set */
+			out_dma_addr = sg_phys(out_sgt->sgl);
+		}
+		
+		dev_info(g2d->dev, "3-buffer operation: out buffer imported (fd=%d addr=0x%llx)\n",
+			 blit.out.dma_fd, (u64)out_dma_addr);
+	} else {
+		/* No explicit out buffer - write to dst (in-place operation) */
+		out_dma_addr = dst_dma_addr;
+	}
+	
 	/* Determine operation requirements:
 	 * - Alpha blending: Auto-detected from:
 	 *   1. Presence of out buffer (3-buffer operation = blending)
@@ -3785,7 +3877,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		if (needs_alpha) {
 			dev_warn(g2d->dev, "Scale+rotate+alpha not yet supported (would need 3-pass)\n");
 			ret = -ENOSYS;
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 		
 		dev_info(g2d->dev, "Rotation + scaling requested: will do 2-pass (scale then rotate)\n");
@@ -3812,7 +3904,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		if (!temp_vaddr) {
 			dev_err(g2d->dev, "Failed to allocate temp buffer for scale+rotate: size=%zu\n", temp_size);
 			ret = -ENOMEM;
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 		
 		dev_info(g2d->dev, "Allocated temp buffer: vaddr=%p dma=0x%llx size=%zu\n",
@@ -3834,20 +3926,20 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		if (ret < 0) {
 			dev_err(g2d->dev, "STEP 1 (scale) failed: %d\n", ret);
 			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 		
 		dev_info(g2d->dev, "✅ Step 1 complete: scaled to temp buffer\n");
 		
-		/* STEP 2: Rotate temp → dst (no scaling) */
-		dev_info(g2d->dev, "STEP 2: ROTATE %ux%u -> dst at (%u,%u)\n",
+		/* STEP 2: Rotate temp → out (no scaling) */
+		dev_info(g2d->dev, "STEP 2: ROTATE %ux%u -> out at (%u,%u)\n",
 			 temp_w, temp_h, blit.dst_x, blit.dst_y);
 		
 		ret = sunxi_g2d_do_blit_rot(g2d,
 					    temp_dma_addr, temp_w, temp_h,
 					    temp_pitch, blit.dst.format,
 					    0, 0, temp_w, temp_h,  /* Full temp buffer as source */
-					    dst_dma_addr, blit.dst.width, blit.dst.height,
+					    out_dma_addr, blit.dst.width, blit.dst.height,  /* Write to out */
 					    dst_pitch, blit.dst.format,
 					    blit.dst_x, blit.dst_y, temp_w, temp_h,
 					    blit.flags);  /* Apply rotation flags */
@@ -3859,7 +3951,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		
 		if (ret < 0) {
 			dev_err(g2d->dev, "STEP 2 (rotate) failed: %d\n", ret);
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 		
 		dev_info(g2d->dev, "✅ 2-pass scale+rotate completed successfully\n");
@@ -3896,6 +3988,21 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	}
 	
 	/* Call unified blit function that handles all combinations */
+	u32 out_w, out_h, out_pitch, out_format;
+	if (has_out_buffer) {
+		/* Explicit output buffer - use its dimensions */
+		out_w = blit.out.width;
+		out_h = blit.out.height;
+		out_pitch = blit.out.stride[0] ? blit.out.stride[0] : (blit.out.width * dst_bpp);
+		out_format = blit.out.format;
+	} else {
+		/* In-place operation - output uses dst dimensions */
+		out_w = blit.dst.width;
+		out_h = blit.dst.height;
+		out_pitch = dst_pitch;
+		out_format = blit.dst.format;
+	}
+	
 	ret = sunxi_g2d_do_blit_unified(g2d,
 					src_dma_addr, blit.src.width, blit.src.height,
 					src_pitch, blit.src.format,
@@ -3905,11 +4012,14 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 					dst_pitch, blit.dst.format,
 					blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h,
 					blit.dst.alpha, blit.dst.alpha_mode,
+					out_dma_addr,  /* Explicit output buffer (or dst if none) */
+					out_w, out_h, out_pitch, out_format,  /* Output dimensions */
 					blit.flags,
+					blit.bld_mode,  /* Porter-Duff blend mode */
 					needs_alpha, needs_rotation, needs_scaling);
 	
 	if (ret < 0)
-		goto err_unmap_dst;
+		goto err_unmap_out;
 
 done_blit:
 	/* Create job + fence and return fence_fd_out to userspace. */
@@ -3920,14 +4030,14 @@ done_blit:
 		job = kzalloc(sizeof(*job), GFP_KERNEL);
 		if (!job) {
 			ret = -ENOMEM;
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 
 		job->fence = sunxi_g2d_fence_create(g2d);
 		if (!job->fence) {
 			kfree(job);
 			ret = -ENOMEM;
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 
 		out_fd = get_unused_fd_flags(O_CLOEXEC);
@@ -3935,7 +4045,7 @@ done_blit:
 			dma_fence_put(job->fence);
 			kfree(job);
 			ret = out_fd;
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 
 		job->fence_fd = out_fd;
@@ -3945,7 +4055,7 @@ done_blit:
 			dma_fence_put(job->fence);
 			kfree(job);
 			ret = -ENOMEM;
-			goto err_unmap_dst;
+			goto err_unmap_out;
 		}
 
 		/* Trace sync_file creation and fd reservation */
@@ -3985,9 +4095,18 @@ done_blit:
 	
 	if (copy_to_user((void __user *)arg, &blit, sizeof(blit))) {
 		ret = -EFAULT;
-		goto err_unmap_dst;
+		goto err_unmap_out;
 	}
-	
+
+err_unmap_out:
+	if (out_sgt)
+		dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
+err_detach_out:
+	if (out_attach)
+		dma_buf_detach(out_dmabuf, out_attach);
+err_put_out_dmabuf:
+	if (out_dmabuf)
+		dma_buf_put(out_dmabuf);
 err_unmap_dst:
 	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
 err_detach_dst:
@@ -4515,7 +4634,8 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 				       blend.dst.alpha, blend.dst.alpha_mode,
 				       out_dma_addr, blend.out.width, blend.out.height,
 				       out_pitch, blend.out.format,
-				       blend.out.crop_w, blend.out.crop_h);
+				       blend.out.crop_w, blend.out.crop_h,
+				       blend.bld_mode);  /* Porter-Duff blend mode */
 	
 	
 	/* TODO: Create and return fence_fd if needed */

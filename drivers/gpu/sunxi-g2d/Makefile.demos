@@ -9,14 +9,14 @@ KERNEL_HEADERS = $(KERNEL_DIR)/include/uapi
 # Use Alpine rootfs sysroot
 ALPINE_ROOTFS = /home/sergio/source/t113/rootfs-alpine
 # Use --sysroot to avoid mixing headers from different sources
-CFLAGS = -Wall -O2 --sysroot=$(ALPINE_ROOTFS) -I$(KERNEL_HEADERS) -I$(ALPINE_ROOTFS)/usr/include/libdrm
+CFLAGS = -Wall -O2 --sysroot=$(ALPINE_ROOTFS) -I. -I$(KERNEL_HEADERS) -I$(ALPINE_ROOTFS)/usr/include/libdrm
 LDFLAGS = --sysroot=$(ALPINE_ROOTFS) -ldrm -lm
 
 # Source files
 DRM_BASE = demo-drm-base.c
 
 # Demo programs
-DEMOS = demo-bouncing-ball demo-rotate-test demo-scale-rotate
+DEMOS = demo-bouncing-ball demo-rotate-test demo-scale-rotate demo-3buffer-test demo-porter-duff
 
 # Build directory (optional, for cross-compilation output)
 BUILD_DIR = .
@@ -40,6 +40,16 @@ demo-scale-rotate: demo-scale-rotate.c $(DRM_BASE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built: $@"
 
+# 3-buffer explicit output test
+demo-3buffer-test: demo-3buffer-test.c $(DRM_BASE)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@"
+
+# Porter-Duff modes test
+demo-porter-duff: demo-porter-duff.c $(DRM_BASE)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@"
+
 clean:
 	rm -f $(DEMOS)
 	@echo "Cleaned demo binaries"
@@ -58,5 +68,6 @@ help:
 	@echo "  demo-bouncing-ball    - Bouncing ball with alpha blending"
 	@echo "  demo-rotate-test      - Rotation test (0°, 90°, 180°, 270°)"
 	@echo "  demo-scale-rotate     - Scale + Rotate 2-pass test"
+	@echo "  demo-3buffer-test     - Explicit output buffer (3-buffer) test"
 	@echo ""
 	@echo "Note: Compiled for Alpine Linux (musl) on T113-S3"

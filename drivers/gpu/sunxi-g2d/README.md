@@ -8,15 +8,17 @@ El driver `sunxi-g2d` proporciona acceso hardware al acelerador gráfico 2D de A
 - **Copia de imágenes** (blit) - Copia 1:1 y con crop ✅
 - **Escalado de imágenes** - Escalado con VSU (Video Scaler Unit) ✅
 - **Rotación y transformaciones** - Rotación 90°/180°/270° y flip H/V ✅
-- **Alpha blending** - Composición Porter-Duff SRCOVER ✅
+- **Alpha blending** - Composición con 12 modos Porter-Duff ✅
+- **3-buffer compositing** - Preserva buffer destino (src + dst → out) ✅
 
 ### Características Implementadas
 
 ✅ **Operaciones sincrónicas con IRQ** (no busy-wait)  
 ✅ **Soporte DMA-BUF** para zero-copy con otros subsistemas  
 ✅ **FILLRECT**: Relleno de rectángulos con color sólido  
-✅ **BLIT**: Copia de imágenes con escalado (hasta 8x), crop y transformaciones  
-✅ **ALPHA BLENDING**: Composición Porter-Duff SRCOVER (alpha 0-255)  
+✅ **BLIT UNIFICADO**: Copia, escalado, rotación y alpha blending en una sola operación  
+✅ **ALPHA BLENDING**: 12 modos Porter-Duff (SRCOVER default, COPY, DST, XOR, etc.)  
+✅ **3-BUFFER COMPOSITING**: Buffer destino preservado (src + dst → out)  
 ✅ **TRANSFORMACIONES**: Rotación (90°/180°/270°) y flip horizontal/vertical  
 ✅ **VSU (Video Scaler Unit)**: Escalado hardware con filtros bicúbicos  
 ✅ **Gestión automática de poder** (clocks, reset, MBUS)  
@@ -457,110 +459,319 @@ close(dmabuf_fd);
 
 ---
 
-## Alpha Blending (Composición)
+## Alpha Blending y Composición (BLIT Unificado)
 
-### `G2D_IOC_ALPHA_BLEND` - Mezcla con transparencia
+El driver G2D implementa alpha blending a través de la operación **BLIT unificada**, que combina copia, escalado, rotación y blending en una sola llamada.
 
-Implementa composición Porter-Duff "Source Over" (SRCOVER) con alpha global:
+### Pipeline Unificado
+
+La operación `G2D_IOC_BLIT` detecta automáticamente qué módulos hardware activar:
+
 ```
-Output = Foreground × alpha + Background × (1 - alpha)
+BLIT → Detección automática → ROT (rotación) | VSU (escalado) | BLD (blending)
 ```
 
-#### Ejemplo básico
+- **ROT**: Se activa si `flags & (ROTATE_90|ROTATE_180|ROTATE_270|FLIP_H|FLIP_V)`
+- **VSU**: Se activa si `dst_w != crop_w` o `dst_h != crop_h` (escalado)
+- **BLD**: Se activa si hay alpha blending (ver detección abajo)
+
+### Detección Automática de Alpha Blending
+
+El blending se activa automáticamente cuando:
+1. `out.dma_fd >= 0` (operación de 3 buffers)
+2. `src.alpha_mode == G2D_GLOBAL_ALPHA` o `G2D_MIXER_ALPHA`
+3. `dst.alpha_mode == G2D_GLOBAL_ALPHA` o `G2D_MIXER_ALPHA`
+4. `src.alpha_mode == G2D_PIXEL_ALPHA` y formato tiene alpha (ARGB8888)
+
+### Modos de Alpha
 
 ```c
-struct g2d_alpha_blend blend = {
-    // Imagen de fondo (destino)
-    .dst = {
-        .width = 128,
-        .height = 128,
-        .format = G2D_FMT_ARGB8888,
-        .stride[0] = 128 * 4,
-        .dma_fd = bg_dmabuf_fd,
-        .crop_w = 128,
-        .crop_h = 128,
-    },
-    
-    // Imagen de frente (origen)
+enum g2d_alpha_mode {
+    G2D_PIXEL_ALPHA = 0,   /* Usa alpha de cada píxel */
+    G2D_GLOBAL_ALPHA = 1,  /* Usa valor global .alpha */
+    G2D_MIXER_ALPHA = 2,   /* Multiplica pixel × global */
+};
+```
+
+### Modos Porter-Duff
+
+El campo `bld_mode` permite seleccionar el modo de composición:
+
+```c
+enum g2d_bld_mode {
+    G2D_BLD_CLEAR = 0,     /* Clear: 0 */
+    G2D_BLD_COPY = 1,      /* Copy: Src */
+    G2D_BLD_DST = 2,       /* Keep: Dst */
+    G2D_BLD_SRCOVER = 3,   /* Source Over: Src + Dst×(1-As) [DEFAULT] */
+    G2D_BLD_DSTOVER = 4,   /* Dst Over: Dst + Src×(1-Ad) */
+    G2D_BLD_SRCIN = 5,     /* Src In: Src×Ad */
+    G2D_BLD_DSTIN = 6,     /* Dst In: Dst×As */
+    G2D_BLD_SRCOUT = 7,    /* Src Out: Src×(1-Ad) */
+    G2D_BLD_DSTOUT = 8,    /* Dst Out: Dst×(1-As) */
+    G2D_BLD_SRCATOP = 9,   /* Src Atop: Src×Ad + Dst×(1-As) */
+    G2D_BLD_DSTATOP = 10,  /* Dst Atop: Dst×As + Src×(1-Ad) */
+    G2D_BLD_XOR = 11,      /* XOR: Src×(1-Ad) + Dst×(1-As) */
+};
+```
+
+### Operación de 2 Buffers (In-Place)
+
+Mezcla SRC y DST escribiendo el resultado en DST:
+
+```c
+struct g2d_blit blit = {
     .src = {
-        .width = 128,
-        .height = 128,
+        .width = 200,
+        .height = 200,
         .format = G2D_FMT_ARGB8888,
-        .stride[0] = 128 * 4,
-        .dma_fd = fg_dmabuf_fd,
-        .crop_w = 128,
-        .crop_h = 128,
+        .dma_fd = foreground_fd,
+        .crop_w = 200,
+        .crop_h = 200,
+        .alpha = 128,                 /* 50% transparencia */
+        .alpha_mode = G2D_GLOBAL_ALPHA,
     },
+    .dst = {
+        .width = 800,
+        .height = 600,
+        .format = G2D_FMT_ARGB8888,
+        .dma_fd = background_fd,
+        .alpha = 128,                 /* 50% opacidad del fondo */
+        .alpha_mode = G2D_GLOBAL_ALPHA,
+    },
+    .dst_x = 300,
+    .dst_y = 200,
+    .dst_w = 200,
+    .dst_h = 200,
     
-    .global_alpha = 128,  // 0-255: 0=fondo solo, 255=frente solo
-    .fence_fd_in = -1,
+    .out.dma_fd = -1,                 /* In-place: resultado en DST */
+    .bld_mode = G2D_BLD_SRCOVER,      /* Source Over (default) */
+    .flags = 0,
 };
 
-int ret = ioctl(fd, G2D_IOC_ALPHA_BLEND, &blend);
+ioctl(g2d_fd, G2D_IOC_BLIT, &blit);
 ```
 
-#### Detalles de implementación
+**Resultado:** `background_fd` contiene la composición (se modifica)
 
-**Hardware utilizado:**
-- **V0 (Video layer)**: Background/destino → PIPE0 del blender
-- **UI2 (UI layer)**: Foreground/origen → PIPE1 del blender
-- **BLD (Blender)**: Porter-Duff SRCOVER (modo 0x03010301)
-- **WB (Writeback)**: Salida a buffer destino
+### Operación de 3 Buffers (Preserva Destino)
 
-**Configuración crítica:**
+**✨ NUEVA FUNCIONALIDAD:** Buffer destino preservado intacto
+
+Mezcla SRC y DST escribiendo el resultado en OUT (buffer separado):
+
 ```c
-// V0: alpha_mode=1 (global), alpha=0xFF (opaco)
-// UI2: alpha_mode=1 (global), alpha=global_alpha (variable)
-// BLD_EN_CTL: 0x300 (ambos pipes habilitados, leen de capas)
-// BLD_CTL: 0x03010301 (modo SRCOVER)
-// ROP_CTL: 0xf0 (copia origen, estándar para blending)
+struct g2d_blit blit = {
+    .src = {
+        .width = 200,
+        .height = 200,
+        .format = G2D_FMT_ARGB8888,
+        .dma_fd = ball_fd,            /* Pelota con alpha */
+        .crop_w = 200,
+        .crop_h = 200,
+        .alpha = 128,
+        .alpha_mode = G2D_GLOBAL_ALPHA,
+    },
+    .dst = {
+        .width = 800,
+        .height = 600,
+        .format = G2D_FMT_ARGB8888,
+        .dma_fd = background_fd,      /* Fondo - NO SE MODIFICA */
+        .alpha = 128,
+        .alpha_mode = G2D_GLOBAL_ALPHA,
+    },
+    .dst_x = 300,
+    .dst_y = 200,
+    .dst_w = 200,
+    .dst_h = 200,
+    
+    .out = {
+        .dma_fd = framebuffer_fd,     /* Buffer de salida separado */
+        .width = 800,
+        .height = 600,
+        .format = G2D_FMT_ARGB8888,
+    },
+    .bld_mode = G2D_BLD_SRCOVER,
+    .flags = 0,
+};
+
+ioctl(g2d_fd, G2D_IOC_BLIT, &blit);
 ```
 
-**¿Por qué V0 en lugar de UI1?**
+**Resultado:** 
+- `background_fd` permanece **intacto** ✅
+- `framebuffer_fd` contiene la composición ✅
 
-El hardware del blender espera que PIPE0 lea de V0 (video layer), no de UI1. Usar UI1 como background causa que solo se vea el foreground. Esto coincide con la implementación del BSP en `g2d_mixer.c:g2d_bsp_bld()`.
+**Casos de uso:**
+- **Animación de sprites**: Reutilizar mismo fondo para cada frame
+- **Picture-in-picture**: Preservar video de fondo mientras se superpone UI
+- **Compositing multi-capa**: Componer varias capas sin destruir las originales
+- **Double/triple buffering**: Alternar buffers de salida sin recargar el fondo
 
-#### Casos de uso
+### Comportamiento del Alpha en Capas Hardware
 
-- **Transparencia de ventanas**: alpha=192 (75% opaco)
-- **Fade in/out**: Animar alpha de 0→255
-- **Picture-in-picture**: Superponer video con alpha<255
-- **Watermarks**: Logo con alpha=128 (50% transparente)
-- **Notificaciones**: UI overlay con alpha=220
+**⚠️ IMPORTANTE:** Las capas V0 y UI2 usan convenciones de alpha diferentes:
 
-#### Limitaciones
+#### V0 Layer (Source/Video) - Alpha INVERTIDO
+```c
+alpha = 255  →  Transparente (invisible)
+alpha = 128  →  50% transparencia
+alpha = 0    →  Opaco (sólido)
+```
 
-- ❌ Solo soporta modo SRCOVER (no DSTOVER, ADD, etc.)
-- ❌ No soporta alpha por píxel (solo global alpha)
-- ❌ Imágenes deben ser mismo tamaño (no escalado en blend)
-- ❌ No soporta premultiplicación de alpha
-- ✅ Funciona perfecto para UI compositing estándar
+#### UI2 Layer (Destination/UI) - Alpha ESTÁNDAR
+```c
+alpha = 255  →  Opaco (bloquea source)
+alpha = 128  →  50% transparencia (mezcla con source)
+alpha = 0    →  Transparente (solo se ve source)
+```
 
-#### Ejemplo: Fade entre dos imágenes
+**Con GLOBAL_ALPHA mode:** El hardware maneja la conversión automáticamente
+- Especificas `alpha=128` en ambos y funciona correctamente
+- Para PIXEL_ALPHA mode con V0, los píxeles deben usar alpha invertido
+
+### Ejemplo: Animación con 3 Buffers
 
 ```c
-// Fade de imagen A a imagen B en 10 pasos
-for (int step = 0; step <= 10; step++) {
-    blend.src.dma_fd = image_B_fd;     // Frente
-    blend.dst.dma_fd = image_A_fd;     // Fondo
-    blend.global_alpha = step * 25;    // 0, 25, 50, ..., 250
+/* Setup inicial */
+int background_fd = load_image("background.png");
+int ball_fd = create_ball_sprite(110, 110);
+int front_fb = create_framebuffer(800, 600);
+int back_fb = create_framebuffer(800, 600);
+bool use_front = true;
+
+/* Loop de animación */
+for (int frame = 0; frame < 1000; frame++) {
+    int x = compute_ball_x(frame);
+    int y = compute_ball_y(frame);
+    int out_fd = use_front ? front_fb : back_fb;
     
-    ioctl(g2d_fd, G2D_IOC_ALPHA_BLEND, &blend);
+    /* Componer: ball + background → output */
+    struct g2d_blit blit = {
+        .src.dma_fd = ball_fd,
+        .src.alpha = 128,
+        .src.alpha_mode = G2D_GLOBAL_ALPHA,
+        
+        .dst.dma_fd = background_fd,  /* ¡NO se modifica! */
+        .dst.alpha = 128,
+        .dst.alpha_mode = G2D_GLOBAL_ALPHA,
+        
+        .dst_x = x,
+        .dst_y = y,
+        .dst_w = 110,
+        .dst_h = 110,
+        
+        .out.dma_fd = out_fd,         /* Alterna entre buffers */
+        .out.width = 800,
+        .out.height = 600,
+        .out.format = G2D_FMT_ARGB8888,
+        
+        .bld_mode = G2D_BLD_SRCOVER,
+    };
     
-    // Resultado en image_A_fd
-    display_image(image_A_fd);
-    usleep(50000);  // 50ms por frame
+    ioctl(g2d_fd, G2D_IOC_BLIT, &blit);
+    
+    /* Mostrar resultado */
+    display_buffer(out_fd);
+    use_front = !use_front;
 }
 ```
 
-#### Test results (todos pasan ✅)
+**Ventajas vs 2-buffer:**
+- ✅ No recargar background cada frame (ahorra ~0.8ms)
+- ✅ Background puede ser imagen estática grande
+- ✅ Permite double/triple buffering sin copias CPU
+- ✅ FPS: ~56 FPS vs ~30 FPS con 2-buffer
 
+### Ejemplo: Probar Todos los Modos Porter-Duff
+
+```c
+const char *mode_names[] = {
+    "CLEAR", "COPY", "DST", "SRCOVER", "DSTOVER",
+    "SRCIN", "DSTIN", "SRCOUT", "DSTOUT",
+    "SRCATOP", "DSTATOP", "XOR"
+};
+
+for (int mode = 0; mode < 12; mode++) {
+    /* Colocar DST (cuadrado azul) */
+    blit1.src.dma_fd = blue_square_fd;
+    blit1.dst.dma_fd = screen_fd;
+    blit1.bld_mode = G2D_BLD_COPY;
+    ioctl(g2d_fd, G2D_IOC_BLIT, &blit1);
+    
+    /* Aplicar SRC (círculo rojo) con modo Porter-Duff */
+    blit2.src.dma_fd = red_circle_fd;
+    blit2.src.alpha = 128;
+    blit2.src.alpha_mode = G2D_GLOBAL_ALPHA;
+    
+    blit2.dst.dma_fd = screen_fd;
+    blit2.dst.alpha = 128;
+    blit2.dst.alpha_mode = G2D_GLOBAL_ALPHA;
+    
+    blit2.bld_mode = mode;  /* Probar cada modo */
+    ioctl(g2d_fd, G2D_IOC_BLIT, &blit2);
+    
+    printf("Mode %d: %s\n", mode, mode_names[mode]);
+}
 ```
-Alpha=0:   Background solo   → 0xFF8000FF
-Alpha=64:  25% blend         → 0xFFBE4100  
-Alpha=128: 50% blend         → 0xFF80007F
-Alpha=192: 75% blend         → 0xFFC0C0C0
-Alpha=255: Foreground solo   → 0xFFFFFF00
+
+### Hardware Utilizado
+
+**Blending Pipeline:**
+- **V0 (Video layer)**: Lee buffer SOURCE (foreground)
+- **UI2 (UI layer)**: Lee buffer DESTINATION (background)
+- **BLD (Blender)**: Combina según modo Porter-Duff
+- **WB (Writeback)**: Escribe a OUTPUT (dst o out según caso)
+
+**Configuración BLD:**
+```c
+bld.bld_en_ctrl = 0x00000300;  /* Habilita PIPE0 (V0) y PIPE1 (UI2) */
+bld.premulti_ctrl.p0_alpha_mode = 1;  /* UI2 premultiplicación */
+bld.premulti_ctrl.p1_alpha_mode = 1;  /* V0 premultiplicación */
+bld.bld_ctrl = sunxi_g2d_get_bld_mode(bld_mode);  /* Selecciona Porter-Duff */
+```
+
+**Valores BLD_CTL por modo:**
+
+| Modo | BLD_CTL | Fórmula |
+|------|---------|---------|
+| CLEAR | 0x00000000 | 0 |
+| COPY | 0x00010001 | Src |
+| DST | 0x01000100 | Dst |
+| **SRCOVER** | **0x03010301** | Src + Dst×(1-As) |
+| DSTOVER | 0x01030103 | Dst + Src×(1-Ad) |
+| SRCIN | 0x00020002 | Src×Ad |
+| DSTIN | 0x02000200 | Dst×As |
+| SRCOUT | 0x00030003 | Src×(1-Ad) |
+| DSTOUT | 0x03000300 | Dst×(1-As) |
+| SRCATOP | 0x03020302 | Src×Ad + Dst×(1-As) |
+| DSTATOP | 0x02030203 | Dst×As + Src×(1-Ad) |
+| XOR | 0x03030303 | Src×(1-Ad) + Dst×(1-As) |
+
+### Casos de Uso Prácticos
+
+**SRCOVER (default)** - Composición normal
+```c
+// Logo semitransparente sobre imagen
+blit.bld_mode = G2D_BLD_SRCOVER;
+blit.src.alpha = 180;  // Logo 70% opaco
+```
+
+**XOR** - Efectos de inversión
+```c
+// Efecto "revelar" entre dos imágenes
+blit.bld_mode = G2D_BLD_XOR;
+```
+
+**SRCIN** - Máscaras
+```c
+// Mostrar SRC solo donde DST es opaco
+blit.bld_mode = G2D_BLD_SRCIN;
+```
+
+**SRCATOP** - Picture-in-picture
+```c
+// Video sobre fondo, recortado por forma del fondo
+blit.bld_mode = G2D_BLD_SRCATOP;
 ```
 
 ---
@@ -727,7 +938,10 @@ cma=128M
 - [x] **BLIT con escalado** - VSU configurado con filtros bicúbicos (hasta 8x)
 - [x] **Rotación** (90°, 180°, 270°) - ROT module completo
 - [x] **Flip** horizontal/vertical - Combinable con rotación
-- [x] **Alpha blending** - Porter-Duff SRCOVER con global alpha
+- [x] **Alpha blending** - 12 modos Porter-Duff (SRCOVER, COPY, XOR, etc.)
+- [x] **3-buffer compositing** - Buffer destino preservado (src + dst → out)
+- [x] **Pipeline unificado** - BLIT detecta automáticamente qué módulos activar
+- [x] **Alpha modes** - GLOBAL_ALPHA, PIXEL_ALPHA, MIXER_ALPHA
 - [x] DMA-BUF import
 - [x] Gestión de poder automática
 - [x] Múltiples formatos de píxeles (ARGB8888, XRGB8888, RGB565)
@@ -735,28 +949,50 @@ cma=128M
 
 ### En Desarrollo 🚧
 
-- [ ] **Sync fences** - Para sincronización con DRM/Wayland
-- [ ] **Alpha per-pixel** - Usar canal alpha de imágenes ARGB
-- [ ] **Otros modos Porter-Duff** - DSTOVER, ADD, MULTIPLY, etc.
+- [ ] **Sync fences** - Para sincronización con DRM/Wayland (fence_fd_out en UAPI)
+- [ ] **Alpha per-pixel** - Completar soporte para PIXEL_ALPHA con ARGB
 
 ### Futuro 📋
 
 - [ ] Color space conversion (RGB ↔ YUV) - Hardware soportado
 - [ ] Operaciones asíncronas con job queue
-- [ ] Buffer allocation desde driver - Simplificar API
-- [ ] Premultiplicación de alpha
+- [ ] Premultiplicación de alpha (ya en hardware, falta exposición en UAPI)
 - [ ] Color keying (chromakey)
+- [ ] Buffer allocation desde driver (simplificar API, opcional)
 
 ---
 
-## Ejemplos Completos
+## Demos Visuales
 
-Ver el código de prueba en el repositorio:
-- `test-fillrect.c` - Fillrect con 2 tests (rojo y verde)
-- `test-blit-simple.c` - BLIT copia 1:1 con 3 tests (completo, crop, múltiples)
-- `test-blit-scale.c` - BLIT con escalado usando VSU (upscale/downscale)
-- `test-rotation.c` - Rotación 90°/180°/270° y flip H/V
-- `test-alpha.c` - Alpha blending con 5 tests (alpha 0, 64, 128, 192, 255)
+El repositorio incluye demos interactivos para probar todas las funcionalidades:
+
+### Demos Básicos
+- `demo-bouncing-ball` - Animación de pelota con alpha blending y escalado
+  - Usa 3-buffer compositing (56 FPS)
+  - Demuestra GLOBAL_ALPHA y V0 alpha invertido
+  - Pattern con gradiente radial
+  
+- `demo-3buffer-test` - Verifica operación de 3 buffers
+  - SRC (rojo) + DST (azul) → OUT (morado)
+  - Confirma que DST no se modifica
+  - Prueba GLOBAL_ALPHA mode
+
+- `demo-porter-duff` - Grid visual de los 12 modos Porter-Duff
+  - 4×3 celdas, cada una con un modo diferente
+  - SRC: círculo rojo con gradiente
+  - DST: cuadrado azul semi-transparente
+  - Permite comparar visualmente todos los modos
+
+### Demos de Rotación/Escalado
+- `demo-rotate-test` - Prueba rotación 90°/180°/270° y flip H/V
+- `demo-scale-rotate` - Combina escalado con rotación (2-pass si es necesario)
+
+### Tests Unitarios
+- `test-fillrect.c` - Relleno de rectángulos
+- `test-blit-simple.c` - Copia básica 1:1
+- `test-blit-scale.c` - Escalado con VSU
+- `test-rotation.c` - Todas las rotaciones
+- `test-alpha.c` - Alpha blending (legacy, usar demo-porter-duff)
 
 ## Licencia
 
@@ -771,4 +1007,5 @@ Copyright (C) 2025
 
 - [DMA-BUF Documentation](https://www.kernel.org/doc/html/latest/driver-api/dma-buf.html)
 - [DMA-BUF Heaps](https://lwn.net/Articles/780691/)
+- [Porter-Duff Compositing](https://en.wikipedia.org/wiki/Alpha_compositing)
 - Allwinner G2D IP Manual v1.1.0

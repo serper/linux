@@ -172,28 +172,6 @@ typedef enum {
  * @G2D_BLD_SRCOUT: Source out (Fa=1-Ad, Fb=0)
  * @G2D_BLD_DSTOUT: Destination out (Fa=0, Fb=1-As)
  * @G2D_BLD_SRCATOP: Source atop destination (Fa=Ad, Fb=1-As)
- * @G2D_BLD_DSTATOP: Destination atop source (Fa=1-Ad, Fb=As)
- * @G2D_BLD_XOR: XOR blend (Fa=1-Ad, Fb=1-As)
- * @G2D_CK_SRC: Enable source color key
- * @G2D_CK_DST: Enable destination color key
- */
-typedef enum {
-	G2D_BLD_CLEAR   = 0x00000001,
-	G2D_BLD_COPY    = 0x00000002,
-	G2D_BLD_DST     = 0x00000003,
-	G2D_BLD_SRCOVER = 0x00000004,
-	G2D_BLD_DSTOVER = 0x00000005,
-	G2D_BLD_SRCIN   = 0x00000006,
-	G2D_BLD_DSTIN   = 0x00000007,
-	G2D_BLD_SRCOUT  = 0x00000008,
-	G2D_BLD_DSTOUT  = 0x00000009,
-	G2D_BLD_SRCATOP = 0x0000000a,
-	G2D_BLD_DSTATOP = 0x0000000b,
-	G2D_BLD_XOR     = 0x0000000c,
-	G2D_CK_SRC      = 0x00010000,
-	G2D_CK_DST      = 0x00020000,
-} g2d_bld_cmd_flag;
-
 /**
  * enum g2d_color_gmt - Color gamut / color space standards
  * @G2D_BT601: ITU-R BT.601 (SD video)

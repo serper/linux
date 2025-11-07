@@ -225,7 +225,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	blit_bg.dst_w = disp->width;
 	blit_bg.dst_h = disp->height;
 	blit_bg.flags = 0;
-	blit_bg._reserved = 0;  /* No global_alpha field anymore */
+	blit_bg.bld_mode = G2D_BLD_SRCOVER; /* Normal copy */
 	blit_bg.fence_fd_in = -1;
 	blit_bg.fence_fd_out = -1;
 
@@ -270,8 +270,8 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	blit.dst.crop_y = y;
 	blit.dst.crop_w = ball_size;  /* Region to blend */
 	blit.dst.crop_h = ball_size;
-	blit.dst.alpha = 128;  /* Background 50% transparent */
-	blit.dst.alpha_mode = G2D_GLOBAL_ALPHA;  /* Auto-enables alpha blending */
+	blit.dst.alpha = 128;  /* Background at 50% transparency */
+	blit.dst.alpha_mode = G2D_GLOBAL_ALPHA;  /* Use global alpha for background */
 
 	/* Output: temp buffer (3-buffer mode - write to same buffer as dst) */
 	blit.out.width = disp->width;
@@ -293,7 +293,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	blit.dst_h = ball_size;
 
 	blit.flags = 0;  /* No rotation, scaling+blending auto-detected */
-	blit._reserved = 0;
+	blit.bld_mode = G2D_BLD_SRCOVER;  /* Normal alpha blend */
 	blit.fence_fd_in = -1;
 	blit.fence_fd_out = -1;
 
@@ -689,14 +689,14 @@ int main(int argc, char **argv)
 				uint32_t color;
 				
 				if (dist > pattern_max_radius) {
-					/* Outside the circle: fully transparent */
-					color = 0xFF000000;  /* Alpha=255 (transparent), RGB=black */
+					/* Outside the circle: fully transparent (V0 INVERTED: alpha=255) */
+					color = 0xFF000000;  /* Alpha=255 (transparent for V0), RGB=black */
 				} else {
 					/* Inside circle: RGB COLOR GRADIENT pattern with radial alpha
-					 * CORRECTED ALPHA BEHAVIOR (standard ARGB, NO inversion):
-					 * - alpha=255: Fully OPAQUE (100% visible)
+					 * V0 INVERTED ALPHA BEHAVIOR:
+					 * - alpha=0:   Fully OPAQUE (100% visible) <- INVERTED!
 					 * - alpha=128: Semi-transparent (50% visible)  
-					 * - alpha=0:   Fully TRANSPARENT (invisible)
+					 * - alpha=255: Fully TRANSPARENT (invisible) <- INVERTED!
 					 * 
 					 * Color pattern: Full RGB spectrum to verify all channels
 					 * - Horizontal gradient: Red (left) → Green → Blue (right)
@@ -710,9 +710,9 @@ int main(int argc, char **argv)
 					uint8_t g = (uint8_t)((1.0f - norm_x) * 255);  /* Green decreases left→right */
 					uint8_t b = (uint8_t)(norm_y * 192);           /* Blue increases top→bottom */
 					
-					/* Radial gradient: center=255 (opaque) → edge=64 (mostly transparent) */
+					/* Radial alpha gradient INVERTED for V0: center=0 (opaque) → edge=191 (semi-transparent) */
 					float norm_dist = dist / pattern_max_radius;
-					uint8_t alpha = (uint8_t)(255 - (norm_dist * 191));  /* 255→64 gradient */
+					uint8_t alpha = (uint8_t)(0 + (norm_dist * 191));  /* 0→191 gradient (INVERTED) */
 					
 					/* G2D_FMT_ARGB8888 expects ARGB in big-endian conceptually,
 					 * but on little-endian ARM it's stored as [B][G][R][A] in memory.
@@ -920,7 +920,7 @@ int main(int argc, char **argv)
 	scale_gradient.dst_w = disp.width;
 	scale_gradient.dst_h = disp.height;
 	scale_gradient.flags = 0;
-	scale_gradient._reserved = 0;  /* No global_alpha field anymore */
+	scale_gradient.bld_mode = G2D_BLD_SRCOVER;  /* Normal copy with VSU scaling */
 	scale_gradient.fence_fd_in = -1;
 	scale_gradient.fence_fd_out = -1;
 	

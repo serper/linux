@@ -57,6 +57,25 @@ enum g2d_alpha_mode {
 	G2D_MIXER_ALPHA = 2,	/* Multiply pixel and global alpha */
 };
 
+/* Porter-Duff blending modes
+ * These define how source and destination are combined during alpha blending.
+ * Only used when alpha blending is active.
+ */
+enum g2d_bld_mode {
+	G2D_BLD_CLEAR = 0,	/* Clear: 0 */
+	G2D_BLD_COPY = 1,	/* Copy source: Src */
+	G2D_BLD_DST = 2,	/* Keep destination: Dst */
+	G2D_BLD_SRCOVER = 3,	/* Source Over: Src + Dst*(1-As) [DEFAULT] */
+	G2D_BLD_DSTOVER = 4,	/* Destination Over: Dst + Src*(1-Ad) */
+	G2D_BLD_SRCIN = 5,	/* Source In: Src*Ad */
+	G2D_BLD_DSTIN = 6,	/* Destination In: Dst*As */
+	G2D_BLD_SRCOUT = 7,	/* Source Out: Src*(1-Ad) */
+	G2D_BLD_DSTOUT = 8,	/* Destination Out: Dst*(1-As) */
+	G2D_BLD_SRCATOP = 9,	/* Source Atop: Src*Ad + Dst*(1-As) */
+	G2D_BLD_DSTATOP = 10,	/* Destination Atop: Dst*As + Src*(1-Ad) */
+	G2D_BLD_XOR = 11,	/* XOR: Src*(1-Ad) + Dst*(1-As) */
+};
+
 /* G2D buffer description */
 struct g2d_buf {
 	__u32 width;
@@ -90,13 +109,19 @@ struct g2d_buf {
  * Hardware limitation: Cannot do scaling + rotation simultaneously.
  * If both are needed, perform in two passes.
  * 
- * Alpha blending is automatic when:
- * - src.alpha_mode != G2D_PIXEL_ALPHA (uses src.alpha value), OR
- * - dst.alpha_mode != G2D_PIXEL_ALPHA (uses dst.alpha value), OR
- * - Source format has alpha channel and pixel alpha is non-opaque
+ * Alpha blending is automatically enabled when ANY of these conditions are met:
+ * - out.dma_fd >= 0 (three-buffer operation always uses alpha blending)
+ * - src.alpha_mode == G2D_GLOBAL_ALPHA (uses src.alpha value)
+ * - src.alpha_mode == G2D_MIXER_ALPHA (multiply pixel and src.alpha)
+ * - dst.alpha_mode == G2D_GLOBAL_ALPHA (uses dst.alpha value)
+ * - dst.alpha_mode == G2D_MIXER_ALPHA (multiply pixel and dst.alpha)
+ * - src.alpha_mode == G2D_PIXEL_ALPHA AND src format has alpha (ARGB8888/ABGR8888)
+ * - Legacy G2D_BLIT_FLAG_ALPHA_BLEND flag is set (deprecated)
  * 
- * If out.dma_fd == -1: in-place operation (dst is both input background and output)
- * If out.dma_fd >= 0: three-buffer operation (dst=background, src=foreground, out=result)
+ * Buffer modes:
+ * - If out.dma_fd == -1: in-place operation (dst is both input background and output)
+ * - If out.dma_fd >= 0: three-buffer operation (dst=background, src=foreground, out=result)
+ *                       dst buffer is preserved (not modified)
  */
 struct g2d_blit {
 	struct g2d_buf src;	/* Source/foreground image */
@@ -109,7 +134,7 @@ struct g2d_blit {
 	__u32 dst_h;
 	
 	__u32 flags;		/* G2D_BLIT_FLAG_* */
-	__u32 _reserved;	/* Reserved for future use */
+	__u32 bld_mode;		/* enum g2d_bld_mode (Porter-Duff blend mode) */
 	
 	/* Sync fence support */
 	__s32 fence_fd_in;	/* Wait on this fence before blit, or -1 */
