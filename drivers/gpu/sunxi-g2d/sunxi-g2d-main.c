@@ -530,10 +530,8 @@ static struct dma_fence *sunxi_g2d_fence_create(struct sunxi_g2d_dev *g2d)
 	sf->seqno = seq;
 	dma_fence_init(&sf->base, &sunxi_g2d_fence_ops, &g2d->fence_lock,
 		       g2d->fence_context, seq);
-	/* Lightweight trace for fence creation (visible with dynamic_debug) */
-	if (g2d->dev) {
-		dev_dbg(g2d->dev, "sunxi_g2d: fence_create seq=%llu fence=%p\n", seq, &sf->base);
-		/* Also emit info-level trace so it's visible without dynamic_debug; include pid for correlation */
+	/* Lightweight trace for fence creation (visible with g2d_debug=1) */
+	if (g2d_debug && g2d->dev) {
 		dev_info(g2d->dev, "sunxi_g2d: fence_create seq=%llu fence=%p pid=%d\n", seq, &sf->base, task_tgid_nr(current));
 	}
 	return &sf->base;
@@ -2002,17 +2000,20 @@ static long sunxi_g2d_ioctl_fillrect_rcq(struct sunxi_g2d_dev *g2d, unsigned lon
 
 	/* If userspace passed a fence_fd_in for this fill, wait on it */
 	if (fill.fence_fd_in >= 0) {
-		dev_info(g2d->dev, "fillrect_rcq: importing input fence fd=%d pid=%d\n",
+		if (g2d_debug)
+			dev_info(g2d->dev, "fillrect_rcq: importing input fence fd=%d pid=%d\n",
 					fill.fence_fd_in, task_tgid_nr(current));
 		struct dma_fence *in_fence = sync_file_get_fence(fill.fence_fd_in);
 		if (!in_fence) {
 			ret = -EINVAL;
 			goto err_unmap;
 		}
-		dev_info(g2d->dev, "fillrect_rcq: got in_fence=%p signaled=%d\n",
+		if (g2d_debug)
+			dev_info(g2d->dev, "fillrect_rcq: got in_fence=%p signaled=%d\n",
 					in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_wait(in_fence, false);
-		dev_info(g2d->dev, "fillrect_rcq: in_fence=%p wait done signaled=%d\n",
+		if (g2d_debug)
+			dev_info(g2d->dev, "fillrect_rcq: in_fence=%p wait done signaled=%d\n",
 					in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_put(in_fence);
 	}
@@ -2108,13 +2109,15 @@ static long sunxi_g2d_ioctl_fillrect_rcq(struct sunxi_g2d_dev *g2d, unsigned lon
 
 		if (job->sync_file && job->sync_file->file) {
 			struct file *tmpf = job->sync_file->file;
-			if (job->fence) {
-				struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-				dev_info(g2d->dev, "fillrect_rcq: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
-							out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
-			} else {
-				dev_info(g2d->dev, "fillrect_rcq: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
-							out_fd, tmpf, job, task_tgid_nr(current));
+			if (g2d_debug) {
+				if (job->fence) {
+					struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
+					dev_info(g2d->dev, "fillrect_rcq: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
+								out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
+				} else {
+					dev_info(g2d->dev, "fillrect_rcq: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
+								out_fd, tmpf, job, task_tgid_nr(current));
+				}
 			}
 			fd_install(out_fd, tmpf);
 			job->sync_file = NULL;
@@ -4655,18 +4658,21 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 
 	/* If userspace passed a fence_fd_in for this fill, wait on it */
 	if (fill.fence_fd_in >= 0) {
-		dev_info(g2d->dev, "fillrect: importing input fence fd=%d pid=%d\n",
-			 fill.fence_fd_in, task_tgid_nr(current));
+		if (g2d_debug)
+			dev_info(g2d->dev, "fillrect: importing input fence fd=%d pid=%d\n",
+				 fill.fence_fd_in, task_tgid_nr(current));
 		struct dma_fence *in_fence = sync_file_get_fence(fill.fence_fd_in);
 		if (!in_fence) {
 			ret = -EINVAL;
 			goto err_unmap;
 		}
-		dev_info(g2d->dev, "fillrect: got in_fence=%p signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+		if (g2d_debug)
+			dev_info(g2d->dev, "fillrect: got in_fence=%p signaled=%d\n",
+				 in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_wait(in_fence, false);
-		dev_info(g2d->dev, "fillrect: in_fence=%p wait done signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+		if (g2d_debug)
+			dev_info(g2d->dev, "fillrect: in_fence=%p wait done signaled=%d\n",
+				 in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_put(in_fence);
 	}
 	
@@ -4802,8 +4808,9 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		/* Return fence_fd to userspace */
 		fill.fence_fd_out = job->fence_fd;
 		
-		dev_info(g2d->dev, "fillrect: enqueued job=%p fence_fd=%d (async)\n",
-			 job, out_fd);
+		if (g2d_debug)
+			dev_info(g2d->dev, "fillrect: enqueued job=%p fence_fd=%d (async)\n",
+				 job, out_fd);
 	}
 	
 	/* Copy result to userspace */
@@ -5039,23 +5046,27 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 
 	/* If userspace provided an input fence fd for this alpha blend, wait on it */
 	if (blend.fence_fd_in >= 0) {
-		dev_info(g2d->dev, "alpha_blend: importing input fence fd=%d pid=%d\n",
-			 blend.fence_fd_in, task_tgid_nr(current));
+		if (g2d_debug)
+			dev_info(g2d->dev, "alpha_blend: importing input fence fd=%d pid=%d\n",
+				 blend.fence_fd_in, task_tgid_nr(current));
 		struct dma_fence *in_fence = sync_file_get_fence(blend.fence_fd_in);
 		if (!in_fence) {
 			ret = -EINVAL;
 			goto err_unmap_out;  /* FIX: was err_unmap_dst, leaked out! */
 		}
-		dev_info(g2d->dev, "alpha_blend: got in_fence=%p signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+		if (g2d_debug)
+			dev_info(g2d->dev, "alpha_blend: got in_fence=%p signaled=%d\n",
+				 in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_wait(in_fence, false);
-		dev_info(g2d->dev, "alpha_blend: in_fence=%p wait done signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+		if (g2d_debug)
+			dev_info(g2d->dev, "alpha_blend: in_fence=%p wait done signaled=%d\n",
+				 in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_put(in_fence);
 	}
 	
-	dev_info(g2d->dev, "DMA addresses: src_fd=%d->0x%llx dst_fd=%d->0x%llx out_fd=%d->0x%llx\n",
-		 blend.src.dma_fd, (u64)src_dma_addr,
+	if (g2d_debug)
+		dev_info(g2d->dev, "DMA addresses: src_fd=%d->0x%llx dst_fd=%d->0x%llx out_fd=%d->0x%llx\n",
+			 blend.src.dma_fd, (u64)src_dma_addr,
 		 blend.dst.dma_fd, (u64)dst_dma_addr,
 		 blend.out.dma_fd, (u64)out_dma_addr);
 	
@@ -5196,13 +5207,15 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 		 */
 		if (job->sync_file && job->sync_file->file) {
 			struct file *tmpf = job->sync_file->file;
-			if (job->fence) {
-				struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-				dev_info(g2d->dev, "alpha_blend: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
-						 out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
-			} else {
-				dev_info(g2d->dev, "alpha_blend: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
-						 out_fd, tmpf, job, task_tgid_nr(current));
+			if (g2d_debug) {
+				if (job->fence) {
+					struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
+					dev_info(g2d->dev, "alpha_blend: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
+							 out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
+				} else {
+					dev_info(g2d->dev, "alpha_blend: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
+							 out_fd, tmpf, job, task_tgid_nr(current));
+				}
 			}
 			fd_install(out_fd, tmpf);
 			/* After fd_install the fd table owns the file ref */
@@ -5777,7 +5790,8 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	
 	/* Initialize job worker */
 	INIT_WORK(&g2d->job_work, sunxi_g2d_job_worker);
-	dev_info(&pdev->dev, "Job worker initialized for async operations\n");
+	if (g2d_debug)
+		dev_info(&pdev->dev, "Job worker initialized for async operations\n");
 	
 	/* Register character device */
 	ret = alloc_chrdev_region(&g2d->dev_num, 0, 1, DRIVER_NAME);
