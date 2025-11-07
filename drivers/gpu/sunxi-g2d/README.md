@@ -361,12 +361,19 @@ blit.flags = G2D_BLT_FLIP_HORIZONTAL;
 
 ## Gestión de Buffers
 
-### Método Recomendado: DMA-BUF Heaps
+El driver ofrece dos métodos para asignar buffers:
 
-El driver **NO asigna buffers** directamente. En su lugar, el desarrollador debe:
+1. **DMA-BUF Heaps** (recomendado): Asignar desde `/dev/dma_heap/*` y pasar fd al driver
+2. **Allocación desde driver**: Usar `G2D_IOC_ALLOC_BUFFER` para simplificar (opcional)
+
+### Método 1: DMA-BUF Heaps (Recomendado)
+
+Este es el método **estándar de Linux** y ofrece máxima flexibilidad para compartir buffers entre subsistemas (DRM, V4L2, etc.).
+
+El driver **importa** automáticamente el DMA-BUF cuando pasas el fd:
 
 1. **Asignar buffer desde DMA-BUF heap** (CMA recomendado)
-2. **Pasar el fd** al driver vía `struct g2d_buf`
+2. **Pasar el fd** al driver vía `struct g2d_buf.dma_fd`
 3. El driver importa el DMA-BUF automáticamente
 
 #### Heaps disponibles en T113-S3
@@ -442,6 +449,137 @@ uint32_t *pixels = (uint32_t *)buf;
 munmap(buf, 1920 * 1080 * 4);
 close(dmabuf_fd);
 ```
+
+**Ventajas:**
+- ✅ Máxima flexibilidad - Compartir buffers con DRM, V4L2, otros drivers
+- ✅ Control total sobre el heap (CMA, system, reserved)
+- ✅ Estándar de Linux kernel
+
+---
+
+### Método 2: Allocación desde Driver (Simplificado)
+
+**✨ FUNCIONALIDAD IMPLEMENTADA:** El driver puede asignar buffers directamente con `G2D_IOC_ALLOC_BUFFER`.
+
+Este método **simplifica la API** para casos donde no necesitas compartir buffers con otros subsistemas.
+
+#### `G2D_IOC_ALLOC_BUFFER` - Asignar buffer desde driver
+
+```c
+struct g2d_alloc_buffer alloc = {
+    .size = 1920 * 1080 * 4,  // Tamaño en bytes
+    .flags = 0,               // Reservado para uso futuro
+};
+
+if (ioctl(g2d_fd, G2D_IOC_ALLOC_BUFFER, &alloc) < 0) {
+    perror("G2D_IOC_ALLOC_BUFFER");
+    return -1;
+}
+
+/* El driver retorna un DMA-BUF fd listo para usar */
+int dmabuf_fd = alloc.dma_fd;
+
+/* Mapear para acceso CPU (opcional) */
+void *mapped = mmap(NULL, alloc.size, PROT_READ | PROT_WRITE,
+                    MAP_SHARED, dmabuf_fd, 0);
+
+/* Usar en operaciones G2D */
+struct g2d_fillrect fill = {
+    .dst.dma_fd = dmabuf_fd,  // fd del driver
+    .dst.width = 1920,
+    .dst.height = 1080,
+    /* ... */
+};
+
+ioctl(g2d_fd, G2D_IOC_FILLRECT, &fill);
+
+/* Cleanup */
+munmap(mapped, alloc.size);
+close(dmabuf_fd);  // Libera automáticamente la memoria DMA
+```
+
+**Características:**
+- ✅ API simplificada (un solo ioctl vs abrir heap + ioctl)
+- ✅ Asigna desde CMA automáticamente (memoria DMA coherente)
+- ✅ Retorna DMA-BUF fd estándar (compatible con otros subsistemas)
+- ✅ Cleanup automático al cerrar fd (no memory leaks)
+- ✅ Límite de seguridad: máximo 128 MB por buffer
+
+**Ejemplo completo:**
+
+```c
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/sunxi_g2d.h>
+
+int main(void)
+{
+    int g2d_fd = open("/dev/g2d", O_RDWR);
+    
+    /* Asignar buffer desde driver */
+    struct g2d_alloc_buffer alloc = {
+        .size = 800 * 600 * 4,  // 800x600 ARGB8888
+    };
+    
+    if (ioctl(g2d_fd, G2D_IOC_ALLOC_BUFFER, &alloc) < 0) {
+        perror("G2D_IOC_ALLOC_BUFFER");
+        return -1;
+    }
+    
+    int buf_fd = alloc.dma_fd;
+    
+    /* Rellenar con rojo */
+    struct g2d_fillrect fill = {
+        .dst = {
+            .width = 800,
+            .height = 600,
+            .format = G2D_FMT_ARGB8888,
+            .stride[0] = 800 * 4,
+            .dma_fd = buf_fd,
+            .crop_w = 800,
+            .crop_h = 600,
+        },
+        .dst_x = 0,
+        .dst_y = 0,
+        .dst_w = 800,
+        .dst_h = 600,
+        .color = 0xFFFF0000,  // Rojo
+    };
+    
+    ioctl(g2d_fd, G2D_IOC_FILLRECT, &fill);
+    
+    /* Leer resultado (opcional) */
+    void *pixels = mmap(NULL, alloc.size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, buf_fd, 0);
+    printf("Primer pixel: 0x%08X\n", ((uint32_t *)pixels)[0]);
+    munmap(pixels, alloc.size);
+    
+    /* Cleanup */
+    close(buf_fd);  // Libera memoria automáticamente
+    close(g2d_fd);
+    return 0;
+}
+```
+
+**Ventajas:**
+- ✅ Código más simple (menos líneas)
+- ✅ No necesitas conocer la ruta del heap
+- ✅ Ideal para buffers temporales/internos
+
+**Desventajas vs DMA-BUF Heaps:**
+- ❌ Menos flexibilidad (siempre usa CMA coherent memory)
+- ❌ No puedes elegir el heap específico
+
+**Cuándo usar cada método:**
+
+| Caso de uso | Método recomendado |
+|-------------|-------------------|
+| Buffers temporales para G2D solamente | `G2D_IOC_ALLOC_BUFFER` |
+| Compartir con DRM/display | DMA-BUF Heaps |
+| Compartir con V4L2/cámara | DMA-BUF Heaps |
+| Necesitas heap específico (system/reserved) | DMA-BUF Heaps |
+| Aplicación simple que solo usa G2D | `G2D_IOC_ALLOC_BUFFER` |
 
 ---
 
@@ -1258,23 +1396,22 @@ cma=128M
 - [x] **Pipeline unificado** - BLIT detecta automáticamente qué módulos activar
 - [x] **Alpha modes** - GLOBAL_ALPHA, PIXEL_ALPHA, MIXER_ALPHA
 - [x] DMA-BUF import
-- [x] Gestión de poder automática
+- [x] Gestión de energía automática
 - [x] **Formatos RGB completos** - Todos los formatos RGB (32/24/16-bit, variantes ARGB/ABGR/RGBA/BGRA)
 - [x] **Formatos YUV/Video** - NV12, NV21, I420, YUYV, UYVY, etc. con conversión YUV→RGB acelerada
 - [x] **Chromakey (Color Keying)** - Transparencia por color con rango configurable (pantalla verde/azul)
+- [x] **Buffer allocation desde driver** - `G2D_IOC_ALLOC_BUFFER` para simplificar API (opcional, DMA-BUF heaps sigue siendo recomendado)
 - [x] UAPI estable
+- [x] Premultiplicación de alpha
+- [x] **Sync fences** - Para sincronización con DRM/Wayland (fence_fd_out en UAPI)
 
 ### En Desarrollo 🚧
 
-- [ ] **Sync fences** - Para sincronización con DRM/Wayland (fence_fd_out en UAPI)
 - [ ] **Demos YUV** - Ejemplos de procesamiento de video NV12→RGB
-- [ ] **Demo Chromakey** - Ejemplo de pantalla verde con video
 
 ### Futuro 📋
 
 - [ ] Operaciones asíncronas con job queue
-- [ ] Premultiplicación de alpha (ya en hardware, falta exposición en UAPI)
-- [ ] Buffer allocation desde driver (simplificar API, opcional)
 - [ ] Soporte BT.709 color space (actualmente solo BT.601)
 
 ---
