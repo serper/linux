@@ -5273,7 +5273,7 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		}
 
 		/* Copy from userspace to device buffer */
-		if (copy_from_user(vaddr + rw.offset, (void __user *)rw.user_ptr, rw.size)) {
+		if (copy_from_user(vaddr + rw.offset, (void __user *)(uintptr_t)rw.user_ptr, rw.size)) {
 			ret = -EFAULT;
 		} else {
 			ret = 0;
@@ -5360,7 +5360,7 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		}
 
 		/* Copy to userspace from device buffer */
-		if (copy_to_user((void __user *)rw.user_ptr, vaddr + rw.offset, rw.size)) {
+		if (copy_to_user((void __user *)(uintptr_t)rw.user_ptr, vaddr + rw.offset, rw.size)) {
 			ret = -EFAULT;
 		} else {
 			ret = 0;

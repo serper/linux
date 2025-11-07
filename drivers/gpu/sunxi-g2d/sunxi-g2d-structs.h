@@ -172,7 +172,8 @@ typedef enum {
  * @G2D_BLD_SRCOUT: Source out (Fa=1-Ad, Fb=0)
  * @G2D_BLD_DSTOUT: Destination out (Fa=0, Fb=1-As)
  * @G2D_BLD_SRCATOP: Source atop destination (Fa=Ad, Fb=1-As)
-/**
+ */
+ /**
  * enum g2d_color_gmt - Color gamut / color space standards
  * @G2D_BT601: ITU-R BT.601 (SD video)
  * @G2D_BT709: ITU-R BT.709 (HD video)
