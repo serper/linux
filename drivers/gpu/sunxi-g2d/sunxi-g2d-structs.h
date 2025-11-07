@@ -161,19 +161,6 @@ typedef enum {
 } g2d_rop3_cmd_flag;
 
 /**
- * enum g2d_bld_cmd_flag - Porter-Duff blend modes and color key flags
- * @G2D_BLD_CLEAR: Clear destination (Fa=0, Fb=0)
- * @G2D_BLD_COPY: Copy source, ignore destination (Fa=1, Fb=0)
- * @G2D_BLD_DST: Keep destination, ignore source (Fa=0, Fb=1)
- * @G2D_BLD_SRCOVER: Source over destination (Fa=1, Fb=1-As)
- * @G2D_BLD_DSTOVER: Destination over source (Fa=1-Ad, Fb=1)
- * @G2D_BLD_SRCIN: Source in destination (Fa=Ad, Fb=0)
- * @G2D_BLD_DSTIN: Destination in source (Fa=0, Fb=As)
- * @G2D_BLD_SRCOUT: Source out (Fa=1-Ad, Fb=0)
- * @G2D_BLD_DSTOUT: Destination out (Fa=0, Fb=1-As)
- * @G2D_BLD_SRCATOP: Source atop destination (Fa=Ad, Fb=1-As)
- */
- /**
  * enum g2d_color_gmt - Color gamut / color space standards
  * @G2D_BT601: ITU-R BT.601 (SD video)
  * @G2D_BT709: ITU-R BT.709 (HD video)
