@@ -255,9 +255,11 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
                               dma_addr_t src_dma, u32 src_width, u32 src_height,
                               u32 src_pitch, u32 src_format,
                               u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+                              u8 src_color_space,
                               dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
                               u32 dst_pitch, u32 dst_format,
-                              u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h);/**
+                              u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
+                              u8 dst_color_space);/**
  * struct sunxi_g2d_dev - G2D device structure
  * 
  * Hardware resources:
@@ -1143,6 +1145,99 @@ static int sunxi_g2d_format_to_hw(u32 fmt, u32 *bpp)
 		*bpp = bytes_pp;
 		
 	return hw_fmt;
+}
+
+/**
+ * sunxi_g2d_is_yuv_format - Check if format is YUV
+ * @fmt: UAPI pixel format
+ * 
+ * Returns: true if YUV format (>= 0x20), false otherwise
+ */
+static inline bool sunxi_g2d_is_yuv_format(u32 fmt)
+{
+	return fmt >= G2D_FMT_YUV422_I_YVYU;
+}
+
+/**
+ * sunxi_g2d_configure_csc - Configure Color Space Conversion matrix
+ * @g2d: G2D device
+ * @csc_id: CSC unit (0=pipe0/V0, 1=pipe1/UI2, 2=output)
+ * @color_space: Color space enum (BT.601 or BT.709)
+ * 
+ * Programs the CSC matrix registers for YUV→RGB conversion.
+ * 
+ * Matrix format: RGB_out = Matrix × YUV_in + Offset
+ * 
+ * BT.601 (SD video):
+ *   R = 1.164(Y-16) + 1.596(Cr-128)
+ *   G = 1.164(Y-16) - 0.391(Cb-128) - 0.813(Cr-128)
+ *   B = 1.164(Y-16) + 2.018(Cb-128)
+ * 
+ * BT.709 (HD video):
+ *   R = 1.164(Y-16) + 1.793(Cr-128)
+ *   G = 1.164(Y-16) - 0.213(Cb-128) - 0.533(Cr-128)
+ *   B = 1.164(Y-16) + 2.112(Cb-128)
+ * 
+ * Coefficients are in S12.0 fixed-point format (13-bit signed integer).
+ * Constants are in S19.0 format (20-bit signed integer).
+ */
+static void sunxi_g2d_configure_csc(struct sunxi_g2d_dev *g2d, int csc_id, u32 color_space)
+{
+	/* BT.601 YUV→RGB coefficients (scaled by 1024 for fixed-point) */
+	static const s16 bt601_coeffs[3][3] = {
+		{ 1192,    0,  1634 },  /* R = 1.164Y + 0.000U + 1.596Cr */
+		{ 1192, -400,  -833 },  /* G = 1.164Y - 0.391U - 0.813Cr */
+		{ 1192, 2066,     0 }   /* B = 1.164Y + 2.018U + 0.000Cr */
+	};
+	static const s32 bt601_offsets[3] = { -223, 136, -277 };
+	
+	/* BT.709 YUV→RGB coefficients (scaled by 1024 for fixed-point) */
+	static const s16 bt709_coeffs[3][3] = {
+		{ 1192,    0,  1836 },  /* R = 1.164Y + 0.000U + 1.793Cr */
+		{ 1192, -218,  -546 },  /* G = 1.164Y - 0.213U - 0.533Cr */
+		{ 1192, 2166,     0 }   /* B = 1.164Y + 2.112U + 0.000Cr */
+	};
+	static const s32 bt709_offsets[3] = { -248, 77, -289 };
+	
+	const s16 (*coeffs)[3];
+	const s32 *offsets;
+	u32 base_reg;
+	
+	/* Select matrix based on color space */
+	if (color_space == G2D_COLOR_SPACE_BT709) {
+		coeffs = bt709_coeffs;
+		offsets = bt709_offsets;
+	} else {
+		coeffs = bt601_coeffs;
+		offsets = bt601_offsets;
+	}
+	
+	/* Calculate base register offset for this CSC unit
+	 * CSC0: 0x110, CSC1: 0x140, CSC2: 0x170 (0x30 bytes apart)
+	 */
+	base_reg = BLD_CSC0_COEF00 + (csc_id * 0x30);
+	
+	/* Program 3x3 matrix + 3 constants (12 registers total) */
+	/* Row 0: R coefficients + constant */
+	g2d_write(g2d, base_reg + 0x00, coeffs[0][0] & 0x1FFF);  /* coeff00: Y */
+	g2d_write(g2d, base_reg + 0x04, coeffs[0][1] & 0x1FFF);  /* coeff01: U */
+	g2d_write(g2d, base_reg + 0x08, coeffs[0][2] & 0x1FFF);  /* coeff02: V */
+	g2d_write(g2d, base_reg + 0x0C, offsets[0] & 0xFFFFF);   /* const0 */
+	
+	/* Row 1: G coefficients + constant */
+	g2d_write(g2d, base_reg + 0x10, coeffs[1][0] & 0x1FFF);  /* coeff10: Y */
+	g2d_write(g2d, base_reg + 0x14, coeffs[1][1] & 0x1FFF);  /* coeff11: U */
+	g2d_write(g2d, base_reg + 0x18, coeffs[1][2] & 0x1FFF);  /* coeff12: V */
+	g2d_write(g2d, base_reg + 0x1C, offsets[1] & 0xFFFFF);   /* const1 */
+	
+	/* Row 2: B coefficients + constant */
+	g2d_write(g2d, base_reg + 0x20, coeffs[2][0] & 0x1FFF);  /* coeff20: Y */
+	g2d_write(g2d, base_reg + 0x24, coeffs[2][1] & 0x1FFF);  /* coeff21: U */
+	g2d_write(g2d, base_reg + 0x28, coeffs[2][2] & 0x1FFF);  /* coeff22: V */
+	g2d_write(g2d, base_reg + 0x2C, offsets[2] & 0xFFFFF);   /* const2 */
+	
+	dev_dbg(g2d->dev, "CSC%d configured: %s\n", csc_id,
+		color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
 }
 
 /**
@@ -2422,12 +2517,12 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 				    dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
 				    u32 src_pitch, u32 src_format,
 				    u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				    u8 src_alpha, u8 src_alpha_mode, u8 src_premul,
+				    u8 src_alpha, u8 src_alpha_mode, u8 src_premul, u8 src_color_space,
 				    dma_addr_t dst_dma_addr, dma_addr_t dst_base_addr,
 				    u32 dst_w, u32 dst_h,
 				    u32 dst_pitch, u32 dst_format,
 				    u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				    u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul,
+				    u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
 				    dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
 				    u32 out_pitch, u32 out_format,
 				    u32 out_crop_w, u32 out_crop_h,
@@ -2816,6 +2911,23 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	/* ROP: Source copy for alpha blending */
 	bld.rop_ctrl.dwval = 0xf0;
 	bld.ch3_index0.dwval = 0x00000000;
+
+	/* Configure Color Space Conversion (CSC) for YUV formats */
+	if (sunxi_g2d_is_yuv_format(dst_format)) {
+		/* CSC0: pipe0 (UI2/destination) YUV→RGB conversion */
+		sunxi_g2d_configure_csc(g2d, 0, dst_color_space);
+		g2d_write(g2d, BLD_CSC_CTL, g2d_read(g2d, BLD_CSC_CTL) | BIT(0));  /* Enable CSC0 */
+		dev_info(g2d->dev, "CSC0 enabled for dst (pipe0/UI2) format=0x%02X %s\n",
+			 dst_format, dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+	}
+	
+	if (sunxi_g2d_is_yuv_format(src_format)) {
+		/* CSC1: pipe1 (V0/source) YUV→RGB conversion */
+		sunxi_g2d_configure_csc(g2d, 1, src_color_space);
+		g2d_write(g2d, BLD_CSC_CTL, g2d_read(g2d, BLD_CSC_CTL) | BIT(1));  /* Enable CSC1 */
+		dev_info(g2d->dev, "CSC1 enabled for src (pipe1/V0) format=0x%02X %s\n",
+			 src_format, src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+	}
 
 	/* Write BLD configuration */
 	g2d_write(g2d, BLD_EN_CTL, bld.bld_en_ctrl.dwval);
@@ -3330,9 +3442,11 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 			      dma_addr_t src_dma, u32 src_width, u32 src_height,
 			      u32 src_pitch, u32 src_format,
 			      u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+			      u8 src_color_space,
 			      dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
 			      u32 dst_pitch, u32 dst_format,
-			      u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h)
+			      u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
+			      u8 dst_color_space)
 {
 	unsigned long timeout;
 	u32 mixer_ctl;
@@ -3393,7 +3507,29 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	/* V0 fillcolor not used in image mode */
 	g2d_write(g2d, V0_FILLC, 0x00000000);
 	
-	/* 3. Setup BLD (blender) - output size = destination blit size */
+	/* 3. Setup CSC (Color Space Conversion) for YUV formats */
+	u32 csc_ctl = 0;
+	
+	/* Configure CSC for destination if it's YUV */
+	if (sunxi_g2d_is_yuv_format(dst_format)) {
+		sunxi_g2d_configure_csc(g2d, 0, dst_color_space);
+		csc_ctl |= BIT(0);  /* Enable CSC0 for pipe0/UI2 */
+		dev_info(g2d->dev, "CSC0 enabled for YUV dst (color_space=%s)\n",
+			 dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+	}
+	
+	/* Configure CSC for source if it's YUV */
+	if (sunxi_g2d_is_yuv_format(src_format)) {
+		sunxi_g2d_configure_csc(g2d, 1, src_color_space);
+		csc_ctl |= BIT(1);  /* Enable CSC1 for pipe1/V0 */
+		dev_info(g2d->dev, "CSC1 enabled for YUV src (color_space=%s)\n",
+			 src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+	}
+	
+	if (csc_ctl)
+		g2d_write(g2d, BLD_CSC_CTL, csc_ctl);
+	
+	/* 4. Setup BLD (blender) - output size = destination blit size */
 	g2d_write(g2d, BLD_EN_CTL, g2d_read(g2d, BLD_EN_CTL) | 0x00000100);  /* Enable pipe 0 */
 	g2d_write(g2d, BLD_PREMUL_CTL, 0x00000000);
 	
@@ -3406,11 +3542,11 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, BLD_OUT_COLOR, g2d_read(g2d, BLD_OUT_COLOR) & ~BIT(1));  /* RGB mode */
 	g2d_write(g2d, BLD_CTL, 0x00000000);
 	
-	/* 4. Setup ROP (copy mode) */
+	/* 5. Setup ROP (copy mode) */
 	g2d_write(g2d, ROP_CTL, 0x000000f0);  /* ROP3: 0xF0 = S (source copy) */
 	g2d_write(g2d, ROP_INDEX0, 0x00061080);
 	
-	/* 5. Setup WB (writeback) with destination offset */
+	/* 6. Setup WB (writeback) with destination offset */
 	u32 dst_bpp;
 	u32 wb_att = 0;
 	switch (dst_format) {
@@ -3703,11 +3839,11 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 				     dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
 				     u32 src_pitch, u32 src_format,
 				     u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				     u8 src_alpha, u8 src_alpha_mode, u8 src_premul,
+				     u8 src_alpha, u8 src_alpha_mode, u8 src_premul, u8 src_color_space,
 				     dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
 				     u32 dst_pitch, u32 dst_format,
 				     u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				     u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul,
+				     u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
 				     dma_addr_t out_dma_addr,  /* Explicit output buffer (may == dst_dma_addr) */
 				     u32 out_w, u32 out_h, u32 out_pitch, u32 out_format,  /* Output dimensions */
 				     u32 flags,
@@ -3737,12 +3873,12 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 						    src_dma_addr, src_w, src_h,
 						    src_pitch, src_format,
 						    src_x, src_y, src_crop_w, src_crop_h,
-						    src_alpha, src_alpha_mode, src_premul,
+						    src_alpha, src_alpha_mode, src_premul, src_color_space,
 						    dst_dma_addr, dst_dma_addr, /* dst_base same as dst */
 						    dst_w, dst_h,
 						    dst_pitch, dst_format,
 						    dst_x, dst_y, blend_w, blend_h,
-						    dst_alpha, dst_alpha_mode, dst_premul,
+						    dst_alpha, dst_alpha_mode, dst_premul, dst_color_space,
 						    out_dma_addr, /* Write to out (may == dst for in-place) */
 						    out_w, out_h,
 						    out_pitch, out_format,
@@ -3756,9 +3892,11 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 					 src_dma_addr, src_w, src_h,
 					 src_pitch, src_format,
 					 src_x, src_y, src_crop_w, src_crop_h,
+					 src_color_space,
 					 out_dma_addr, out_w, out_h,  /* Write to out */
 					 out_pitch, out_format,
-					 dst_x, dst_y, blend_w, blend_h);
+					 dst_x, dst_y, blend_w, blend_h,
+					 dst_color_space);
 	}
 }
 
@@ -4068,9 +4206,11 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 					src_dma_addr, blit.src.width, blit.src.height,
 					src_pitch, blit.src.format,
 					blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
+					blit.src.color_space,
 					temp_dma_addr, temp_w, temp_h,
 					temp_pitch, blit.dst.format,
-					0, 0, temp_w, temp_h);  /* Fill entire temp buffer */
+					0, 0, temp_w, temp_h,  /* Fill entire temp buffer */
+					blit.dst.color_space);
 		
 		if (ret < 0) {
 			dev_err(g2d->dev, "STEP 1 (scale) failed: %d\n", ret);
@@ -4157,10 +4297,12 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 					src_pitch, blit.src.format,
 					blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
 					blit.src.alpha, blit.src.alpha_mode, blit.src.premul_mode,
+					blit.src.color_space,  /* YUV→RGB conversion mode */
 					dst_dma_addr, blit.dst.width, blit.dst.height,
 					dst_pitch, blit.dst.format,
 					blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h,
 					blit.dst.alpha, blit.dst.alpha_mode, blit.dst.premul_mode,
+					blit.dst.color_space,  /* YUV→RGB conversion mode */
 					out_dma_addr,  /* Explicit output buffer (or dst if none) */
 					out_w, out_h, out_pitch, out_format,  /* Output dimensions */
 					blit.flags,
@@ -4777,11 +4919,11 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 				       src_dma_addr, blend.src.width, blend.src.height,
 				       src_pitch, blend.src.format,
 				       0, 0, blend.src.crop_w, blend.src.crop_h,
-				       blend.src.alpha, blend.src.alpha_mode, blend.src.premul_mode,
+				       blend.src.alpha, blend.src.alpha_mode, blend.src.premul_mode, blend.src.color_space,
 				       dst_dma_addr, dst_base_addr, blend.dst.width, blend.dst.height,
 				       dst_pitch, blend.dst.format,
 				       0, 0, blend.dst.crop_w, blend.dst.crop_h,
-				       blend.dst.alpha, blend.dst.alpha_mode, blend.dst.premul_mode,
+				       blend.dst.alpha, blend.dst.alpha_mode, blend.dst.premul_mode, blend.dst.color_space,
 				       out_dma_addr, blend.out.width, blend.out.height,
 				       out_pitch, blend.out.format,
 				       blend.out.crop_w, blend.out.crop_h,

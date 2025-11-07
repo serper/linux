@@ -24,6 +24,7 @@ El driver `sunxi-g2d` proporciona acceso hardware al acelerador gráfico 2D de A
 ✅ **Gestión automática de poder** (clocks, reset, MBUS)  
 ✅ **Formatos RGB completos**: ARGB8888, XRGB8888, RGB565, RGB888, ARGB4444, ARGB1555, y variantes  
 ✅ **Formatos YUV/Video**: NV12, NV21, I420, YV12, YUYV, UYVY, NV16, y más (conversión YUV→RGB acelerada)  
+✅ **Conversión de Color Space**: BT.601 (SD) y BT.709 (HD) programables para video YUV  
 ✅ **API UAPI estable** en `/dev/g2d`
 
 ---
@@ -322,6 +323,7 @@ if (ret < 0) {
 - ✅ **Rotación**: `G2D_BLT_ROTATE_90/180/270` (se aplica después del escalado)
 - ✅ **Flip**: `G2D_BLT_FLIP_HORIZONTAL/VERTICAL` (combinable con rotación)
 - ✅ **Múltiples operaciones**: Llamar ioctl varias veces consecutivas
+- ✅ **Color Space YUV**: Campo `color_space` en `src`/`dst` para seleccionar BT.601/BT.709 (solo formatos YUV)
 
 **Casos de uso:**
 - Copiar imágenes completas entre buffers
@@ -695,7 +697,95 @@ ioctl(g2d_fd, G2D_IOC_BLIT, &blit);  /* YUV→RGB + scale en una operación */
 - Los formatos YUV requieren `stride[0]` (Y plane) y opcionalmente `stride[1]` (UV/U plane)
 - Para formatos planar (I420), se requiere `stride[2]` (V plane)
 - El hardware G2D convierte automáticamente YUV→RGB al escribir en buffer destino RGB
-- El color space usado es **BT.601** (estándar SD video)
+- El color space por defecto es **BT.601** (estándar SD video, compatible hacia atrás)
+
+### Color Space Conversion: BT.601 vs BT.709
+
+El hardware G2D incluye **3 unidades CSC (Color Space Conversion)** programables que permiten seleccionar entre diferentes estándares de conversión YUV→RGB.
+
+#### Espacios de Color Disponibles
+
+| Valor | Constante | Uso Recomendado | Descripción |
+|-------|-----------|----------------|-------------|
+| `0` | `G2D_COLOR_SPACE_BT601` | Video SD (480p, 576p) | Rec. ITU-R BT.601 - Colores más saturados |
+| `1` | `G2D_COLOR_SPACE_BT709` | Video HD (1080p, 4K) | Rec. ITU-R BT.709 - Colores más precisos para HD |
+
+**¿Cuándo usar cada uno?**
+- **BT.601**: Video de definición estándar (DVD, cámaras antiguas, transmisión SD)
+- **BT.709**: Video de alta definición (Blu-ray, transmisión HD/4K, cámaras modernas)
+
+#### Matrices de Conversión
+
+El hardware utiliza estas fórmulas para convertir YUV a RGB:
+
+**BT.601 (SD Video):**
+```
+R = 1.164 × Y               + 1.596 × Cr
+G = 1.164 × Y - 0.391 × Cb  - 0.813 × Cr
+B = 1.164 × Y + 2.018 × Cb
+```
+
+**BT.709 (HD Video):**
+```
+R = 1.164 × Y               + 1.793 × Cr
+G = 1.164 × Y - 0.213 × Cb  - 0.533 × Cr
+B = 1.164 × Y + 2.112 × Cb
+```
+
+**Diferencias visuales:**
+- BT.601 produce rojos más intensos y azules más saturados
+- BT.709 es más neutral y preciso para contenido moderno
+
+#### Uso en el API
+
+El campo `color_space` se especifica en `struct g2d_buf` tanto para source como destination:
+
+```c
+struct g2d_blit blit = {
+    .src = {
+        .width = 1920,
+        .height = 1080,
+        .format = G2D_FMT_YUV420_SP_UVUV,  /* NV12 */
+        .color_space = G2D_COLOR_SPACE_BT709,  /* Video HD */
+        .dma_fd = video_dmabuf_fd,
+        // ... resto de campos
+    },
+    .dst = {
+        .width = 1920,
+        .height = 1080,
+        .format = G2D_FMT_ARGB8888,
+        .color_space = G2D_COLOR_SPACE_BT601,  /* Valor por defecto (ignorado para RGB) */
+        .dma_fd = fb_dmabuf_fd,
+    },
+    // ... resto de campos
+};
+
+ioctl(g2d_fd, G2D_IOC_BLIT, &blit);
+```
+
+**Notas importantes:**
+- El campo `color_space` **solo afecta formatos YUV** (>= 0x20)
+- Para formatos RGB, el valor es ignorado
+- El valor por defecto es `0` (BT.601) para compatibilidad hacia atrás
+- El hardware habilita automáticamente las unidades CSC cuando detecta YUV
+
+#### Implementación Hardware
+
+El G2D tiene 3 unidades CSC independientes:
+- **CSC0**: Para pipe0/UI2 (destination layer)
+- **CSC1**: Para pipe1/V0 (source/video layer)
+- **CSC2**: Para output (post-blending)
+
+Cada unidad CSC programa:
+- **Matriz 3×3** de coeficientes (13-bit signed, formato S12)
+- **Vector de offset** de 3 valores (20-bit signed, formato S19)
+- Total: **12 registros** por unidad CSC
+
+El driver configura automáticamente la unidad CSC apropiada según el formato:
+```
+if (formato_src == YUV) → habilita CSC1 con color_space especificado
+if (formato_dst == YUV) → habilita CSC0 con color_space especificado
+```
 
 ---
 
@@ -1399,6 +1489,7 @@ cma=128M
 - [x] Gestión de energía automática
 - [x] **Formatos RGB completos** - Todos los formatos RGB (32/24/16-bit, variantes ARGB/ABGR/RGBA/BGRA)
 - [x] **Formatos YUV/Video** - NV12, NV21, I420, YUYV, UYVY, etc. con conversión YUV→RGB acelerada
+- [x] **Color Space Conversion (BT.709/BT.601)** - Matrices CSC programables para video SD/HD con conversión YUV→RGB correcta
 - [x] **Chromakey (Color Keying)** - Transparencia por color con rango configurable (pantalla verde/azul)
 - [x] **Buffer allocation desde driver** - `G2D_IOC_ALLOC_BUFFER` para simplificar API (opcional, DMA-BUF heaps sigue siendo recomendado)
 - [x] UAPI estable
@@ -1412,7 +1503,6 @@ cma=128M
 ### Futuro 📋
 
 - [ ] Operaciones asíncronas con job queue
-- [ ] Soporte BT.709 color space (actualmente solo BT.601)
 
 ---
 

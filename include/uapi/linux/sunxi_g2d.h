@@ -63,6 +63,15 @@ enum g2d_premul_mode {
 	G2D_PREMUL_ALPHA = 1,	/* Premultiplied alpha (color *= alpha) */
 };
 
+/* Color space for YUV to RGB conversion
+ * Only relevant for YUV formats (>= 0x20).
+ * Determines which matrix is used for color space conversion.
+ */
+enum g2d_color_space {
+	G2D_COLOR_SPACE_BT601 = 0,	/* BT.601 (SD video, SDTV) */
+	G2D_COLOR_SPACE_BT709 = 1,	/* BT.709 (HD video, HDTV) */
+};
+
 /* Porter-Duff blending modes
  * These define how source and destination are combined during alpha blending.
  * Only used when alpha blending is active.
@@ -102,7 +111,7 @@ struct g2d_buf {
 	__u8 alpha;		/* Global alpha value for this buffer (0-255) */
 	__u8 alpha_mode;	/* enum g2d_alpha_mode */
 	__u8 premul_mode;	/* enum g2d_premul_mode - alpha premultiplication */
-	__u8 _pad;		/* Padding for alignment to 4-byte boundary */
+	__u8 color_space;	/* enum g2d_color_space - YUV→RGB conversion (YUV formats only) */
 };
 
 /* G2D blit operation - UNIFIED operation for all blitting needs
