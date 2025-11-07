@@ -264,7 +264,15 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
                               dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
                               u32 dst_pitch, u32 dst_format,
                               u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
-                              u8 dst_color_space);/**
+                              u8 dst_color_space);
+
+static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
+				  dma_addr_t dst_dma,
+				  u32 width, u32 height,
+				  u32 pitch, u32 color,
+				  u32 color_format, u32 dst_format);
+
+/**
  * struct sunxi_g2d_dev - G2D device structure
  * 
  * Hardware resources:
@@ -351,6 +359,7 @@ struct sunxi_g2d_dev {
 	
 	/* Statistics */
 	u32 hw_version;
+	atomic64_t jobs_submitted;
 	atomic64_t jobs_done;
 	atomic64_t jobs_failed;
 };
@@ -370,6 +379,30 @@ enum g2d_job_type {
 	G2D_JOB_FILLRECT,
 };
 
+/* Internal job data structures */
+struct g2d_job_fillrect_data {
+	u32 width;
+	u32 height;
+	u32 pitch;
+	u32 color;
+	u32 color_format;
+	u32 dst_format;
+};
+
+struct g2d_job_blit_data {
+	u32 src_width;
+	u32 src_height;
+	u32 dst_width;
+	u32 dst_height;
+	u32 src_pitch;
+	u32 dst_pitch;
+	u32 out_pitch;
+	u32 src_format;
+	u32 dst_format;
+	u32 out_format;
+	/* Add other blit parameters as needed */
+};
+
 struct sunxi_g2d_job {
 	struct list_head node;
 	struct dma_fence *fence;
@@ -379,9 +412,14 @@ struct sunxi_g2d_job {
 	enum g2d_job_type type;
 	
 	union {
-		struct g2d_blit blit;
-		struct g2d_fillrect fillrect;
+		struct g2d_job_blit_data blit;
+		struct g2d_job_fillrect_data fillrect;
 	} data;
+	
+	/* DMA addresses for HW (mapped from DMA-BUFs) */
+	dma_addr_t src_dma;
+	dma_addr_t dst_dma;
+	dma_addr_t out_dma;  /* For 3-buffer blit */
 	
 	/* Imported DMA-BUFs to clean up */
 	struct dma_buf *src_dmabuf;
@@ -416,6 +454,33 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 	if (job->fence) {
 		pr_debug("sunxi_g2d: cleanup - dma_fence_put(%p)\n", job->fence);
 		dma_fence_put(job->fence);
+	}
+	
+	/* Release imported DMA-BUFs (if any) */
+	if (job->src_sgt && job->src_attach) {
+		dma_buf_unmap_attachment(job->src_attach, job->src_sgt, DMA_TO_DEVICE);
+		job->src_sgt = NULL;
+	}
+	if (job->src_attach && job->src_dmabuf) {
+		dma_buf_detach(job->src_dmabuf, job->src_attach);
+		job->src_attach = NULL;
+	}
+	if (job->src_dmabuf) {
+		dma_buf_put(job->src_dmabuf);
+		job->src_dmabuf = NULL;
+	}
+	
+	if (job->dst_sgt && job->dst_attach) {
+		dma_buf_unmap_attachment(job->dst_attach, job->dst_sgt, DMA_FROM_DEVICE);
+		job->dst_sgt = NULL;
+	}
+	if (job->dst_attach && job->dst_dmabuf) {
+		dma_buf_detach(job->dst_dmabuf, job->dst_attach);
+		job->dst_attach = NULL;
+	}
+	if (job->dst_dmabuf) {
+		dma_buf_put(job->dst_dmabuf);
+		job->dst_dmabuf = NULL;
 	}
 
 	pr_debug("sunxi_g2d: cleanup - free job %p\n", job);
@@ -816,6 +881,112 @@ static void sunxi_g2d_hw_disable(struct sunxi_g2d_dev *g2d)
 	dev_info(g2d->dev, "G2D hardware disabled\n");
 }
 
+/* ========== Async Job Queue Worker ========== */
+
+/**
+ * sunxi_g2d_job_worker - Workqueue worker for async job processing
+ * @work: work_struct embedded in sunxi_g2d_dev
+ * 
+ * Dequeues jobs from job_queue and executes them without blocking.
+ * When HW completes, IRQ handler will signal the fence and schedule next job.
+ */
+static void sunxi_g2d_job_worker(struct work_struct *work)
+{
+	struct sunxi_g2d_dev *g2d = container_of(work, struct sunxi_g2d_dev, job_work);
+	struct sunxi_g2d_job *job = NULL;
+	unsigned long flags;
+	int ret;
+	
+	/* Dequeue next job under lock */
+	spin_lock_irqsave(&g2d->job_lock, flags);
+	
+	/* Don't start new job if one is already running */
+	if (g2d->current_job) {
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+		return;
+	}
+	
+	/* Check if queue has jobs */
+	if (list_empty(&g2d->job_queue)) {
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+		return;
+	}
+	
+	/* Dequeue first job */
+	job = list_first_entry(&g2d->job_queue, struct sunxi_g2d_job, node);
+	list_del(&job->node);
+	g2d->current_job = job;
+	atomic64_inc(&g2d->jobs_submitted);
+	
+	spin_unlock_irqrestore(&g2d->job_lock, flags);
+	
+	dev_dbg(g2d->dev, "job_worker: executing job=%p type=%d fence=%p\n",
+		job, job->type, job->fence);
+	
+	/* Execute job based on type (HW will IRQ when done) */
+	switch (job->type) {
+	case G2D_JOB_FILLRECT:
+		ret = sunxi_g2d_do_fillrect(g2d,
+					    job->dst_dma,
+					    job->data.fillrect.width,
+					    job->data.fillrect.height,
+					    job->data.fillrect.pitch,
+					    job->data.fillrect.color,
+					    job->data.fillrect.color_format,
+					    job->data.fillrect.dst_format);
+		if (ret) {
+			dev_err(g2d->dev, "job_worker: fillrect failed: %d\n", ret);
+			dma_fence_set_error(job->fence, ret);
+			dma_fence_signal(job->fence);
+			
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			g2d->current_job = NULL;
+			atomic64_inc(&g2d->jobs_failed);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+			
+			/* Cleanup and try next job */
+			queue_work(g2d->job_wq, &job->cleanup_work);
+			queue_work(g2d->job_wq, &g2d->job_work);
+		}
+		break;
+		
+	case G2D_JOB_BLIT:
+		/* TODO: Implement async BLIT when porting BLIT IOCTL */
+		dev_err(g2d->dev, "job_worker: BLIT not yet implemented for async\n");
+		dma_fence_set_error(job->fence, -ENOSYS);
+		dma_fence_signal(job->fence);
+		
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		g2d->current_job = NULL;
+		atomic64_inc(&g2d->jobs_failed);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+		
+		queue_work(g2d->job_wq, &job->cleanup_work);
+		queue_work(g2d->job_wq, &g2d->job_work);
+		break;
+		
+	default:
+		dev_err(g2d->dev, "job_worker: unknown job type %d\n", job->type);
+		dma_fence_set_error(job->fence, -EINVAL);
+		dma_fence_signal(job->fence);
+		
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		g2d->current_job = NULL;
+		atomic64_inc(&g2d->jobs_failed);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+		
+		queue_work(g2d->job_wq, &job->cleanup_work);
+		queue_work(g2d->job_wq, &g2d->job_work);
+		break;
+	}
+	
+	/* On success, HW is now running. IRQ handler will:
+	 *  1. Signal job->fence
+	 *  2. Schedule cleanup_work
+	 *  3. Schedule next job_work
+	 */
+}
+
 /* ========== IRQ handler ========== */
 
 static irqreturn_t sunxi_g2d_irq(int irq, void *data)
@@ -949,6 +1120,9 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 				/* If queueing failed, perform cleanup synchronously (fallback) */
 				sunxi_g2d_job_cleanup_workfn(&job->cleanup_work);
 			}
+			
+			/* Schedule next job if queue not empty */
+			queue_work(g2d->job_wq, &g2d->job_work);
 			}
 		}
 	}
@@ -4541,24 +4715,27 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 	/* Adjust DMA address for dst_x/dst_y offset */
 	dma_addr += (fill.dst_y * pitch) + (fill.dst_x * bpp);
 	
-	/* v2.8.0: Switch to direct register writes (NO RCQ) for fillrect
-	 * Reason: RCQ mode on T113-S3 has issues - MIXER START never auto-clears
-	 * BSP also uses direct writes for fillrect, not RCQ
+	/* v2.9.17: ASYNC JOB QUEUE - Create job, enqueue, and return immediately
+	 * 
+	 * Instead of executing synchronously, we:
+	 * 1. Create job with all parameters
+	 * 2. Add to job_queue
+	 * 3. Schedule job_worker
+	 * 4. Return fence_fd immediately (userspace can poll/wait on it)
 	 */
-	ret = sunxi_g2d_do_fillrect(g2d, dma_addr, width, height, pitch, 
-				    fill.color, fill.color_format, fill.dst.format);
-	
-	/* Create job + fence and return fence_fd_out to userspace. */
 	{
 		struct sunxi_g2d_job *job;
 		int out_fd = -1;
+		unsigned long flags;
 
+		/* Allocate job structure */
 		job = kzalloc(sizeof(*job), GFP_KERNEL);
 		if (!job) {
 			ret = -ENOMEM;
 			goto err_unmap;
 		}
 
+		/* Create DMA fence for this job */
 		job->fence = sunxi_g2d_fence_create(g2d);
 		if (!job->fence) {
 			kfree(job);
@@ -4566,6 +4743,7 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 			goto err_unmap;
 		}
 
+		/* Reserve file descriptor for userspace */
 		out_fd = get_unused_fd_flags(O_CLOEXEC);
 		if (out_fd < 0) {
 			dma_fence_put(job->fence);
@@ -4574,6 +4752,7 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 			goto err_unmap;
 		}
 
+		/* Create sync_file wrapping the fence */
 		job->fence_fd = out_fd;
 		job->sync_file = sync_file_create(job->fence);
 		if (!job->sync_file) {
@@ -4584,43 +4763,91 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 			goto err_unmap;
 		}
 
-		/* Trace sync_file creation and fd reservation */
-		dev_dbg(g2d->dev, "fillrect: created job=%p sync_file=%p file=%p fence=%p reserved fd=%d\n",
-			 job, job->sync_file, job->sync_file ? job->sync_file->file : NULL,
-			 job->fence, out_fd);
-
-		/* Install FD into current process now (process context) so IRQ won't
-		 * need to touch file-descriptors. After fd_install, the fd table owns
-		 * the file ref; clear job->sync_file so cleanup won't fput it.
-		 */
+		/* Install FD in process context (CRITICAL: must be before queueing) */
 		if (job->sync_file && job->sync_file->file) {
-			struct file *tmpf = job->sync_file->file;
-			if (job->fence) {
-				struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-				dev_info(g2d->dev, "fillrect: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
-						 out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
-			} else {
-				dev_info(g2d->dev, "fillrect: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
-						 out_fd, tmpf, job, task_tgid_nr(current));
-			}
-			fd_install(out_fd, tmpf);
-			/* After fd_install the fd table owns the file ref */
-			job->sync_file = NULL;
+			fd_install(out_fd, job->sync_file->file);
+			job->sync_file = NULL;  /* fd table owns the ref now */
 		} else {
-			dev_err(g2d->dev, "fillrect: unexpected NULL sync_file/file for job=%p fd=%d\n", job, out_fd);
+			dev_err(g2d->dev, "fillrect: NULL sync_file, cannot install fd\n");
+			put_unused_fd(out_fd);
+			dma_fence_put(job->fence);
+			kfree(job);
+			ret = -ENOMEM;
+			goto err_unmap;
 		}
 
-		spin_lock(&g2d->job_lock);
-		g2d->current_job = job;
-		spin_unlock(&g2d->job_lock);
+		/* Fill job with operation parameters */
+		job->type = G2D_JOB_FILLRECT;
+		job->dst_dma = dma_addr;
+		job->data.fillrect.width = width;
+		job->data.fillrect.height = height;
+		job->data.fillrect.pitch = pitch;
+		job->data.fillrect.color = fill.color;
+		job->data.fillrect.color_format = fill.color_format;
+		job->data.fillrect.dst_format = fill.dst.format;
+		
+		/* Store DMA-BUF references for cleanup */
+		job->dst_dmabuf = dmabuf;
+		job->dst_attach = attach;
+		job->dst_sgt = sgt;
+		
+		/* Enqueue job (under spinlock) */
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		list_add_tail(&job->node, &g2d->job_queue);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
 
+		/* Schedule worker to process the job */
+		queue_work(g2d->job_wq, &g2d->job_work);
+
+		/* Return fence_fd to userspace */
 		fill.fence_fd_out = job->fence_fd;
+		
+		dev_info(g2d->dev, "fillrect: enqueued job=%p fence_fd=%d (async)\n",
+			 job, out_fd);
 	}
 	
+	/* Copy result to userspace */
 	if (copy_to_user((void __user *)arg, &fill, sizeof(fill))) {
 		ret = -EFAULT;
-		goto err_unmap;
+		/* CRITICAL: On copy_to_user failure, we need to abort the job.
+		 * The job is already enqueued, so we need to remove it and cleanup.
+		 */
+		goto err_abort_job;
 	}
+	
+	/* SUCCESS: Job enqueued, DMA-BUFs transferred to job ownership.
+	 * Return immediately WITHOUT cleanup - job_worker will use the buffers
+	 * and cleanup_work will release them after HW completion.
+	 */
+	return 0;
+
+err_abort_job:
+	/* Job was enqueued but copy_to_user failed - need to abort */
+	{
+		struct sunxi_g2d_job *job_to_abort = NULL;
+		unsigned long flags;
+		
+		/* Find and remove the job we just added */
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		if (!list_empty(&g2d->job_queue)) {
+			struct sunxi_g2d_job *last_job = list_last_entry(&g2d->job_queue, 
+									 struct sunxi_g2d_job, node);
+			/* Remove only if it matches our fence_fd */
+			if (last_job && last_job->fence_fd == fill.fence_fd_out) {
+				list_del(&last_job->node);
+				job_to_abort = last_job;
+			}
+		}
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+		
+		/* Cleanup aborted job outside lock */
+		if (job_to_abort) {
+			dma_fence_set_error(job_to_abort->fence, -EFAULT);
+			dma_fence_signal(job_to_abort->fence);
+			queue_work(g2d->job_wq, &job_to_abort->cleanup_work);
+		}
+	}
+	/* Fallthrough to cleanup on error paths before job creation */
 	
 err_unmap:
 	dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
@@ -5511,6 +5738,7 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	init_waitqueue_head(&g2d->irq_wait);
 	atomic_set(&g2d->irq_done, 0);
 	atomic_set(&g2d->users, 0);
+	atomic64_set(&g2d->jobs_submitted, 0);
 	atomic64_set(&g2d->jobs_done, 0);
 	atomic64_set(&g2d->jobs_failed, 0);
 
@@ -5546,6 +5774,10 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Failed to create workqueue\n");
 		return -ENOMEM;
 	}
+	
+	/* Initialize job worker */
+	INIT_WORK(&g2d->job_work, sunxi_g2d_job_worker);
+	dev_info(&pdev->dev, "Job worker initialized for async operations\n");
 	
 	/* Register character device */
 	ret = alloc_chrdev_region(&g2d->dev_num, 0, 1, DRIVER_NAME);
