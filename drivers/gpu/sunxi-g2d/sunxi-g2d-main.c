@@ -960,6 +960,192 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 /* ========== G2D Operations ========== */
 
 /**
+ * sunxi_g2d_format_to_hw - Convert UAPI format to hardware format value
+ * @fmt: UAPI pixel format (enum g2d_pixel_format)
+ * @bpp: Output bytes per pixel (optional, can be NULL)
+ * 
+ * Returns: Hardware format value, or -EINVAL if unsupported
+ * 
+ * Supports all RGB and YUV formats that the G2D hardware can handle.
+ * YUV formats (>= 0x20) are only valid for V0 (video) layer.
+ */
+static int sunxi_g2d_format_to_hw(u32 fmt, u32 *bpp)
+{
+	u32 hw_fmt;
+	u32 bytes_pp = 0;
+	
+	switch (fmt) {
+	/* RGB formats - 32bpp */
+	case G2D_FMT_ARGB8888:
+		hw_fmt = G2D_FORMAT_ARGB8888;  /* 0x00 */
+		bytes_pp = 4;
+		break;
+	case G2D_FMT_ABGR8888:
+		hw_fmt = G2D_FORMAT_ABGR8888;  /* 0x01 */
+		bytes_pp = 4;
+		break;
+	case G2D_FMT_RGBA8888:
+		hw_fmt = G2D_FORMAT_RGBA8888;  /* 0x02 */
+		bytes_pp = 4;
+		break;
+	case G2D_FMT_BGRA8888:
+		hw_fmt = G2D_FORMAT_BGRA8888;  /* 0x03 */
+		bytes_pp = 4;
+		break;
+	case G2D_FMT_XRGB8888:
+		hw_fmt = G2D_FORMAT_XRGB8888;  /* 0x04 */
+		bytes_pp = 4;
+		break;
+	case G2D_FMT_XBGR8888:
+		hw_fmt = G2D_FORMAT_XBGR8888;  /* 0x05 */
+		bytes_pp = 4;
+		break;
+	case G2D_FMT_RGBX8888:
+		hw_fmt = G2D_FORMAT_RGBX8888;  /* 0x06 */
+		bytes_pp = 4;
+		break;
+	case G2D_FMT_BGRX8888:
+		hw_fmt = G2D_FORMAT_BGRX8888;  /* 0x07 */
+		bytes_pp = 4;
+		break;
+		
+	/* RGB formats - 24bpp */
+	case G2D_FMT_RGB888:
+		hw_fmt = G2D_FORMAT_RGB888;  /* 0x08 */
+		bytes_pp = 3;
+		break;
+	case G2D_FMT_BGR888:
+		hw_fmt = G2D_FORMAT_BGR888;  /* 0x09 */
+		bytes_pp = 3;
+		break;
+		
+	/* RGB formats - 16bpp */
+	case G2D_FMT_RGB565:
+		hw_fmt = G2D_FORMAT_RGB565;  /* 0x0A */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_BGR565:
+		hw_fmt = G2D_FORMAT_BGR565;  /* 0x0B */
+		bytes_pp = 2;
+		break;
+		
+	/* RGB formats - 16bpp with alpha */
+	case G2D_FMT_ARGB4444:
+		hw_fmt = G2D_FORMAT_ARGB4444;  /* 0x0C */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_ABGR4444:
+		hw_fmt = G2D_FORMAT_ABGR4444;  /* 0x0D */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_RGBA4444:
+		hw_fmt = G2D_FORMAT_RGBA4444;  /* 0x0E */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_BGRA4444:
+		hw_fmt = G2D_FORMAT_BGRA4444;  /* 0x0F */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_ARGB1555:
+		hw_fmt = G2D_FORMAT_ARGB1555;  /* 0x10 */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_ABGR1555:
+		hw_fmt = G2D_FORMAT_ABGR1555;  /* 0x11 */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_RGBA5551:
+		hw_fmt = G2D_FORMAT_RGBA5551;  /* 0x12 */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_BGRA5551:
+		hw_fmt = G2D_FORMAT_BGRA5551;  /* 0x13 */
+		bytes_pp = 2;
+		break;
+		
+	/* YUV formats - Interleaved (packed) 422 */
+	case G2D_FMT_YUV422_I_YVYU:
+		hw_fmt = G2D_FORMAT_IYUV422_V0Y1U0Y0;  /* 0x20 */
+		bytes_pp = 2;  /* 2 bytes per pixel (averaged) */
+		break;
+	case G2D_FMT_YUV422_I_YUYV:
+		hw_fmt = G2D_FORMAT_IYUV422_Y1V0Y0U0;  /* 0x21 */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_YUV422_I_UYVY:
+		hw_fmt = G2D_FORMAT_IYUV422_U0Y1V0Y0;  /* 0x22 */
+		bytes_pp = 2;
+		break;
+	case G2D_FMT_YUV422_I_VYUY:
+		hw_fmt = G2D_FORMAT_IYUV422_Y1U0Y0V0;  /* 0x23 */
+		bytes_pp = 2;
+		break;
+		
+	/* YUV formats - Semi-planar 422 */
+	case G2D_FMT_YUV422_SP_UVUV:
+		hw_fmt = G2D_FORMAT_YUV422UVC_V1U1V0U0;  /* 0x24 */
+		bytes_pp = 1;  /* Y plane: 1 byte per pixel */
+		break;
+	case G2D_FMT_YUV422_SP_VUVU:
+		hw_fmt = G2D_FORMAT_YUV422UVC_U1V1U0V0;  /* 0x25 */
+		bytes_pp = 1;
+		break;
+		
+	/* YUV formats - Planar 422 */
+	case G2D_FMT_YUV422_P:
+		hw_fmt = G2D_FORMAT_YUV422_PLANAR;  /* 0x26 */
+		bytes_pp = 1;  /* Y plane: 1 byte per pixel */
+		break;
+		
+	/* YUV formats - Semi-planar 420 */
+	case G2D_FMT_YUV420_SP_UVUV:
+		hw_fmt = G2D_FORMAT_YUV420UVC_V1U1V0U0;  /* 0x28 */
+		bytes_pp = 1;
+		break;
+	case G2D_FMT_YUV420_SP_VUVU:
+		hw_fmt = G2D_FORMAT_YUV420UVC_U1V1U0V0;  /* 0x29 */
+		bytes_pp = 1;
+		break;
+		
+	/* YUV formats - Planar 420 (I420/YV12) */
+	case G2D_FMT_YUV420_P:
+		hw_fmt = G2D_FORMAT_YUV420_PLANAR;  /* 0x2A */
+		bytes_pp = 1;
+		break;
+		
+	/* YUV formats - Semi-planar 411 */
+	case G2D_FMT_YUV411_SP_UVUV:
+		hw_fmt = G2D_FORMAT_YUV411UVC_V1U1V0U0;  /* 0x2C */
+		bytes_pp = 1;
+		break;
+	case G2D_FMT_YUV411_SP_VUVU:
+		hw_fmt = G2D_FORMAT_YUV411UVC_U1V1U0V0;  /* 0x2D */
+		bytes_pp = 1;
+		break;
+		
+	/* YUV formats - Planar 411 */
+	case G2D_FMT_YUV411_P:
+		hw_fmt = G2D_FORMAT_YUV411_PLANAR;  /* 0x2E */
+		bytes_pp = 1;
+		break;
+		
+	/* Monochrome formats */
+	case G2D_FMT_8BPP_MONO:
+		hw_fmt = G2D_FORMAT_Y8;  /* 0x30 - Grayscale */
+		bytes_pp = 1;
+		break;
+		
+	default:
+		return -EINVAL;
+	}
+	
+	if (bpp)
+		*bpp = bytes_pp;
+		
+	return hw_fmt;
+}
+
+/**
  * sunxi_g2d_do_fillrect - Execute fillrect operation (DIRECT mode)
  * 
  * @color_format: Format of the color value (enum g2d_pixel_format from UAPI)
@@ -978,37 +1164,17 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 	union g2d_mixer_ctrl mixer_ctrl = {0};
 	union g2d_mixer_interrupt mixer_int = {0};
 	unsigned long timeout;
-	u32 color_fmt_val, dst_fmt_val;
+	int color_fmt_val, dst_fmt_val;
 	
-	/* Convert color format from UAPI enum to hardware value
-	 * Apply same mapping as in alpha blend: ARGB→ABGR, XRGB→XBGR
-	 */
-	switch (color_format) {
-	case G2D_FMT_ARGB8888:
-		color_fmt_val = G2D_FORMAT_ABGR8888;
-		break;
-	case G2D_FMT_XRGB8888:
-		color_fmt_val = G2D_FORMAT_XBGR8888;
-		break;
-	case G2D_FMT_RGB565:
-		color_fmt_val = G2D_FORMAT_RGB565;
-		break;
-	default:
+	/* Convert formats using helper function */
+	color_fmt_val = sunxi_g2d_format_to_hw(color_format, NULL);
+	if (color_fmt_val < 0) {
 		dev_err(g2d->dev, "Unsupported color format: %u\n", color_format);
 		return -EINVAL;
 	}
 	
-	switch (dst_format) {
-	case G2D_FMT_ARGB8888:
-		dst_fmt_val = G2D_FORMAT_ABGR8888;
-		break;
-	case G2D_FMT_XRGB8888:
-		dst_fmt_val = G2D_FORMAT_XBGR8888;
-		break;
-	case G2D_FMT_RGB565:
-		dst_fmt_val = G2D_FORMAT_RGB565;
-		break;
-	default:
+	dst_fmt_val = sunxi_g2d_format_to_hw(dst_format, NULL);
+	if (dst_fmt_val < 0) {
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
 		return -EINVAL;
 	}
@@ -1228,33 +1394,15 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 	g2d_top = (volatile struct g2d_top_reg *)g2d->base;
 	g2d_mixer = (volatile struct g2d_mixer_glb_reg *)(g2d->base + G2D_MIXER);
 	
-	/* Convert color format from UAPI enum to hardware value */
-	switch (color_format) {
-	case G2D_FMT_ARGB8888:
-		color_fmt_val = G2D_FORMAT_ABGR8888;
-		break;
-	case G2D_FMT_XRGB8888:
-		color_fmt_val = G2D_FORMAT_XBGR8888;
-		break;
-	case G2D_FMT_RGB565:
-		color_fmt_val = G2D_FORMAT_RGB565;
-		break;
-	default:
+	/* Convert formats using helper function */
+	int color_fmt_val = sunxi_g2d_format_to_hw(color_format, NULL);
+	if (color_fmt_val < 0) {
 		dev_err(g2d->dev, "Unsupported color format: %u\n", color_format);
 		return -EINVAL;
 	}
 	
-	switch (dst_format) {
-	case G2D_FMT_ARGB8888:
-		dst_fmt_val = G2D_FORMAT_ABGR8888;
-		break;
-	case G2D_FMT_XRGB8888:
-		dst_fmt_val = G2D_FORMAT_XBGR8888;
-		break;
-	case G2D_FMT_RGB565:
-		dst_fmt_val = G2D_FORMAT_RGB565;
-		break;
-	default:
+	int dst_fmt_val = sunxi_g2d_format_to_hw(dst_format, NULL);
+	if (dst_fmt_val < 0) {
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
 		return -EINVAL;
 	}
@@ -2291,7 +2439,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	struct g2d_mixer_bld_reg bld = {0};    /* Blender */
 	struct g2d_mixer_write_back_reg wb = {0}; /* Writeback (out) - WRITE ONLY */
 
-	u32 src_fmt_val, dst_fmt_val, out_fmt_val;
+	int src_fmt_val, dst_fmt_val, out_fmt_val;
 	dma_addr_t ui2_addr, v0_addr, wb_addr;
 	u32 ui2_bpp, v0_bpp, wb_bpp;
 	unsigned long timeout;
@@ -2439,48 +2587,21 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		return ret;
 	}
 
-	/* Map format to hardware value - SAME as fillrect */
-	switch (src_format) {
-	case G2D_FMT_ARGB8888:
-		src_fmt_val = 0x0;
-		break;
-	case G2D_FMT_XRGB8888:
-		src_fmt_val = 0x4;
-		break;
-	case G2D_FMT_RGB565:
-		src_fmt_val = 0xA;
-		break;
-	default:
+	/* Map formats to hardware values using helper function */
+	src_fmt_val = sunxi_g2d_format_to_hw(src_format, NULL);
+	if (src_fmt_val < 0) {
 		dev_err(g2d->dev, "Unsupported source format: %u\n", src_format);
 		return -EINVAL;
 	}
 
-	switch (dst_format) {
-	case G2D_FMT_ARGB8888:
-		dst_fmt_val = 0x0;
-		break;
-	case G2D_FMT_XRGB8888:
-		dst_fmt_val = 0x4;
-		break;
-	case G2D_FMT_RGB565:
-		dst_fmt_val = 0xA;
-		break;
-	default:
+	dst_fmt_val = sunxi_g2d_format_to_hw(dst_format, &ui2_bpp);
+	if (dst_fmt_val < 0) {
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
 		return -EINVAL;
 	}
 
-	switch (out_format) {
-	case G2D_FMT_ARGB8888:
-		out_fmt_val = 0x0;
-		break;
-	case G2D_FMT_XRGB8888:
-		out_fmt_val = 0x4;
-		break;
-	case G2D_FMT_RGB565:
-		out_fmt_val = 0xA;
-		break;
-	default:
+	out_fmt_val = sunxi_g2d_format_to_hw(out_format, NULL);
+	if (out_fmt_val < 0) {
 		dev_err(g2d->dev, "Unsupported output format: %u\n", out_format);
 		return -EINVAL;
 	}
@@ -2501,24 +2622,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 	/* === Configure UI2 (Pipe0: background from temp buffer) === */
 
-	/* Calculate bytes per pixel for UI2 */
-	switch (dst_format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		ui2_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		ui2_bpp = 2;
-		break;
-	default:
-		ui2_bpp = 4;
-		break;
-	}
-
 	/* UI2 reads from dst buffer at the position where the ball is (dst_x, dst_y)
 	 * IMPORTANT: Apply dst_x/dst_y offset to the address
+	 * Note: ui2_bpp was calculated by sunxi_g2d_format_to_hw() above
 	 */
 	ui2_addr = dst_dma_addr + (dst_y * dst_pitch) + (dst_x * ui2_bpp);
 

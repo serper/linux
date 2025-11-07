@@ -22,7 +22,8 @@ El driver `sunxi-g2d` proporciona acceso hardware al acelerador gráfico 2D de A
 ✅ **TRANSFORMACIONES**: Rotación (90°/180°/270°) y flip horizontal/vertical  
 ✅ **VSU (Video Scaler Unit)**: Escalado hardware con filtros bicúbicos  
 ✅ **Gestión automática de poder** (clocks, reset, MBUS)  
-✅ **Múltiples formatos de píxeles** (ARGB8888, XRGB8888, RGB565, etc.)  
+✅ **Formatos RGB completos**: ARGB8888, XRGB8888, RGB565, RGB888, ARGB4444, ARGB1555, y variantes  
+✅ **Formatos YUV/Video**: NV12, NV21, I420, YV12, YUYV, UYVY, NV16, y más (conversión YUV→RGB acelerada)  
 ✅ **API UAPI estable** en `/dev/g2d`
 
 ---
@@ -446,16 +447,117 @@ close(dmabuf_fd);
 
 ## Formatos de Píxeles Soportados
 
+El driver soporta una amplia gama de formatos RGB y YUV para procesamiento de gráficos y video.
+
+### Formatos RGB
+
 | Formato | Enum | Descripción | Bytes/píxel |
 |---------|------|-------------|-------------|
-| ARGB8888 | `G2D_FMT_ARGB8888` | 8 bits alpha, RGB | 4 |
-| XRGB8888 | `G2D_FMT_XRGB8888` | Sin alpha (X=ignorado) | 4 |
+| **Formatos 32-bit** |
+| ARGB8888 | `G2D_FMT_ARGB8888` | 8 bits alpha + RGB | 4 |
+| ABGR8888 | `G2D_FMT_ABGR8888` | 8 bits alpha + BGR | 4 |
 | RGBA8888 | `G2D_FMT_RGBA8888` | RGB + 8 bits alpha | 4 |
-| RGB565 | `G2D_FMT_RGB565` | 5-6-5 bits RGB | 2 |
+| BGRA8888 | `G2D_FMT_BGRA8888` | BGR + 8 bits alpha | 4 |
+| XRGB8888 | `G2D_FMT_XRGB8888` | Sin alpha (X=ignorado) + RGB | 4 |
+| XBGR8888 | `G2D_FMT_XBGR8888` | Sin alpha + BGR | 4 |
+| RGBX8888 | `G2D_FMT_RGBX8888` | RGB + X ignorado | 4 |
+| BGRX8888 | `G2D_FMT_BGRX8888` | BGR + X ignorado | 4 |
+| **Formatos 24-bit** |
 | RGB888 | `G2D_FMT_RGB888` | 8 bits RGB (packed) | 3 |
-| ARGB1555 | `G2D_FMT_ARGB1555` | 1 bit alpha, 5-5-5 RGB | 2 |
+| BGR888 | `G2D_FMT_BGR888` | 8 bits BGR (packed) | 3 |
+| **Formatos 16-bit** |
+| RGB565 | `G2D_FMT_RGB565` | 5-6-5 bits RGB | 2 |
+| BGR565 | `G2D_FMT_BGR565` | 5-6-5 bits BGR | 2 |
+| ARGB4444 | `G2D_FMT_ARGB4444` | 4-4-4-4 bits ARGB | 2 |
+| ABGR4444 | `G2D_FMT_ABGR4444` | 4-4-4-4 bits ABGR | 2 |
+| RGBA4444 | `G2D_FMT_RGBA4444` | 4-4-4-4 bits RGBA | 2 |
+| BGRA4444 | `G2D_FMT_BGRA4444` | 4-4-4-4 bits BGRA | 2 |
+| ARGB1555 | `G2D_FMT_ARGB1555` | 1 bit alpha + 5-5-5 RGB | 2 |
+| ABGR1555 | `G2D_FMT_ABGR1555` | 1 bit alpha + 5-5-5 BGR | 2 |
+| RGBA5551 | `G2D_FMT_RGBA5551` | 5-5-5 RGB + 1 bit alpha | 2 |
+| BGRA5551 | `G2D_FMT_BGRA5551` | 5-5-5 BGR + 1 bit alpha | 2 |
 
-**Nota sobre YUV:** Los formatos YUV están definidos en el UAPI pero no están probados aún.
+### Formatos YUV (Video)
+
+Los formatos YUV son críticos para procesamiento de video. Todos están soportados por el hardware G2D.
+
+**⚠️ IMPORTANTE**: Los formatos YUV solo pueden usarse en la **capa V0 (source/video layer)**. La capa UI2 (destination) debe usar formatos RGB.
+
+| Formato | Enum | Descripción | Subsampling | Notas |
+|---------|------|-------------|-------------|-------|
+| **Formatos Interleaved (Packed) 4:2:2** |
+| YVYU | `G2D_FMT_YUV422_I_YVYU` | Y-V-Y-U entrelazado | 4:2:2 | V antes de U |
+| YUYV | `G2D_FMT_YUV422_I_YUYV` | Y-U-Y-V entrelazado | 4:2:2 | U antes de V |
+| UYVY | `G2D_FMT_YUV422_I_UYVY` | U-Y-V-Y entrelazado | 4:2:2 | U primero |
+| VYUY | `G2D_FMT_YUV422_I_VYUY` | V-Y-U-Y entrelazado | 4:2:2 | V primero |
+| **Formatos Semi-Planar 4:2:2 (NV16)** |
+| YUV422_SP_UVUV | `G2D_FMT_YUV422_SP_UVUV` | Y plane + UV interleaved | 4:2:2 | NV16 |
+| YUV422_SP_VUVU | `G2D_FMT_YUV422_SP_VUVU` | Y plane + VU interleaved | 4:2:2 | NV61 |
+| **Formatos Planar 4:2:2** |
+| YUV422_P | `G2D_FMT_YUV422_P` | Y, U, V planes separados | 4:2:2 | I422/YV16 |
+| **Formatos Semi-Planar 4:2:0 (NV12/NV21)** |
+| YUV420_SP_UVUV | `G2D_FMT_YUV420_SP_UVUV` | Y plane + UV interleaved | 4:2:0 | **NV12** ⭐ |
+| YUV420_SP_VUVU | `G2D_FMT_YUV420_SP_VUVU` | Y plane + VU interleaved | 4:2:0 | **NV21** ⭐ |
+| **Formatos Planar 4:2:0 (I420/YV12)** |
+| YUV420_P | `G2D_FMT_YUV420_P` | Y, U, V planes separados | 4:2:0 | **I420/YV12** ⭐ |
+| **Formatos Semi-Planar 4:1:1** |
+| YUV411_SP_UVUV | `G2D_FMT_YUV411_SP_UVUV` | Y plane + UV interleaved | 4:1:1 | Raro |
+| YUV411_SP_VUVU | `G2D_FMT_YUV411_SP_VUVU` | Y plane + VU interleaved | 4:1:1 | Raro |
+| **Formatos Planar 4:1:1** |
+| YUV411_P | `G2D_FMT_YUV411_P` | Y, U, V planes separados | 4:1:1 | Raro |
+| **Monocromo** |
+| 8BPP_MONO | `G2D_FMT_8BPP_MONO` | Grayscale 8-bit | Mono | Y solamente |
+
+⭐ **Formatos más comunes para video**:
+- **NV12** (`YUV420_SP_UVUV`): Usado por FFmpeg, GStreamer, V4L2, cámaras
+- **NV21** (`YUV420_SP_VUVU`): Usado por Android Camera API
+- **I420/YV12** (`YUV420_P`): Formato planar estándar
+
+### Uso de Formatos YUV
+
+**Ejemplo: Escalar y convertir NV12 (video) a ARGB8888 (framebuffer)**
+
+```c
+struct g2d_blit blit = {
+    .src = {
+        .width = 1920,
+        .height = 1080,
+        .format = G2D_FMT_YUV420_SP_UVUV,  /* NV12 desde cámara/decoder */
+        .stride[0] = 1920,     /* Y plane stride */
+        .stride[1] = 1920,     /* UV plane stride */
+        .dma_fd = video_dmabuf_fd,
+        .crop_x = 0,
+        .crop_y = 0,
+        .crop_w = 1920,
+        .crop_h = 1080,
+    },
+    .dst = {
+        .width = 800,
+        .height = 480,
+        .format = G2D_FMT_ARGB8888,  /* Framebuffer RGB */
+        .stride[0] = 800 * 4,
+        .dma_fd = fb_dmabuf_fd,
+    },
+    .dst_x = 0,
+    .dst_y = 0,
+    .dst_w = 800,   /* Downscale 1920→800 */
+    .dst_h = 480,   /* Downscale 1080→480 */
+};
+
+ioctl(g2d_fd, G2D_IOC_BLIT, &blit);  /* YUV→RGB + scale en una operación */
+```
+
+**Ventajas del soporte YUV:**
+- ✅ Conversión YUV→RGB acelerada por hardware
+- ✅ Escalado y conversión en un solo paso (sin buffer intermedio)
+- ✅ Procesamiento eficiente de video (decoders producen YUV)
+- ✅ Ahorro de memoria vs RGB (4:2:0 usa 1.5 bytes/píxel vs 4 bytes/píxel)
+
+**Notas técnicas:**
+- Los formatos YUV requieren `stride[0]` (Y plane) y opcionalmente `stride[1]` (UV/U plane)
+- Para formatos planar (I420), se requiere `stride[2]` (V plane)
+- El hardware G2D convierte automáticamente YUV→RGB al escribir en buffer destino RGB
+- El color space usado es **BT.601** (estándar SD video)
 
 ---
 
@@ -944,21 +1046,22 @@ cma=128M
 - [x] **Alpha modes** - GLOBAL_ALPHA, PIXEL_ALPHA, MIXER_ALPHA
 - [x] DMA-BUF import
 - [x] Gestión de poder automática
-- [x] Múltiples formatos de píxeles (ARGB8888, XRGB8888, RGB565)
+- [x] **Formatos RGB completos** - Todos los formatos RGB (32/24/16-bit, variantes ARGB/ABGR/RGBA/BGRA)
+- [x] **Formatos YUV/Video** - NV12, NV21, I420, YUYV, UYVY, etc. con conversión YUV→RGB acelerada
 - [x] UAPI estable
 
 ### En Desarrollo 🚧
 
 - [ ] **Sync fences** - Para sincronización con DRM/Wayland (fence_fd_out en UAPI)
-- [ ] **Alpha per-pixel** - Completar soporte para PIXEL_ALPHA con ARGB
+- [ ] **Demos YUV** - Ejemplos de procesamiento de video NV12→RGB
 
 ### Futuro 📋
 
-- [ ] Color space conversion (RGB ↔ YUV) - Hardware soportado
 - [ ] Operaciones asíncronas con job queue
 - [ ] Premultiplicación de alpha (ya en hardware, falta exposición en UAPI)
 - [ ] Color keying (chromakey)
 - [ ] Buffer allocation desde driver (simplificar API, opcional)
+- [ ] Soporte BT.709 color space (actualmente solo BT.601)
 
 ---
 
