@@ -13,10 +13,11 @@ El driver `sunxi-g2d` proporciona acceso hardware al acelerador gráfico 2D de A
 
 ### Características Implementadas
 
-✅ **Operaciones sincrónicas con IRQ** (no busy-wait)  
+✅ **Operaciones ASÍNCRONAS con Job Queue (v2.9.17+)** - No bloquean userspace  
+✅ **Fence Synchronization** - Retorna fence_fd para sincronización explícita  
 ✅ **Soporte DMA-BUF** para zero-copy con otros subsistemas  
-✅ **FILLRECT**: Relleno de rectángulos con color sólido  
-✅ **BLIT UNIFICADO**: Copia, escalado, rotación y alpha blending en una sola operación  
+✅ **FILLRECT**: Relleno de rectángulos con color sólido (async)  
+🔄 **BLIT UNIFICADO**: Copia, escalado, rotación y alpha blending (async pending)  
 ✅ **ALPHA BLENDING**: 12 modos Porter-Duff (SRCOVER default, COPY, DST, XOR, etc.)  
 ✅ **3-BUFFER COMPOSITING**: Buffer destino preservado (src + dst → out)  
 ✅ **TRANSFORMACIONES**: Rotación (90°/180°/270°) y flip horizontal/vertical  
@@ -26,6 +27,42 @@ El driver `sunxi-g2d` proporciona acceso hardware al acelerador gráfico 2D de A
 ✅ **Formatos YUV/Video**: NV12, NV21, I420, YV12, YUYV, UYVY, NV16, y más (conversión YUV→RGB acelerada)  
 ✅ **Conversión de Color Space**: BT.601 (SD) y BT.709 (HD) programables para video YUV  
 ✅ **API UAPI estable** en `/dev/g2d`
+
+### 🆕 Modo Asíncrono (v2.9.17+)
+
+**IMPORTANTE:** A partir de la versión 2.9.17, el driver opera de forma asíncrona por defecto:
+
+- Las operaciones NO BLOQUEAN: `ioctl()` retorna inmediatamente
+- Se retorna un `fence_fd_out` para sincronización explícita
+- Userspace puede:
+  - Hacer `poll()` en el fence_fd
+  - Llamar a `sync_wait()` (Android sync framework)
+  - Ignorar el fence si no necesita sincronización
+- Múltiples jobs pueden encolarse (pipelining)
+- Compatible con DRM sync model
+
+**Ejemplo:**
+```c
+struct g2d_fillrect fill = {
+    .fence_fd_in = -1,  // No input fence
+    .fence_fd_out = -1  // Will receive output fence
+    // ... other fields ...
+};
+
+ioctl(g2d_fd, G2D_IOC_FILLRECT, &fill);
+// Returns IMMEDIATELY, fill.fence_fd_out contains fence
+
+// Option 1: Wait for completion
+struct pollfd pfd = { .fd = fill.fence_fd_out, .events = POLLIN };
+poll(&pfd, 1, -1);  // Wait until done
+
+// Option 2: Continue without waiting (async)
+// Next operation can use fill.fence_fd_out as fence_fd_in for ordering
+
+close(fill.fence_fd_out);  // Always close fence_fd when done
+```
+
+Ver **[Job Queue Design](../../patches/demo-g2d/docs/JOB-QUEUE-ASYNC-DESIGN.md)** para detalles de arquitectura.
 
 ---
 
