@@ -61,19 +61,24 @@
 
 
 #define DRIVER_NAME		"sunxi-g2d"
-#define DRIVER_VERSION		"2.9.15"
+#define DRIVER_VERSION		"2.9.16"
 #define DRIVER_MAJOR		2
-#define DRIVER_MINOR		7
-#define DRIVER_PATCHLEVEL	1
+#define DRIVER_MINOR		9
+#define DRIVER_PATCHLEVEL	16
 
-/* Module parameters for RCQ experimentation */
+/* Module parameters */
+static bool g2d_debug = false;
+module_param_named(debug, g2d_debug, bool, 0644);
+MODULE_PARM_DESC(debug, "Enable debug logging (default: false)");
+
+/* Module parameters for RCQ experimentation (deprecated - RCQ not functional on T113-S3) */
 static bool rcq_enable_bit = true;
 module_param(rcq_enable_bit, bool, 0644);
-MODULE_PARM_DESC(rcq_enable_bit, "Enable RCQ_CTRL.EN bit (default: true, try false if RCQ fails)");
+MODULE_PARM_DESC(rcq_enable_bit, "Enable RCQ_CTRL.EN bit (deprecated)");
 
 static bool rcq_use_mixer_irq = false;
 module_param(rcq_use_mixer_irq, bool, 0644);
-MODULE_PARM_DESC(rcq_use_mixer_irq, "Use MIXER_INT in addition to RCQ IRQ (default: false)");
+MODULE_PARM_DESC(rcq_use_mixer_irq, "Use MIXER_INT in addition to RCQ IRQ (deprecated)");
 
 
 /* VSU scaling filter coefficients - from BSP g2d_scal.c */
@@ -672,8 +677,6 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 	u32 val;
 	int ret;
 	
-	dev_info(g2d->dev, "=== G2D hardware enable (fillrect v1.0.0 sequence) ===\n");
-	
 	/* Step 1: Enable clocks (BSP order: bus → mod@300MHz → mbus) */
 	ret = clk_prepare_enable(g2d->clk_bus);
 	if (ret) {
@@ -698,10 +701,11 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 		goto err_mod_clk;
 	}
 	
-	dev_info(g2d->dev, "Clocks: mod=%lu bus=%lu mbus=%lu\n",
-		 clk_get_rate(g2d->clk_mod),
-		 clk_get_rate(g2d->clk_bus),
-		 clk_get_rate(g2d->clk_mbus));
+	if (g2d_debug)
+		dev_info(g2d->dev, "Clocks: mod=%lu bus=%lu mbus=%lu\n",
+			 clk_get_rate(g2d->clk_mod),
+			 clk_get_rate(g2d->clk_bus),
+			 clk_get_rate(g2d->clk_mbus));
 	
 	/* Step 2: TOP enable - open gates (0x3 = MIXER + ROT) */
 	g2d_write(g2d, G2D_SCLK_GATE, 0x3);   /* Source clocks */
@@ -716,17 +720,17 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 	g2d_write(g2d, G2D_CMD_CTL, 0x00010001);  /* Enable CORE0 and RT_WB */
 	wmb();
 	
-	dev_info(g2d->dev, "TOP: SCLK=0x%08x HCLK=0x%08x RESET=0x%08x CMD_CTL=0x%08x\n",
-		 g2d_read(g2d, G2D_SCLK_GATE),
-		 g2d_read(g2d, G2D_HCLK_GATE),
-		 g2d_read(g2d, G2D_AHB_RESET),
-		 g2d_read(g2d, G2D_CMD_CTL));
+	if (g2d_debug)
+		dev_info(g2d->dev, "TOP: SCLK=0x%08x HCLK=0x%08x RESET=0x%08x CMD_CTL=0x%08x\n",
+			 g2d_read(g2d, G2D_SCLK_GATE),
+			 g2d_read(g2d, G2D_HCLK_GATE),
+			 g2d_read(g2d, G2D_AHB_RESET),
+			 g2d_read(g2d, G2D_CMD_CTL));
 	
 	/* Read VERSION */
 	val = g2d_read(g2d, G2D_VERSION);
 	g2d->hw_version = val;
-	dev_info(g2d->dev, "G2D_VERSION=0x%08x (IP version=0x%04x)\n",
-		 val, (val >> 16) & 0xFFFF);
+	dev_info(g2d->dev, "Hardware version 0x%04x\n", (val >> 16) & 0xFFFF);
 	
 	/* Step 3: CCU enable - enable WB/RCQ sub-blocks */
 	if (g2d->ccu_base) {
@@ -737,9 +741,10 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 		writel(0x00010001, g2d->ccu_base + G2D_BGR_REG);  /* Gate + RST */
 		wmb();
 		
-		dev_info(g2d->dev, "CCU: CLK_REG=0x%08x BGR_REG=0x%08x\n",
-			 readl(g2d->ccu_base + G2D_CLK_REG),
-			 readl(g2d->ccu_base + G2D_BGR_REG));
+		if (g2d_debug)
+			dev_info(g2d->dev, "CCU: CLK_REG=0x%08x BGR_REG=0x%08x\n",
+				 readl(g2d->ccu_base + G2D_CLK_REG),
+				 readl(g2d->ccu_base + G2D_BGR_REG));
 	}
 	
 	/* Step 4: Set MBUS bandwidth (300 MB/s avg, 600 MB/s peak) */
@@ -749,8 +754,6 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 				 Bps_to_icc(600 * 1024 * 1024));
 		if (ret)
 			dev_warn(g2d->dev, "Failed to set MBUS bandwidth: %d\n", ret);
-		else
-			dev_info(g2d->dev, "MBUS bandwidth set\n");
 	}
 	
 	/* Step 4.5: Configure MBUS priority for G2D master (T113-S3 quirk)
@@ -763,17 +766,17 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 
 	sunxi_g2d_setup_mbus(g2d->dev, mbus);
 
-	/* Step 5: Verify register access */
-	dev_info(g2d->dev, "RCQ_CTRL=0x%08x RCQ_STATUS=0x%08x\n",
-		 g2d_read(g2d, G2D_RCQ_CTRL),
-		 g2d_read(g2d, G2D_RCQ_STATUS));
+	if (g2d_debug)
+		dev_info(g2d->dev, "RCQ_CTRL=0x%08x RCQ_STATUS=0x%08x\n",
+			 g2d_read(g2d, G2D_RCQ_CTRL),
+			 g2d_read(g2d, G2D_RCQ_STATUS));
 	
 	/* Step 6: Configure interrupts for DIRECT mode */
 	g2d_write(g2d, G2D_MIXER_INT, G2D_MIXER_INT_FINISH_IRQ_EN);
 	
 	g2d->hw_enabled = true;
 	
-	dev_info(g2d->dev, "=== G2D hardware enabled successfully ===\n");
+	dev_info(g2d->dev, "G2D hardware enabled\n");
 	return 0;
 
 err_mod_clk:
@@ -790,8 +793,6 @@ err_bus_clk:
  */
 static void sunxi_g2d_hw_disable(struct sunxi_g2d_dev *g2d)
 {
-	dev_dbg(g2d->dev, "Disabling G2D hardware\n");
-	
 	if (!g2d->hw_enabled)
 		return;
 	
@@ -855,8 +856,9 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 		
 		rcq_status_after = g2d_top->rcq_status.dwval;
 		
-		dev_info(g2d->dev, "RCQ IRQ: task_end! status before=0x%08x after=0x%08x (MIXER reset done)\n",
-		         rcq_status_before, rcq_status_after);
+		if (g2d_debug)
+			dev_info(g2d->dev, "RCQ IRQ: task_end! status before=0x%08x after=0x%08x\n",
+				 rcq_status_before, rcq_status_after);
 		
 		/* Signal completion */
 		atomic_set(&g2d->irq_done, 1);
@@ -881,8 +883,9 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 		g2d_mixer->mixer_interrupt.bits.mixer_irq = 1;
 		wmb();
 		
-		dev_info(g2d->dev, "MIXER IRQ: completion! mixer_int=0x%08x (MIXER reset done)\n",
-		         mixer_int_before);
+		if (g2d_debug)
+			dev_info(g2d->dev, "MIXER IRQ: completion! mixer_int=0x%08x\n",
+				 mixer_int_before);
 		
 		/* Signal completion */
 		atomic_set(&g2d->irq_done, 1);
@@ -895,7 +898,9 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 	if (rot_status & ROT_INT_FINISH) {
 		/* Clear ROT interrupt */
 		g2d_write(g2d, ROT_INT, ROT_INT_FINISH);
-		dev_info(g2d->dev, "ROT IRQ received: status=0x%08x\n", rot_status);
+		
+		if (g2d_debug)
+			dev_info(g2d->dev, "ROT IRQ received: status=0x%08x\n", rot_status);
 		
 		/* Signal completion */
 		atomic_set(&g2d->irq_done, 1);
@@ -921,20 +926,12 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 			if (job) {
 				/* Signal the fence */
 				if (job->fence) {
-					/* Log before signalling so we can correlate with userspace fd */
-					{
+					if (g2d_debug) {
 						struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-						dev_info(g2d->dev, "irq: about to signal fence=%p seq=%llu job=%p fd=%d\n",
-								 job->fence, sf->seqno, job, job->fence_fd);
+						dev_info(g2d->dev, "IRQ: signaling fence seq=%llu fd=%d\n",
+							 sf->seqno, job->fence_fd);
 					}
 					dma_fence_signal(job->fence);
-					/* Check and log if fence is signaled (should be true) */
-					{
-						int signaled = dma_fence_is_signaled(job->fence);
-						struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-						dev_info(g2d->dev, "irq: fence signalled fence=%p seq=%llu signaled=%d job=%p fd=%d\n",
-								 job->fence, sf->seqno, signaled, job, job->fence_fd);
-					}
 				}
 
 				/* FD installation is performed in process context when the job
@@ -1274,8 +1271,9 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 		return -EINVAL;
 	}
 	
-	dev_info(g2d->dev, "FILLRECT: %ux%u color=0x%08x fmt=%u->0x%02X dst_fmt=%u->0x%02X\n",
-		width, height, color, color_format, color_fmt_val, dst_format, dst_fmt_val);
+	if (g2d_debug)
+		dev_info(g2d->dev, "FILLRECT: %ux%u color=0x%08x fmt=%u->0x%02X dst_fmt=%u->0x%02X\n",
+			width, height, color, color_format, color_fmt_val, dst_format, dst_fmt_val);
 	
 	/* Convert color value ONLY when writing to framebuffer (XBGR destination)
 	 * 
@@ -1294,8 +1292,10 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 		hw_color = (color & 0xFF00FF00) |        /* Keep A and G */
 		           ((color & 0x00FF0000) >> 16) | /* R -> B position */
 		           ((color & 0x000000FF) << 16);  /* B -> R position */
-		dev_info(g2d->dev, "Color swap for XBGR framebuffer: 0x%08x -> 0x%08x\n", 
-			color, hw_color);
+		
+		if (g2d_debug)
+			dev_info(g2d->dev, "Color swap for XBGR framebuffer: 0x%08x -> 0x%08x\n", 
+				color, hw_color);
 	}
 	
 	/* 1. Reset G2D */
@@ -1402,41 +1402,6 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 	mixer_ctrl.bits.start = 1;
 	g2d_write(g2d, G2D_MIXER_CTL, mixer_ctrl.dwval);
 	wmb();
-	
-	/* v2.8.5: DUMP all critical G2D registers after legacy fillrect setup
-	 * This allows comparing with RCQ buffer contents to find differences
-	 */
-	dev_info(g2d->dev, "=== LEGACY FILLRECT REGISTER DUMP ===\n");
-	dev_info(g2d->dev, "MIXER: CTL=0x%08x FILLCOLOR0=0x%08x\n",
-		 g2d_read(g2d, G2D_MIXER_CTL),
-		 g2d_read(g2d, MIXER_FILLCOLOR0));
-	dev_info(g2d->dev, "V0: ATTCTL=0x%08x MBSIZE=0x%08x SIZE=0x%08x COOR=0x%08x\n",
-		 g2d_read(g2d, V0_ATTCTL),
-		 g2d_read(g2d, V0_MBSIZE),
-		 g2d_read(g2d, V0_SIZE),
-		 g2d_read(g2d, V0_COOR));
-	dev_info(g2d->dev, "V0: PITCH0=0x%08x FILLC=0x%08x\n",
-		 g2d_read(g2d, V0_PITCH0),
-		 g2d_read(g2d, V0_FILLC));
-	dev_info(g2d->dev, "BLD: EN=0x%08x PREMUL=0x%08x ISIZE0=0x%08x OFFSET0=0x%08x\n",
-		 g2d_read(g2d, BLD_EN_CTL),
-		 g2d_read(g2d, BLD_PREMUL_CTL),
-		 g2d_read(g2d, BLD_CH_ISIZE0),
-		 g2d_read(g2d, BLD_CH_OFFSET0));
-	dev_info(g2d->dev, "BLD: ISIZE1=0x%08x OFFSET1=0x%08x SIZE=0x%08x CTL=0x%08x\n",
-		 g2d_read(g2d, BLD_CH_ISIZE1),
-		 g2d_read(g2d, BLD_CH_OFFSET1),
-		 g2d_read(g2d, BLD_SIZE),
-		 g2d_read(g2d, BLD_CTL));
-	dev_info(g2d->dev, "BLD: COLOR=0x%08x\n",
-		 g2d_read(g2d, BLD_OUT_COLOR));
-	dev_info(g2d->dev, "WB: ATTR=0x%08x SIZE=0x%08x PITCH0=0x%08x LADD0=0x%08x\n",
-		 g2d_read(g2d, WB_ATT),
-		 g2d_read(g2d, WB_SIZE),
-		 g2d_read(g2d, WB_PITCH0),
-		 g2d_read(g2d, WB_LADD0));
-	dev_info(g2d->dev, "=== END REGISTER DUMP ===\n");
-	dev_info(g2d->dev, "=== END REGISTER DUMP ===\n");
 	
 	/* 8. Wait for IRQ completion */
 	timeout = wait_event_timeout(g2d->irq_wait,
