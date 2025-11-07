@@ -1,0 +1,4 @@
+# Ignore local demo artifacts and test scripts used during development
+# These are not part of the driver source and should not be committed.
+demo-*
+test-3buffer.sh
