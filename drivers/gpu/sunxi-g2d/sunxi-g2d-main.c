@@ -4415,7 +4415,6 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 	ret = sunxi_g2d_do_fillrect(g2d, dma_addr, width, height, pitch, 
 				    fill.color, fill.color_format, fill.dst.format);
 	
-	/* TODO: Create and return fence_fd if ASYNC flag set */
 	/* Create job + fence and return fence_fd_out to userspace. */
 	{
 		struct sunxi_g2d_job *job;
@@ -4790,7 +4789,6 @@ static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
 				       0, 0, 0, 0);  /* No chromakey for RCQ blend */
 	
 	
-	/* TODO: Create and return fence_fd if needed */
 	/* Create job + fence and return fence_fd_out to userspace. */
 	{
 		struct sunxi_g2d_job *job;
