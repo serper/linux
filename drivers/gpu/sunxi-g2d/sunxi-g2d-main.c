@@ -2431,7 +2431,9 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 				    dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
 				    u32 out_pitch, u32 out_format,
 				    u32 out_crop_w, u32 out_crop_h,
-				    u32 bld_mode)
+				    u32 bld_mode,
+				    u32 color_key_enable, u32 color_key_mode,
+				    u32 color_key_min, u32 color_key_max)
 {
 	/* v2.9.16: 3-buffer alpha blending - UI2 (dst READ) + V0 (src READ) → WB (out WRITE) */
 	struct g2d_mixer_ovl_u_reg ui2 = {0};  /* Pipe0: background (dst) - READ ONLY */
@@ -2773,6 +2775,44 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	bld.out_color.dwval = 0;  /* Clear all first */
 	bld.out_color.bits.alpha_mode = 0;  /* RGB mode (not YUV) */
 	bld.out_color.bits.premul_en = 0;   /* No premultiplication on output */
+
+	/* === Configure Color Key (Chroma Key) === */
+	if (color_key_enable) {
+		/* Extract RGB components from min/max values (0xRRGGBB format) */
+		u8 min_r = (color_key_min >> 16) & 0xFF;
+		u8 min_g = (color_key_min >> 8) & 0xFF;
+		u8 min_b = color_key_min & 0xFF;
+		u8 max_r = (color_key_max >> 16) & 0xFF;
+		u8 max_g = (color_key_max >> 8) & 0xFF;
+		u8 max_b = color_key_max & 0xFF;
+
+		/* Enable color key on pipe1 (V0/source layer) */
+		bld.color_key.bits.key0_en = 1;
+		bld.color_key.bits.key0_match_dir = color_key_mode;  /* 0=inside, 1=outside */
+
+		/* Match all RGB channels */
+		bld.color_key_cfg.bits.key0b_match = 1;  /* Match blue */
+		bld.color_key_cfg.bits.key0g_match = 1;  /* Match green */
+		bld.color_key_cfg.bits.key0y_match = 1;  /* Match red */
+
+		/* Set color range */
+		bld.color_key_min.bits.min_r = min_r;
+		bld.color_key_min.bits.min_g = min_g;
+		bld.color_key_min.bits.min_b = min_b;
+		bld.color_key_max.bits.max_r = max_r;
+		bld.color_key_max.bits.max_g = max_g;
+		bld.color_key_max.bits.max_b = max_b;
+
+		dev_info(g2d->dev, "CHROMAKEY: enabled mode=%u range=0x%06X-0x%06X (R:%u-%u G:%u-%u B:%u-%u)\n",
+			 color_key_mode, color_key_min, color_key_max,
+			 min_r, max_r, min_g, max_g, min_b, max_b);
+	} else {
+		/* Disable color key */
+		bld.color_key.dwval = 0;
+		bld.color_key_cfg.dwval = 0;
+		bld.color_key_min.dwval = 0;
+		bld.color_key_max.dwval = 0;
+	}
 
 	/* ROP: Source copy for alpha blending */
 	bld.rop_ctrl.dwval = 0xf0;
@@ -3673,6 +3713,8 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 				     u32 out_w, u32 out_h, u32 out_pitch, u32 out_format,  /* Output dimensions */
 				     u32 flags,
 				     u32 bld_mode,  /* Porter-Duff blend mode */
+				     u32 color_key_enable, u32 color_key_mode,
+				     u32 color_key_min, u32 color_key_max,
 				     bool needs_alpha, bool needs_rotation, bool needs_scaling)
 {
 	/* For now, delegate to existing implementations based on operation type
@@ -3706,7 +3748,9 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 						    out_w, out_h,
 						    out_pitch, out_format,
 						    blend_w, blend_h,  /* out_crop = blend size */
-						    bld_mode);         /* Porter-Duff blend mode */
+						    bld_mode,
+						    color_key_enable, color_key_mode,
+						    color_key_min, color_key_max);         /* Porter-Duff blend mode */
 	} else {
 		/* Simple copy/scale path - use MIXER with optional VSU */
 		return sunxi_g2d_do_blit(g2d,
@@ -4122,6 +4166,8 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 					out_w, out_h, out_pitch, out_format,  /* Output dimensions */
 					blit.flags,
 					blit.bld_mode,  /* Porter-Duff blend mode */
+					blit.color_key_enable, blit.color_key_mode,
+					blit.color_key_min, blit.color_key_max,
 					needs_alpha, needs_rotation, needs_scaling);
 	
 	if (ret < 0)

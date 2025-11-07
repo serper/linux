@@ -136,6 +136,13 @@ struct g2d_blit {
 	__u32 flags;		/* G2D_BLIT_FLAG_* */
 	__u32 bld_mode;		/* enum g2d_bld_mode (Porter-Duff blend mode) */
 	
+	/* Chroma key (color keying) support */
+	__u32 color_key_enable;		/* 1 = enable color keying, 0 = disable */
+	__u32 color_key_mode;		/* 0 = match inside range (make transparent),
+					   1 = match outside range (keep only key color) */
+	__u32 color_key_min;		/* Minimum RGB value (0xRRGGBB format) */
+	__u32 color_key_max;		/* Maximum RGB value (0xRRGGBB format) */
+	
 	/* Sync fence support */
 	__s32 fence_fd_in;	/* Wait on this fence before blit, or -1 */
 	__s32 fence_fd_out;	/* OUT: fence that signals when done */

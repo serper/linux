@@ -16,7 +16,7 @@ LDFLAGS = --sysroot=$(ALPINE_ROOTFS) -ldrm -lm
 DRM_BASE = demo-drm-base.c
 
 # Demo programs
-DEMOS = demo-bouncing-ball demo-rotate-test demo-scale-rotate demo-3buffer-test demo-porter-duff
+DEMOS = demo-bouncing-ball demo-rotate-test demo-scale-rotate demo-3buffer-test demo-porter-duff demo-chromakey
 
 # Build directory (optional, for cross-compilation output)
 BUILD_DIR = .
@@ -50,6 +50,11 @@ demo-porter-duff: demo-porter-duff.c $(DRM_BASE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built: $@"
 
+# Chromakey (green screen) test
+demo-chromakey: demo-chromakey.c $(DRM_BASE)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@"
+
 clean:
 	rm -f $(DEMOS)
 	@echo "Cleaned demo binaries"
@@ -69,5 +74,7 @@ help:
 	@echo "  demo-rotate-test      - Rotation test (0°, 90°, 180°, 270°)"
 	@echo "  demo-scale-rotate     - Scale + Rotate 2-pass test"
 	@echo "  demo-3buffer-test     - Explicit output buffer (3-buffer) test"
+	@echo "  demo-porter-duff      - Porter-Duff blending modes grid (12 modes)"
+	@echo "  demo-chromakey        - Chromakey (green screen) transparency test"
 	@echo ""
 	@echo "Note: Compiled for Alpine Linux (musl) on T113-S3"
