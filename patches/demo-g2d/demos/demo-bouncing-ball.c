@@ -77,6 +77,18 @@ static int sync_wait(int fd, int timeout_ms)
 	return 0;
 }
 
+/* Helper: Wait for fence and close it */
+static void sync_wait_and_close(int fence_fd, const char *op_name)
+{
+	if (fence_fd >= 0) {
+		int ret = sync_wait(fence_fd, 1000);  /* 1 second timeout */
+		if (ret < 0) {
+			fprintf(stderr, "Warning: sync_wait failed for %s: %d\n", op_name, ret);
+		}
+		close(fence_fd);
+	}
+}
+
 /* Helper: Write data to a G2D buffer from userspace */
 static int g2d_write_buffer(int g2d_fd, int dma_fd, void *data, size_t size, size_t offset)
 {
@@ -235,9 +247,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 		return -1;
 	}
 
-	if (blit_bg.fence_fd_out >= 0) {
-		close(blit_bg.fence_fd_out);
-	}
+	sync_wait_and_close(blit_bg.fence_fd_out, "bg→temp");
 	
 	/* Step 2: BLIT ball (110x110 FULL) + temp → temp at (x,y) with scaling
 	 * Using unified BLIT operation with auto-detection:
@@ -304,9 +314,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 		return -1;
 	}
 	
-	if (blit.fence_fd_out >= 0) {
-		close(blit.fence_fd_out);
-	}
+	sync_wait_and_close(blit.fence_fd_out, "ball+temp→temp");
 
 	/* Step 3: BLIT temp → framebuffer */
 
@@ -355,9 +363,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 		return -1;
 	}
 	
-	if (blit_debug.fence_fd_out >= 0) {
-		close(blit_debug.fence_fd_out);
-	}
+	sync_wait_and_close(blit_debug.fence_fd_out, "debug:ball_scaled→temp");
 #endif  /* End disabled debug code */
 
 #if 0  /* DISABLED: Original alpha blend code */
@@ -411,16 +417,12 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	ret = ioctl(g2d_fd, G2D_IOC_ALPHA_BLEND, &blend);
 	if (ret < 0) {
 		perror("G2D_IOC_ALPHA_BLEND (ball_scaled + bg → temp)");
-		close(dmabuf_fd);
-		return -1;
-	}
-	
-	if (blend.fence_fd_out >= 0) {
-		close(blend.fence_fd_out);
-	}
-#endif  /* End disabled alpha blend */
+	close(dmabuf_fd);
+	return -1;
+}
 
-	/* Step 3: BLIT temp_buffer → framebuffer (copy composited result with ball) */
+sync_wait_and_close(blend.fence_fd_out, "blend:ball+temp→comp");
+#endif  /* End disabled alpha blend */	/* Step 3: BLIT temp_buffer → framebuffer (copy composited result with ball) */
 	struct g2d_blit blit_copy = {0};
 	blit_copy.out.dma_fd = -1;  /* Legacy 2-buffer mode: dst is also output */
 	
@@ -463,10 +465,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd,
 	 * NOTE: Currently disabled due to poll() timing issues with already-signaled fences.
 	 * The G2D operations complete very quickly (~1-2ms) so the risk of tearing is minimal.
 	 */
-	if (blit_copy.fence_fd_out >= 0) {
-		/* Fence wait disabled - just close the fd */
-		close(blit_copy.fence_fd_out);
-	}
+	sync_wait_and_close(blit_copy.fence_fd_out, "temp→framebuffer");
 
 	/* Removed diagnostic second blit to other page. The proper frame is
 	 * already copied into the backbuffer above and will be presented by
@@ -936,17 +935,13 @@ int main(int argc, char **argv)
 		close(bg_ion_fd);
 		close(ball_ion_fd);
 		drm_display_cleanup(&disp);
-		return 1;
-	}
-	
-	if (scale_gradient.fence_fd_out >= 0) {
-		close(scale_gradient.fence_fd_out);
-	}
-	
-	/* Clean up gradient source buffer (no longer needed) */
-	close(gradient_ion_fd);
-	
-	printf("Background filled with VSU-interpolated smooth gradient\n");
+	return 1;
+}
+
+sync_wait_and_close(scale_gradient.fence_fd_out, "gradient→background");
+
+/* Clean up gradient source buffer (no longer needed) */
+close(gradient_ion_fd);	printf("Background filled with VSU-interpolated smooth gradient\n");
 
 	/* Removed diagnostic startup blit that populated both fb pages. The
 	 * production demo relies on normal composition + pageflip. If early
@@ -1010,19 +1005,14 @@ int main(int argc, char **argv)
 			fill_pat.fence_fd_in = -1;
 			fill_pat.fence_fd_out = -1;
 
-			ret = ioctl(disp.g2d_fd, G2D_IOC_FILLRECT, &fill_pat);
-			if (ret < 0) {
-				perror("G2D_IOC_FILLRECT (pattern)");
-				break;
-			}
-			/* Close fillrect fence fd without waiting */
-			if (fill_pat.fence_fd_out >= 0) {
-				close(fill_pat.fence_fd_out);
-			}
+		ret = ioctl(disp.g2d_fd, G2D_IOC_FILLRECT, &fill_pat);
+		if (ret < 0) {
+			perror("G2D_IOC_FILLRECT (pattern)");
+			break;
+		}
+		sync_wait_and_close(fill_pat.fence_fd_out, "fillrect:pattern");
 
-			/* Diagnostic dumps removed in cleaned build. */
-
-			/* Blit temp -> framebuffer pages (same as step 3 in normal flow) */
+		/* Diagnostic dumps removed in cleaned build. */			/* Blit temp -> framebuffer pages (same as step 3 in normal flow) */
 			uint32_t backbuffer_offset_bytes = drm_get_backbuffer_offset(&disp);
 			int backbuffer_y_offset = backbuffer_offset_bytes / disp.pitch;
 			struct g2d_blit blit = {0};
@@ -1064,10 +1054,7 @@ int main(int argc, char **argv)
 				break;
 			}
 			
-			/* Close fence fd without waiting */
-			if (blit.fence_fd_out >= 0) {
-				close(blit.fence_fd_out);
-			}
+			sync_wait_and_close(blit.fence_fd_out, "pattern→framebuffer");
 		} else {
 		/* Composite with 3 DISTINCT buffers: bg→temp, ball+temp→comp, comp→fb
 		 * Step 1 (inside function): BLIT bg → temp_buffer (background copy)

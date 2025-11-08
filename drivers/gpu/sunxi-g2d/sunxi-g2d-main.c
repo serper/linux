@@ -263,6 +263,15 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 				     u32 color_key_min, u32 color_key_max,
 				     bool needs_alpha, bool needs_rotation, bool needs_scaling);
 
+static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
+				  dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
+				  u32 src_pitch, u32 src_format,
+				  u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+				  dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
+				  u32 dst_pitch, u32 dst_format,
+				  u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
+				  u32 flags);
+
 static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
                               dma_addr_t src_dma, u32 src_width, u32 src_height,
                               u32 src_pitch, u32 src_format,
@@ -450,6 +459,7 @@ struct sunxi_g2d_job {
 	struct sync_file *sync_file;
 	struct work_struct cleanup_work;
 	enum g2d_job_type type;
+	struct sunxi_g2d_dev *g2d;  /* Back reference for cleanup */
 	
 	union {
 		struct g2d_job_blit_data blit;
@@ -473,6 +483,15 @@ struct sunxi_g2d_job {
 	struct dma_buf *out_dmabuf;
 	struct dma_buf_attachment *out_attach;
 	struct sg_table *out_sgt;
+	
+	/* For 2-pass scale+rotate: temporary buffer allocated by driver */
+	void *temp_vaddr;           /* Virtual address of temp buffer */
+	dma_addr_t temp_dma_addr;   /* DMA address of temp buffer */
+	size_t temp_size;           /* Size of temp buffer */
+	u32 temp_width;             /* Temp buffer dimensions */
+	u32 temp_height;
+	u32 temp_pitch;
+	u32 temp_format;
 };
 
 static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
@@ -538,6 +557,14 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 	if (job->out_dmabuf) {
 		dma_buf_put(job->out_dmabuf);
 		job->out_dmabuf = NULL;
+	}
+	
+	/* Release temporary buffer for 2-pass scale+rotate (if any) */
+	if (job->temp_vaddr && job->g2d) {
+		pr_debug("sunxi_g2d: cleanup - freeing temp buffer vaddr=%p dma=0x%llx size=%zu\n",
+			 job->temp_vaddr, (u64)job->temp_dma_addr, job->temp_size);
+		dma_free_coherent(job->g2d->dev, job->temp_size, job->temp_vaddr, job->temp_dma_addr);
+		job->temp_vaddr = NULL;
 	}
 
 	pr_debug("sunxi_g2d: cleanup - free job %p\n", job);
@@ -999,7 +1026,16 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 		break;
 		
 	case G2D_JOB_BLIT:
-		ret = sunxi_g2d_do_blit_unified(g2d,
+		/* Check if this is a 2-pass scale+rotate job */
+		if (job->temp_vaddr) {
+			dev_dbg(g2d->dev, "job_worker: executing 2-pass scale+rotate job=%p\n", job);
+			
+			/* STEP 1: Scale src → temp (no rotation, no alpha) */
+			dev_dbg(g2d->dev, "STEP 1 async: SCALE %ux%u -> %ux%u to temp buffer\n",
+				 job->data.blit.src_crop_w, job->data.blit.src_crop_h,
+				 job->temp_width, job->temp_height);
+			
+			ret = sunxi_g2d_do_blit(g2d,
 						job->src_dma,
 						job->data.blit.src_width,
 						job->data.blit.src_height,
@@ -1009,50 +1045,136 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 						job->data.blit.src_crop_y,
 						job->data.blit.src_crop_w,
 						job->data.blit.src_crop_h,
-						job->data.blit.src_alpha,
-						job->data.blit.src_alpha_mode,
-						job->data.blit.src_premul,
 						job->data.blit.src_color_space,
-						job->dst_dma,
-						job->data.blit.dst_width,
-						job->data.blit.dst_height,
-						job->data.blit.dst_pitch,
-						job->data.blit.dst_format,
-						job->data.blit.dst_x,
-						job->data.blit.dst_y,
-						job->data.blit.dst_w,
-						job->data.blit.dst_h,
-						job->data.blit.dst_alpha,
-						job->data.blit.dst_alpha_mode,
-						job->data.blit.dst_premul,
-						job->data.blit.dst_color_space,
-						job->out_dma,
-						job->data.blit.out_width,
-						job->data.blit.out_height,
-						job->data.blit.out_pitch,
-						job->data.blit.out_format,
-						job->data.blit.flags,
-						job->data.blit.bld_mode,
-						job->data.blit.color_key_enable,
-						job->data.blit.color_key_mode,
-						job->data.blit.color_key_min,
-						job->data.blit.color_key_max,
-						job->data.blit.needs_alpha,
-						job->data.blit.needs_rotation,
-						job->data.blit.needs_scaling);
-		if (ret) {
-			dev_err(g2d->dev, "job_worker: blit failed: %d\n", ret);
-			dma_fence_set_error(job->fence, ret);
-			dma_fence_signal(job->fence);
+						job->temp_dma_addr,
+						job->temp_width,
+						job->temp_height,
+						job->temp_pitch,
+						job->temp_format,
+						0, 0,  /* Fill entire temp buffer */
+						job->temp_width,
+						job->temp_height,
+						job->data.blit.dst_color_space);
 			
-			spin_lock_irqsave(&g2d->job_lock, flags);
-			g2d->current_job = NULL;
-			atomic64_inc(&g2d->jobs_failed);
-			spin_unlock_irqrestore(&g2d->job_lock, flags);
+			if (ret < 0) {
+				dev_err(g2d->dev, "job_worker: 2-pass STEP 1 (scale) failed: %d\n", ret);
+				dma_fence_set_error(job->fence, ret);
+				dma_fence_signal(job->fence);
+				
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				g2d->current_job = NULL;
+				atomic64_inc(&g2d->jobs_failed);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+				
+				/* Cleanup and try next job */
+				queue_work(g2d->job_wq, &job->cleanup_work);
+				queue_work(g2d->job_wq, &g2d->job_work);
+				break;
+			}
 			
-			/* Cleanup and try next job */
-			queue_work(g2d->job_wq, &job->cleanup_work);
-			queue_work(g2d->job_wq, &g2d->job_work);
+			dev_dbg(g2d->dev, "✅ STEP 1 async complete: scaled to temp buffer\n");
+			
+			/* STEP 2: Rotate temp → out (no scaling) */
+			dev_dbg(g2d->dev, "STEP 2 async: ROTATE %ux%u -> out at (%u,%u)\n",
+				 job->temp_width, job->temp_height,
+				 job->data.blit.dst_x, job->data.blit.dst_y);
+			
+			ret = sunxi_g2d_do_blit_rot(g2d,
+						    job->temp_dma_addr,
+						    job->temp_width,
+						    job->temp_height,
+						    job->temp_pitch,
+						    job->temp_format,
+						    0, 0,  /* Full temp buffer as source */
+						    job->temp_width,
+						    job->temp_height,
+						    job->out_dma,  /* Write to out (or dst if no out) */
+						    job->data.blit.out_width,
+						    job->data.blit.out_height,
+						    job->data.blit.out_pitch,
+						    job->data.blit.out_format,
+						    job->data.blit.dst_x,
+						    job->data.blit.dst_y,
+						    job->temp_width,
+						    job->temp_height,
+						    job->data.blit.flags);  /* Apply rotation flags */
+			
+			if (ret < 0) {
+				dev_err(g2d->dev, "job_worker: 2-pass STEP 2 (rotate) failed: %d\n", ret);
+				dma_fence_set_error(job->fence, ret);
+				dma_fence_signal(job->fence);
+				
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				g2d->current_job = NULL;
+				atomic64_inc(&g2d->jobs_failed);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+				
+				/* Cleanup and try next job */
+				queue_work(g2d->job_wq, &job->cleanup_work);
+				queue_work(g2d->job_wq, &g2d->job_work);
+				break;
+			}
+			
+			dev_dbg(g2d->dev, "✅ 2-pass scale+rotate async completed successfully\n");
+			/* IRQ will signal fence and cleanup */
+			
+		} else {
+			/* Single-pass unified BLIT */
+			ret = sunxi_g2d_do_blit_unified(g2d,
+							job->src_dma,
+							job->data.blit.src_width,
+							job->data.blit.src_height,
+							job->data.blit.src_pitch,
+							job->data.blit.src_format,
+							job->data.blit.src_crop_x,
+							job->data.blit.src_crop_y,
+							job->data.blit.src_crop_w,
+							job->data.blit.src_crop_h,
+							job->data.blit.src_alpha,
+							job->data.blit.src_alpha_mode,
+							job->data.blit.src_premul,
+							job->data.blit.src_color_space,
+							job->dst_dma,
+							job->data.blit.dst_width,
+							job->data.blit.dst_height,
+							job->data.blit.dst_pitch,
+							job->data.blit.dst_format,
+							job->data.blit.dst_x,
+							job->data.blit.dst_y,
+							job->data.blit.dst_w,
+							job->data.blit.dst_h,
+							job->data.blit.dst_alpha,
+							job->data.blit.dst_alpha_mode,
+							job->data.blit.dst_premul,
+							job->data.blit.dst_color_space,
+							job->out_dma,
+							job->data.blit.out_width,
+							job->data.blit.out_height,
+							job->data.blit.out_pitch,
+							job->data.blit.out_format,
+							job->data.blit.flags,
+							job->data.blit.bld_mode,
+							job->data.blit.color_key_enable,
+							job->data.blit.color_key_mode,
+							job->data.blit.color_key_min,
+							job->data.blit.color_key_max,
+							job->data.blit.needs_alpha,
+							job->data.blit.needs_rotation,
+							job->data.blit.needs_scaling);
+			if (ret) {
+				dev_err(g2d->dev, "job_worker: blit failed: %d\n", ret);
+				dma_fence_set_error(job->fence, ret);
+				dma_fence_signal(job->fence);
+				
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				g2d->current_job = NULL;
+				atomic64_inc(&g2d->jobs_failed);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+				
+				/* Cleanup and try next job */
+				queue_work(g2d->job_wq, &job->cleanup_work);
+				queue_work(g2d->job_wq, &g2d->job_work);
+			}
 		}
 		break;
 		
@@ -4112,8 +4234,13 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
 	u32 src_bpp, dst_bpp;
-	u32 src_pitch, dst_pitch;
+	u32 src_pitch, dst_pitch, out_pitch;
 	u32 src_crop_w, src_crop_h;
+	struct sunxi_g2d_job *job = NULL;
+	struct dma_fence *fence = NULL;
+	struct sync_file *sync_file = NULL;
+	int fence_fd = -1;
+	unsigned long flags;
 	int ret;
 	
 	if (copy_from_user(&blit, (void __user *)arg, sizeof(blit)))
@@ -4316,6 +4443,14 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		out_dma_addr = dst_dma_addr;
 	}
 	
+	/* Calculate output buffer pitch */
+	bool has_out_buffer = (blit.out.dma_fd >= 0);
+	if (has_out_buffer) {
+		out_pitch = blit.out.stride[0] ? blit.out.stride[0] : (blit.out.width * dst_bpp);
+	} else {
+		out_pitch = dst_pitch;
+	}
+	
 	/* Determine operation requirements:
 	 * - Alpha blending: Auto-detected from:
 	 *   1. Presence of out buffer (3-buffer operation = blending)
@@ -4340,7 +4475,6 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	 * - ARGB format with PIXEL_ALPHA mode needs blending
 	 * - GLOBAL_ALPHA or MIXER_ALPHA modes need blending
 	 */
-	bool has_out_buffer = (blit.out.dma_fd >= 0);
 	bool src_has_alpha_format = (blit.src.format == G2D_FMT_ARGB8888 ||
 				     blit.src.format == G2D_FMT_ABGR8888);
 	bool needs_alpha = has_out_buffer ||  /* 3-buffer = blending */
@@ -4371,14 +4505,14 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			goto err_unmap_out;
 		}
 		
-		dev_dbg(g2d->dev, "Rotation + scaling requested: will do 2-pass (scale then rotate)\n");
+		dev_dbg(g2d->dev, "Rotation + scaling requested: 2-pass async (scale then rotate)\n");
 		
-		/* 2-pass approach:
-		 * STEP 1: Scale src to temporary buffer (no rotation, no alpha)
-		 * STEP 2: Rotate temp buffer to dst (no scaling, no alpha)
-		 * 
-		 * This handles the hardware limitation where VSU and ROT
-		 * cannot operate simultaneously.
+		/* 2-pass ASYNC approach:
+		 * - Allocate temporary buffer NOW in IOCTL context
+		 * - Store temp buffer + all parameters in job
+		 * - Create fence, enqueue job, return immediately
+		 * - Worker will execute STEP 1 (scale) then STEP 2 (rotate) async
+		 * - Cleanup will free temp buffer after completion
 		 */
 		
 		/* Calculate scaled size (before rotation) */
@@ -4398,59 +4532,155 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			goto err_unmap_out;
 		}
 		
-		dev_dbg(g2d->dev, "Allocated temp buffer: vaddr=%p dma=0x%llx size=%zu\n",
+		dev_dbg(g2d->dev, "Allocated temp buffer for async 2-pass: vaddr=%p dma=0x%llx size=%zu\n",
 			 temp_vaddr, (u64)temp_dma_addr, temp_size);
 		
-		/* STEP 1: Scale src → temp (no rotation, no alpha) */
-		dev_dbg(g2d->dev, "STEP 1: SCALE %ux%u -> %ux%u to temp buffer\n",
-			 src_crop_w, src_crop_h, temp_w, temp_h);
-		
-		/* Simple scaling only */
-		ret = sunxi_g2d_do_blit(g2d,
-					src_dma_addr, blit.src.width, blit.src.height,
-					src_pitch, blit.src.format,
-					blit.src.crop_x, blit.src.crop_y, src_crop_w, src_crop_h,
-					blit.src.color_space,
-					temp_dma_addr, temp_w, temp_h,
-					temp_pitch, blit.dst.format,
-					0, 0, temp_w, temp_h,  /* Fill entire temp buffer */
-					blit.dst.color_space);
-		
-		if (ret < 0) {
-			dev_err(g2d->dev, "STEP 1 (scale) failed: %d\n", ret);
+		/* Create job for 2-pass async execution */
+		job = kzalloc(sizeof(*job), GFP_KERNEL);
+		if (!job) {
+			dev_err(g2d->dev, "Failed to allocate job for 2-pass blit\n");
 			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
 		
-		dev_dbg(g2d->dev, "✅ Step 1 complete: scaled to temp buffer\n");
+		job->g2d = g2d;
+		job->type = G2D_JOB_BLIT;
+		INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
 		
-		/* STEP 2: Rotate temp → out (no scaling) */
-		dev_dbg(g2d->dev, "STEP 2: ROTATE %ux%u -> out at (%u,%u)\n",
-			 temp_w, temp_h, blit.dst_x, blit.dst_y);
+		/* Store all BLIT parameters in job */
+		job->data.blit.src_width = blit.src.width;
+		job->data.blit.src_height = blit.src.height;
+		job->data.blit.src_pitch = src_pitch;
+		job->data.blit.src_format = blit.src.format;
+		job->data.blit.src_crop_x = blit.src.crop_x;
+		job->data.blit.src_crop_y = blit.src.crop_y;
+		job->data.blit.src_crop_w = src_crop_w;
+		job->data.blit.src_crop_h = src_crop_h;
+		job->data.blit.src_alpha = blit.src.alpha;
+		job->data.blit.src_alpha_mode = blit.src.alpha_mode;
+		job->data.blit.src_premul = blit.src.premul_mode;
+		job->data.blit.src_color_space = blit.src.color_space;
 		
-		ret = sunxi_g2d_do_blit_rot(g2d,
-					    temp_dma_addr, temp_w, temp_h,
-					    temp_pitch, blit.dst.format,
-					    0, 0, temp_w, temp_h,  /* Full temp buffer as source */
-					    out_dma_addr, blit.dst.width, blit.dst.height,  /* Write to out */
-					    dst_pitch, blit.dst.format,
-					    blit.dst_x, blit.dst_y, temp_w, temp_h,
-					    blit.flags);  /* Apply rotation flags */
+		job->data.blit.dst_width = blit.dst.width;
+		job->data.blit.dst_height = blit.dst.height;
+		job->data.blit.dst_pitch = dst_pitch;
+		job->data.blit.dst_format = blit.dst.format;
+		job->data.blit.dst_x = blit.dst_x;
+		job->data.blit.dst_y = blit.dst_y;
+		job->data.blit.dst_w = blit.dst_w;
+		job->data.blit.dst_h = blit.dst_h;
+		job->data.blit.dst_alpha = blit.dst.alpha;
+		job->data.blit.dst_alpha_mode = blit.dst.alpha_mode;
+		job->data.blit.dst_premul = blit.dst.premul_mode;
+		job->data.blit.dst_color_space = blit.dst.color_space;
 		
-		/* Free temporary buffer */
-		dev_dbg(g2d->dev, "Freeing temp buffer: vaddr=%p dma=0x%llx size=%zu\n",
-			 temp_vaddr, (u64)temp_dma_addr, temp_size);
-		dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+		job->data.blit.out_width = has_out_buffer ? blit.out.width : blit.dst.width;
+		job->data.blit.out_height = has_out_buffer ? blit.out.height : blit.dst.height;
+		job->data.blit.out_pitch = has_out_buffer ? out_pitch : dst_pitch;
+		job->data.blit.out_format = has_out_buffer ? blit.out.format : blit.dst.format;
 		
-		if (ret < 0) {
-			dev_err(g2d->dev, "STEP 2 (rotate) failed: %d\n", ret);
-			goto err_unmap_out;
+		job->data.blit.flags = blit.flags;
+		job->data.blit.bld_mode = blit.bld_mode;
+		job->data.blit.color_key_min = blit.color_key_min;
+		job->data.blit.color_key_max = blit.color_key_max;
+		job->data.blit.color_key_enable = blit.color_key_enable;
+		job->data.blit.color_key_mode = blit.color_key_mode;
+		job->data.blit.needs_alpha = needs_alpha;
+		job->data.blit.needs_rotation = needs_rotation;
+		job->data.blit.needs_scaling = needs_scaling;
+		
+		/* Store DMA addresses for HW access */
+		job->src_dma = src_dma_addr;
+		job->dst_dma = dst_dma_addr;
+		job->out_dma = out_dma_addr;
+		
+		/* Transfer DMA-BUF ownership to job */
+		job->src_dmabuf = src_dmabuf;
+		job->src_attach = src_attach;
+		job->src_sgt = src_sgt;
+		job->dst_dmabuf = dst_dmabuf;
+		job->dst_attach = dst_attach;
+		job->dst_sgt = dst_sgt;
+		job->out_dmabuf = out_dmabuf;
+		job->out_attach = out_attach;
+		job->out_sgt = out_sgt;
+		
+		/* Store temp buffer info for 2-pass execution */
+		job->temp_vaddr = temp_vaddr;
+		job->temp_dma_addr = temp_dma_addr;
+		job->temp_size = temp_size;
+		job->temp_width = temp_w;
+		job->temp_height = temp_h;
+		job->temp_pitch = temp_pitch;
+		job->temp_format = blit.dst.format;
+		
+		/* Create fence for this job */
+		fence = sunxi_g2d_fence_create(g2d);
+		if (!fence) {
+			dev_err(g2d->dev, "Failed to create fence for 2-pass blit\n");
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			kfree(job);
+			ret = -ENOMEM;
+			goto err_no_cleanup;  /* Don't cleanup DMA-BUFs, we haven't transferred ownership yet */
+		}
+		job->fence = fence;
+		
+		/* Create sync_file and get FD */
+		sync_file = sync_file_create(fence);
+		if (!sync_file) {
+			dev_err(g2d->dev, "Failed to create sync_file for 2-pass blit\n");
+			dma_fence_put(fence);
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			kfree(job);
+			ret = -ENOMEM;
+			goto err_no_cleanup;
 		}
 		
-		dev_dbg(g2d->dev, "✅ 2-pass scale+rotate completed successfully\n");
+		fence_fd = get_unused_fd_flags(O_CLOEXEC);
+		if (fence_fd < 0) {
+			dev_err(g2d->dev, "Failed to get unused fd for 2-pass blit\n");
+			fput(sync_file->file);
+			kfree(sync_file);
+			dma_fence_put(fence);
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			kfree(job);
+			ret = fence_fd;
+			goto err_no_cleanup;
+		}
 		
-		/* Skip unified path - we already did the work */
-		goto done_blit;
+		job->fence_fd = fence_fd;
+		job->sync_file = sync_file;
+		
+		/* Install FD (makes it visible to userspace) */
+		fd_install(fence_fd, sync_file->file);
+		job->sync_file = NULL;  /* fd table owns the ref now */
+		
+		dev_dbg(g2d->dev, "2-pass blit: installing fd=%d for job=%p fence=%p pid=%d\n",
+			 fence_fd, job, fence, current->pid);
+		
+		/* Enqueue job to worker */
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		list_add_tail(&job->node, &g2d->job_queue);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+		
+		queue_work(g2d->job_wq, &g2d->job_work);
+		
+		dev_dbg(g2d->dev, "2-pass blit: enqueued job=%p fence_fd=%d\n", job, fence_fd);
+		
+		/* Return fence FD to userspace */
+		blit.fence_fd_out = fence_fd;
+		if (copy_to_user((void __user *)arg, &blit, sizeof(blit))) {
+			dev_err(g2d->dev, "Failed to copy blit result to userspace\n");
+			/* Job is already enqueued, can't cleanly abort */
+			ret = -EFAULT;
+			goto err_no_cleanup;
+		}
+		
+		dev_dbg(g2d->dev, "2-pass BLIT async: returned fence_fd=%d to userspace\n", fence_fd);
+		
+		/* Success - DMA-BUFs and temp buffer now owned by job, return immediately */
+		return 0;
 	}
 	
 	/* All other combinations are valid for single-pass:
@@ -4474,19 +4704,19 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		 op_desc, src_crop_w, src_crop_h, blit.dst_w, blit.dst_h);
 } else {
 	dev_dbg(g2d->dev, "BLIT: simple copy %ux%u\n", src_crop_w, src_crop_h);
-}	/* Calculate output buffer dimensions */
-	u32 out_w, out_h, out_pitch, out_format;
+}
+	
+	/* Calculate output buffer dimensions (out_pitch already calculated above) */
+	u32 out_w, out_h, out_format;
 	if (has_out_buffer) {
 		/* Explicit output buffer - use its dimensions */
 		out_w = blit.out.width;
 		out_h = blit.out.height;
-		out_pitch = blit.out.stride[0] ? blit.out.stride[0] : (blit.out.width * dst_bpp);
 		out_format = blit.out.format;
 	} else {
 		/* In-place operation - output uses dst dimensions */
 		out_w = blit.dst.width;
 		out_h = blit.dst.height;
-		out_pitch = dst_pitch;
 		out_format = blit.dst.format;
 	}
 	
@@ -4621,71 +4851,11 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	
 	return 0;
 
-done_blit:
-	/* Legacy sync path for 2-pass scale+rotate.
-	 * This section is only reached from the 2-pass path above.
-	 * Single-pass operations now use async job queue and return early.
+err_no_cleanup:
+	/* Error path for async 2-pass: DMA-BUFs and temp buffer not yet transferred to job.
+	 * Just return error - caller still owns the DMA-BUFs and will cleanup via normal error path.
 	 */
-	{
-		struct sunxi_g2d_job *job;
-		int out_fd = -1;
-
-		job = kzalloc(sizeof(*job), GFP_KERNEL);
-		if (!job) {
-			ret = -ENOMEM;
-			goto err_unmap_out;
-		}
-
-		job->fence = sunxi_g2d_fence_create(g2d);
-		if (!job->fence) {
-			kfree(job);
-			ret = -ENOMEM;
-			goto err_unmap_out;
-		}
-
-		out_fd = get_unused_fd_flags(O_CLOEXEC);
-		if (out_fd < 0) {
-			dma_fence_put(job->fence);
-			kfree(job);
-			ret = out_fd;
-			goto err_unmap_out;
-		}
-
-		job->fence_fd = out_fd;
-		job->sync_file = sync_file_create(job->fence);
-		if (!job->sync_file) {
-			put_unused_fd(out_fd);
-			dma_fence_put(job->fence);
-			kfree(job);
-			ret = -ENOMEM;
-			goto err_unmap_out;
-		}
-
-		/* Install FD */
-		if (job->sync_file && job->sync_file->file) {
-			fd_install(out_fd, job->sync_file->file);
-			job->sync_file = NULL;
-		}
-
-		/* Signal fence immediately (sync path already executed) */
-		spin_lock(&g2d->job_lock);
-		g2d->current_job = job;
-		spin_unlock(&g2d->job_lock);
-		
-		dma_fence_signal(job->fence);
-		
-		spin_lock(&g2d->job_lock);
-		g2d->current_job = NULL;
-		spin_unlock(&g2d->job_lock);
-
-		blit.fence_fd_out = job->fence_fd;
-		kfree(job);  /* Immediate cleanup for sync path */
-	}
-	
-	if (copy_to_user((void __user *)arg, &blit, sizeof(blit))) {
-		ret = -EFAULT;
-		goto err_unmap_out;
-	}
+	return ret;
 
 err_unmap_out:
 	/* Only cleanup if buffers weren't transferred to async job.
