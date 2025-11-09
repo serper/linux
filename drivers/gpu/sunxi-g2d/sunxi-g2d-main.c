@@ -389,6 +389,9 @@ struct sunxi_g2d_dev {
 	void *temp_scale_buffer;
 	dma_addr_t temp_scale_dma;
 	size_t temp_scale_size;
+
+	/* Delayed work to safely disable hardware when idle */
+	struct delayed_work disable_work;
 	
 	/* Statistics */
 	u32 hw_version;
@@ -977,6 +980,32 @@ static void sunxi_g2d_hw_disable(struct sunxi_g2d_dev *g2d)
 	g2d->hw_enabled = false;
 	
 	dev_dbg(g2d->dev, "G2D hardware disabled\n");
+}
+
+/* Delayed work handler: disable HW only when no users, no queued jobs and no current job */
+static void sunxi_g2d_disable_workfn(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct sunxi_g2d_dev *g2d = container_of(dwork, struct sunxi_g2d_dev, disable_work);
+	unsigned long flags;
+	bool should_disable = false;
+
+	/* Quick check under job_lock to avoid races with job enqueue/dequeue */
+	spin_lock_irqsave(&g2d->job_lock, flags);
+	if (atomic_read(&g2d->users) == 0 && list_empty(&g2d->job_queue) && g2d->current_job == NULL)
+		should_disable = true;
+	spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+	if (should_disable) {
+		/* Re-check under dev_mutex and disable safely */
+		mutex_lock(&g2d->dev_mutex);
+		if (atomic_read(&g2d->users) == 0 && list_empty(&g2d->job_queue) && g2d->current_job == NULL)
+			sunxi_g2d_hw_disable(g2d);
+		mutex_unlock(&g2d->dev_mutex);
+	} else {
+		/* Not idle yet — reschedule after 100 ms */
+		queue_delayed_work(g2d->job_wq, &g2d->disable_work, msecs_to_jiffies(100));
+	}
 }
 
 /* ========== Async Job Queue Worker ========== */
@@ -1605,6 +1634,15 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 			
 			/* Schedule next job if queue not empty */
 			queue_work(g2d->job_wq, &g2d->job_work);
+
+			/* If there are no users, schedule immediate disable check to speed shutdown */
+			if (atomic_read(&g2d->users) == 0) {
+				unsigned long __flags;
+				spin_lock_irqsave(&g2d->job_lock, __flags);
+				if (list_empty(&g2d->job_queue) && g2d->current_job == NULL)
+					queue_delayed_work(g2d->job_wq, &g2d->disable_work, 0);
+				spin_unlock_irqrestore(&g2d->job_lock, __flags);
+			}
 			}
 		}
 	}
@@ -2645,12 +2683,20 @@ static int sunxi_g2d_release(struct inode *inode, struct file *file)
 	
 	dev_dbg(g2d->dev, "Device released\n");
 	
-	/* Decrement user count and disable hardware if last user */
+	/* Decrement user count and schedule hardware disable if last user.
+	 * We schedule a delayed work to ensure the HW is not disabled while
+	 * there are still jobs pending or running. The work will re-check
+	 * the queue and current_job before disabling.
+	 */
 	mutex_lock(&g2d->dev_mutex);
-	
-	if (atomic_dec_return(&g2d->users) == 0)
-		sunxi_g2d_hw_disable(g2d);
-	
+
+	if (atomic_dec_return(&g2d->users) == 0) {
+		/* Schedule delayed disable: gives time for in-flight jobs to finish.
+		 * disable_work will re-check and reschedule until fully idle.
+		 */
+		queue_delayed_work(g2d->job_wq, &g2d->disable_work, msecs_to_jiffies(100));
+	}
+
 	mutex_unlock(&g2d->dev_mutex);
 	
 	return 0;
@@ -7110,6 +7156,9 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	/* Initialize job worker */
 	INIT_WORK(&g2d->job_work, sunxi_g2d_job_worker);
 	dev_dbg(&pdev->dev, "Job worker initialized for async operations\n");
+
+	/* initialize delayed work for safe HW disable */
+	INIT_DELAYED_WORK(&g2d->disable_work, sunxi_g2d_disable_workfn);
 	
 	/* Register character device */
 	ret = alloc_chrdev_region(&g2d->dev_num, 0, 1, DRIVER_NAME);
@@ -7164,6 +7213,10 @@ static void sunxi_g2d_remove(struct platform_device *pdev)
 	unregister_chrdev_region(g2d->dev_num, 1);
 	
 	/* Flush and destroy workqueue */
+
+	/* Cancel pending disable work to avoid running after device removal */
+	cancel_delayed_work_sync(&g2d->disable_work);
+
 	flush_workqueue(g2d->job_wq);
 	destroy_workqueue(g2d->job_wq);
 	
