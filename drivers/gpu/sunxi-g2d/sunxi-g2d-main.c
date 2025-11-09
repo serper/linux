@@ -272,6 +272,23 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 				  u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
 				  u32 flags);
 
+static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
+					 dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
+					 u32 src_pitch, u32 src_format,
+					 u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
+					 u8 src_alpha, u8 src_alpha_mode, u8 src_premul, u8 src_color_space,
+					 dma_addr_t dst_dma_addr, dma_addr_t dst_base_addr,
+					 u32 dst_w, u32 dst_h,
+					 u32 dst_pitch, u32 dst_format,
+					 u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
+					 u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
+					 dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
+					 u32 out_pitch, u32 out_format,
+					 u32 out_crop_w, u32 out_crop_h,
+					 u32 bld_mode,
+					 u32 color_key_enable, u32 color_key_mode,
+					 u32 color_key_min, u32 color_key_max);
+
 static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
                               dma_addr_t src_dma, u32 src_width, u32 src_height,
                               u32 src_pitch, u32 src_format,
@@ -393,6 +410,12 @@ struct sunxi_g2d_dev {
 enum g2d_job_type {
 	G2D_JOB_BLIT,
 	G2D_JOB_FILLRECT,
+	/* Specialized command types from G2D_IOC_CMD */
+	G2D_JOB_CMD_COPY,
+	G2D_JOB_CMD_SCALE,
+	G2D_JOB_CMD_BLEND,
+	G2D_JOB_CMD_ROTATE,
+	G2D_JOB_CMD_MASK,
 };
 
 /* Internal job data structures */
@@ -1175,6 +1198,257 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				queue_work(g2d->job_wq, &job->cleanup_work);
 				queue_work(g2d->job_wq, &g2d->job_work);
 			}
+		}
+		break;
+	
+	case G2D_JOB_CMD_SCALE:
+		/* Scaling operation using VSU */
+		ret = sunxi_g2d_do_blit(g2d,
+					job->src_dma,
+					job->data.blit.src_width,
+					job->data.blit.src_height,
+					job->data.blit.src_pitch,
+					job->data.blit.src_format,
+					job->data.blit.src_crop_x,
+					job->data.blit.src_crop_y,
+					job->data.blit.src_crop_w,
+					job->data.blit.src_crop_h,
+					job->data.blit.src_color_space,
+					job->dst_dma,
+					job->data.blit.dst_width,
+					job->data.blit.dst_height,
+					job->data.blit.dst_pitch,
+					job->data.blit.dst_format,
+					job->data.blit.dst_x,
+					job->data.blit.dst_y,
+					job->data.blit.dst_w,
+					job->data.blit.dst_h,
+					job->data.blit.dst_color_space);
+		
+		if (ret < 0) {
+			dev_err(g2d->dev, "G2D_CMD_SCALE failed: %d\n", ret);
+			dma_fence_set_error(job->fence, ret);
+			dma_fence_signal(job->fence);
+			
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			g2d->current_job = NULL;
+			atomic64_inc(&g2d->jobs_failed);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+			
+			queue_work(g2d->job_wq, &job->cleanup_work);
+			queue_work(g2d->job_wq, &g2d->job_work);
+		}
+		break;
+	
+	case G2D_JOB_CMD_BLEND:
+		/* Alpha blending operation - 3 buffer mode (src + dst → out) */
+		/* ARCHITECTURAL ISSUES WITH CURRENT BLEND IMPLEMENTATION:
+		 * 
+		 * ISSUE 1 - Wrong layer for RGB/ARGB (V0 vs UI1) [TODO]:
+		 * V0 (video layer) is currently used for foreground (src), but this is INCORRECT for RGB/ARGB formats.
+		 * V0 is designed for YUV video data. RGB/ARGB textures should use UI1 (UI layer) instead.
+		 * User insight: "V0 pueda ser para video con formato de color yuv y quizás el layer UI1 sería RGB?"
+		 * This may cause suboptimal alpha channel handling when blending RGB/ARGB images.
+		 * 
+		 * ISSUE 2 - Src/Dst register semantics INVERTED [FIXED]:
+		 * Hardware has V0 and WB/UI registers with SWAPPED semantic roles:
+		 * - V0 (labeled "source") → acts as DESTINATION in blend equation
+		 * - WB (labeled "destination") → acts as SOURCE in blend equation
+		 * Discovered by testing: G2D_BLD_DSTOVER hw value produces correct SRCOVER behavior.
+		 * Alpha values are NORMAL (0=transparent, 255=opaque), buffer assignments backwards.
+		 * 
+		 * SOLUTION IMPLEMENTED: Swapped enum g2d_bld_mode values to compensate.
+		 * When user requests G2D_BLD_SRCOVER, driver uses DSTOVER hw register value.
+		 * Applications use standard Porter-Duff semantics, driver handles quirk internally.
+		 * See sunxi_g2d_get_bld_mode() and include/uapi/linux/sunxi_g2d.h for details.
+		 * 
+		 * FUTURE: Use UI1 for RGB/ARGB to potentially improve alpha quality.
+		 */
+		ret = sunxi_g2d_do_blit_alpha_3buf(g2d,
+						   job->src_dma,
+						   job->data.blit.src_width,
+						   job->data.blit.src_height,
+						   job->data.blit.src_pitch,
+						   job->data.blit.src_format,
+						   job->data.blit.src_crop_x,
+						   job->data.blit.src_crop_y,
+						   job->data.blit.src_crop_w,
+						   job->data.blit.src_crop_h,
+						   job->data.blit.src_alpha,
+						   job->data.blit.src_alpha_mode,
+						   job->data.blit.src_premul,
+						   job->data.blit.src_color_space,
+						   job->dst_dma,
+						   job->out_dma,  /* dst_base_addr = OUT buffer for in-place write */
+						   job->data.blit.dst_width,
+						   job->data.blit.dst_height,
+						   job->data.blit.dst_pitch,
+						   job->data.blit.dst_format,
+						   job->data.blit.dst_x,
+						   job->data.blit.dst_y,
+						   job->data.blit.dst_w,
+						   job->data.blit.dst_h,
+						   job->data.blit.dst_alpha,
+						   job->data.blit.dst_alpha_mode,
+						   job->data.blit.dst_premul,
+						   job->data.blit.dst_color_space,
+						   job->out_dma,
+						   job->data.blit.out_width,
+						   job->data.blit.out_height,
+						   job->data.blit.out_pitch,
+						   job->data.blit.out_format,
+						   job->data.blit.dst_w,  /* out_crop_w = blend region width */
+						   job->data.blit.dst_h,  /* out_crop_h = blend region height */
+						   job->data.blit.bld_mode,
+						   0, 0, 0, 0);  /* No color keying for BLEND command */
+		
+		if (ret < 0) {
+			dev_err(g2d->dev, "G2D_CMD_BLEND failed: %d\n", ret);
+			dma_fence_set_error(job->fence, ret);
+			dma_fence_signal(job->fence);
+			
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			g2d->current_job = NULL;
+			atomic64_inc(&g2d->jobs_failed);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+			
+			queue_work(g2d->job_wq, &job->cleanup_work);
+			queue_work(g2d->job_wq, &g2d->job_work);
+		}
+		break;
+	
+	case G2D_JOB_CMD_ROTATE:
+		/* Rotation/flip operation using ROT block */
+		ret = sunxi_g2d_do_blit_rot(g2d,
+					    job->src_dma,
+					    job->data.blit.src_width,
+					    job->data.blit.src_height,
+					    job->data.blit.src_pitch,
+					    job->data.blit.src_format,
+					    job->data.blit.src_crop_x,
+					    job->data.blit.src_crop_y,
+					    job->data.blit.src_crop_w,
+					    job->data.blit.src_crop_h,
+					    job->dst_dma,
+					    job->data.blit.dst_width,
+					    job->data.blit.dst_height,
+					    job->data.blit.dst_pitch,
+					    job->data.blit.dst_format,
+					    job->data.blit.dst_x,
+					    job->data.blit.dst_y,
+					    job->data.blit.dst_w,
+					    job->data.blit.dst_h,
+					    job->data.blit.flags);
+		
+		if (ret < 0) {
+			dev_err(g2d->dev, "G2D_CMD_ROTATE failed: %d\n", ret);
+			dma_fence_set_error(job->fence, ret);
+			dma_fence_signal(job->fence);
+			
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			g2d->current_job = NULL;
+			atomic64_inc(&g2d->jobs_failed);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+			
+			queue_work(g2d->job_wq, &job->cleanup_work);
+			queue_work(g2d->job_wq, &g2d->job_work);
+		}
+		break;
+	
+	case G2D_JOB_CMD_MASK:
+		/* Color keying / chromakey operation */
+		ret = sunxi_g2d_do_blit_alpha_3buf(g2d,
+						   job->src_dma,
+						   job->data.blit.src_width,
+						   job->data.blit.src_height,
+						   job->data.blit.src_pitch,
+						   job->data.blit.src_format,
+						   job->data.blit.src_crop_x,
+						   job->data.blit.src_crop_y,
+						   job->data.blit.src_crop_w,
+						   job->data.blit.src_crop_h,
+						   job->data.blit.src_alpha,
+						   job->data.blit.src_alpha_mode,
+						   job->data.blit.src_premul,
+						   job->data.blit.src_color_space,
+						   job->dst_dma,
+						   job->dst_dma,  /* dst_base_addr = dst_dma */
+						   job->data.blit.dst_width,
+						   job->data.blit.dst_height,
+						   job->data.blit.dst_pitch,
+						   job->data.blit.dst_format,
+						   job->data.blit.dst_x,
+						   job->data.blit.dst_y,
+						   job->data.blit.dst_w,
+						   job->data.blit.dst_h,
+						   job->data.blit.dst_alpha,
+						   job->data.blit.dst_alpha_mode,
+						   job->data.blit.dst_premul,
+						   job->data.blit.dst_color_space,
+						   job->out_dma,
+						   job->data.blit.out_width,
+						   job->data.blit.out_height,
+						   job->data.blit.out_pitch,
+						   job->data.blit.out_format,
+						   job->data.blit.dst_w,
+						   job->data.blit.dst_h,
+						   job->data.blit.bld_mode,
+						   job->data.blit.color_key_enable,
+						   job->data.blit.color_key_mode,
+						   job->data.blit.color_key_min,
+						   job->data.blit.color_key_max);
+		
+		if (ret < 0) {
+			dev_err(g2d->dev, "G2D_CMD_MASK failed: %d\n", ret);
+			dma_fence_set_error(job->fence, ret);
+			dma_fence_signal(job->fence);
+			
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			g2d->current_job = NULL;
+			atomic64_inc(&g2d->jobs_failed);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+			
+			queue_work(g2d->job_wq, &job->cleanup_work);
+			queue_work(g2d->job_wq, &g2d->job_work);
+		}
+		break;
+	
+	case G2D_JOB_CMD_COPY:
+		/* Simple copy operation - no scaling, no blending, no rotation */
+		ret = sunxi_g2d_do_blit(g2d,
+					job->src_dma,
+					job->data.blit.src_width,
+					job->data.blit.src_height,
+					job->data.blit.src_pitch,
+					job->data.blit.src_format,
+					job->data.blit.src_crop_x,
+					job->data.blit.src_crop_y,
+					job->data.blit.src_crop_w,
+					job->data.blit.src_crop_h,
+					job->data.blit.src_color_space,
+					job->dst_dma,
+					job->data.blit.dst_width,
+					job->data.blit.dst_height,
+					job->data.blit.dst_pitch,
+					job->data.blit.dst_format,
+					job->data.blit.dst_x,
+					job->data.blit.dst_y,
+					job->data.blit.dst_w,
+					job->data.blit.dst_h,
+					job->data.blit.dst_color_space);
+		
+		if (ret < 0) {
+			dev_err(g2d->dev, "G2D_CMD_COPY failed: %d\n", ret);
+			dma_fence_set_error(job->fence, ret);
+			dma_fence_signal(job->fence);
+			
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			g2d->current_job = NULL;
+			atomic64_inc(&g2d->jobs_failed);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+			
+			queue_work(g2d->job_wq, &job->cleanup_work);
+			queue_work(g2d->job_wq, &g2d->job_work);
 		}
 		break;
 		
@@ -2223,36 +2497,9 @@ static long sunxi_g2d_ioctl_fillrect_rcq(struct sunxi_g2d_dev *g2d, unsigned lon
 		dma_fence_put(in_fence);
 	}
 
-	/* Calculate bytes per pixel based on format */
+	/* Get bytes per pixel using unified format function */
 	u32 bpp;
-	switch (fill.dst.format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_RGBA8888:
-	case G2D_FMT_BGRA8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_XBGR8888:
-	case G2D_FMT_RGBX8888:
-	case G2D_FMT_BGRX8888:
-		bpp = 4;
-		break;
-	case G2D_FMT_RGB888:
-	case G2D_FMT_BGR888:
-		bpp = 3;
-		break;
-	case G2D_FMT_RGB565:
-	case G2D_FMT_BGR565:
-	case G2D_FMT_ARGB4444:
-	case G2D_FMT_ABGR4444:
-	case G2D_FMT_RGBA4444:
-	case G2D_FMT_BGRA4444:
-	case G2D_FMT_ARGB1555:
-	case G2D_FMT_ABGR1555:
-	case G2D_FMT_RGBA5551:
-	case G2D_FMT_BGRA5551:
-		bpp = 2;
-		break;
-	default:
+	if (sunxi_g2d_format_to_hw(fill.dst.format, &bpp) < 0) {
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", fill.dst.format);
 		ret = -EINVAL;
 		goto err_unmap;
@@ -2359,23 +2606,35 @@ static int sunxi_g2d_open(struct inode *inode, struct file *file)
 						  struct sunxi_g2d_dev, cdev);
 	int ret = 0;
 	
+	dev_dbg(g2d->dev, "=== MODULE WITH NEW G2D_IOC_CMD API LOADED ===\n");
+	dev_dbg(g2d->dev, "sizeof(g2d_buf)=%zu sizeof(g2d_cmd)=%zu G2D_IOC_CMD=0x%08lx\n",
+		sizeof(struct g2d_buf), sizeof(struct g2d_cmd), (unsigned long)G2D_IOC_CMD);
 	dev_dbg(g2d->dev, "Device opened\n");
-	
+
 	file->private_data = g2d;
-	
+
+	dev_dbg(g2d->dev, "About to lock mutex and enable hardware\n");
+
 	/* Increment user count and enable hardware if first user */
 	mutex_lock(&g2d->dev_mutex);
-	
+
+	dev_dbg(g2d->dev, "Mutex locked, users=%d\n", atomic_read(&g2d->users));
+
 	if (atomic_inc_return(&g2d->users) == 1) {
+		dev_dbg(g2d->dev, "First user, enabling hardware\n");
 		ret = sunxi_g2d_hw_enable(g2d);
 		if (ret) {
+			dev_err(g2d->dev, "Hardware enable failed: %d\n", ret);
 			atomic_dec(&g2d->users);
 			mutex_unlock(&g2d->dev_mutex);
 			return ret;
 		}
+		dev_dbg(g2d->dev, "Hardware enabled successfully\n");
 	}
 	
 	mutex_unlock(&g2d->dev_mutex);
+
+	dev_dbg(g2d->dev, "Open completed successfully\n");
 	
 	return 0;
 }
@@ -2799,37 +3058,48 @@ static int sunxi_g2d_do_blit_alpha_rcq(struct sunxi_g2d_dev *g2d,
 
 /*
  * Get BLD_CTL value for Porter-Duff blending mode
- * Based on BSP driver implementation
+ * 
+ * HARDWARE QUIRK COMPENSATION:
+ * The G2D hardware has V0 and WB registers with INVERTED semantic roles:
+ * - V0 (labeled "source") → acts as DESTINATION in blend equation
+ * - WB (labeled "destination") → acts as SOURCE in blend equation
+ * 
+ * Solution: The enum g2d_bld_mode values are SWAPPED to compensate.
+ * When user requests G2D_BLD_SRCOVER (value 4), we use hardware register
+ * value 0x01030103 (DSTOVER), which produces correct "src OVER dst" behavior.
+ * 
+ * This function maps swapped enum values → correct hardware register values.
+ * Applications use standard Porter-Duff semantics, driver handles the quirk.
  */
 static u32 sunxi_g2d_get_bld_mode(u32 mode)
 {
 	switch (mode) {
-	case 0:  /* G2D_BLD_CLEAR */
+	case G2D_BLD_CLEAR:	/* 0 */
 		return 0x00000000;
-	case 1:  /* G2D_BLD_COPY */
+	case G2D_BLD_COPY:	/* 1 */
 		return 0x00010001;
-	case 2:  /* G2D_BLD_DST */
+	case G2D_BLD_DST:	/* 2 */
 		return 0x01000100;
-	case 3:  /* G2D_BLD_SRCOVER */
-		return 0x03010301;
-	case 4:  /* G2D_BLD_DSTOVER */
+	case G2D_BLD_SRCOVER:	/* 4 (swapped!) - use DSTOVER hw value */
 		return 0x01030103;
-	case 5:  /* G2D_BLD_SRCIN */
-		return 0x00020002;
-	case 6:  /* G2D_BLD_DSTIN */
+	case G2D_BLD_DSTOVER:	/* 3 (swapped!) - use SRCOVER hw value */
+		return 0x03010301;
+	case G2D_BLD_SRCIN:	/* 6 (swapped!) - use DSTIN hw value */
 		return 0x02000200;
-	case 7:  /* G2D_BLD_SRCOUT */
-		return 0x00030003;
-	case 8:  /* G2D_BLD_DSTOUT */
+	case G2D_BLD_DSTIN:	/* 5 (swapped!) - use SRCIN hw value */
+		return 0x00020002;
+	case G2D_BLD_SRCOUT:	/* 8 (swapped!) - use DSTOUT hw value */
 		return 0x03000300;
-	case 9:  /* G2D_BLD_SRCATOP */
-		return 0x03020302;
-	case 10: /* G2D_BLD_DSTATOP */
+	case G2D_BLD_DSTOUT:	/* 7 (swapped!) - use SRCOUT hw value */
+		return 0x00030003;
+	case G2D_BLD_SRCATOP:	/* 10 (swapped!) - use DSTATOP hw value */
 		return 0x02030203;
-	case 11: /* G2D_BLD_XOR */
+	case G2D_BLD_DSTATOP:	/* 9 (swapped!) - use SRCATOP hw value */
+		return 0x03020302;
+	case G2D_BLD_XOR:	/* 11 - symmetric, no swap needed */
 		return 0x03030303;
 	default:
-		return 0x03010301;  /* Default to SRCOVER */
+		return 0x01030103;  /* Default to SRCOVER (hw DSTOVER value) */
 	}
 }
 
@@ -2875,8 +3145,17 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 			dst_w, dst_h, dst_x, dst_y, dst_alpha, dst_alpha_mode, dst_premul,
 			out_crop_w, out_crop_h, blend_w, blend_h);
 
+	/* SIMPLIFIED VERSION: No scaling support - operation must be atomic
+	 * If scaling needed, do it in a separate operation before blending */
+	if (src_crop_w != blend_w || src_crop_h != blend_h) {
+		dev_err(g2d->dev, "Scaling not supported in atomic blend mode. "
+			"src=%ux%u blend=%ux%u - do separate scale operation first.\n",
+			src_crop_w, src_crop_h, blend_w, blend_h);
+		return -EINVAL;
+	}
+
 	/* Check if scaling is needed (G2D V2 requires TWO operations for scale+blend) */
-	bool needs_scaling = (src_crop_w != blend_w) || (src_crop_h != blend_h);
+	bool needs_scaling = false;  /* Always false now */
 	
 	if (needs_scaling) {
 		/*
@@ -3091,22 +3370,12 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	dev_dbg(g2d->dev, "UI2 (Pipe0/BG): addr=0x%llx size=%ux%u pitch=%u win=%ux%u alpha=%u mode=%u\n",
 			 (u64)ui2_addr, blend_w, blend_h, dst_pitch, blend_w, blend_h, dst_alpha, dst_alpha_mode);
 
-	/* === Configure V0 (Pipe1: foreground/ball with alpha) === */
+	/* === Configure V0 (Pipe1: foreground/source with alpha) === */
 
-	/* Calculate bytes per pixel for V0 */
-	switch (src_format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		v0_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		v0_bpp = 2;
-		break;
-	default:
-		v0_bpp = 4;
-		break;
+	/* Get bytes per pixel for V0 using unified format function */
+	if (sunxi_g2d_format_to_hw(src_format, &v0_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported V0 source format: %u\n", src_format);
+		return -EINVAL;
 	}
 
 	/* V0 address = ball buffer base + offset */
@@ -3192,6 +3461,13 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	 */
 	bld.bld_ctrl.dwval = sunxi_g2d_get_bld_mode(bld_mode);
 
+	dev_dbg(g2d->dev, "BLD CONFIG: mode=%u bld_ctrl=0x%08X bld_en_ctrl=0x%08X premulti_ctrl=0x%08X\n",
+		bld_mode, bld.bld_ctrl.dwval, bld.bld_en_ctrl.dwval, bld.premulti_ctrl.dwval);
+	dev_dbg(g2d->dev, "BLD SIZES: p0=%ux%u p1=%ux%u out=%ux%u\n",
+		bld.mem_size[0].bits.width + 1, bld.mem_size[0].bits.height + 1,
+		bld.mem_size[1].bits.width + 1, bld.mem_size[1].bits.height + 1,
+		bld.out_size.bits.width + 1, bld.out_size.bits.height + 1);
+
 	/* Output in RGB mode (framebuffer is XRGB8888) */
 	bld.out_color.dwval = 0;  /* Clear all first */
 	bld.out_color.bits.alpha_mode = 0;  /* RGB mode (not YUV) */
@@ -3274,20 +3550,10 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 	/* === Configure Writeback - Write result to OUTPUT buffer (separate from inputs) === */
 
-	/* Calculate bytes per pixel for writeback first (needed for offset calculation) */
-	switch (out_format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		wb_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		wb_bpp = 2;
-		break;
-	default:
-		wb_bpp = 4;
-		break;
+	/* Get bytes per pixel for writeback using unified format function (needed for offset calculation) */
+	if (sunxi_g2d_format_to_hw(out_format, &wb_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported writeback output format: %u\n", out_format);
+		return -EINVAL;
 	}
 
 	/* WB address calculation:
@@ -3379,43 +3645,6 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 }
 
 /**
- * sunxi_g2d_dump_buffer - Dump buffer contents to /tmp for debugging
- * @g2d: G2D device
- * @vaddr: Virtual address of buffer (must be CPU-accessible)
- * @size: Buffer size in bytes
- * @name: Filename prefix (e.g., "vsu-output")
- *
- * Writes buffer to /tmp/<name>-<timestamp>.raw
- */
-// static void sunxi_g2d_dump_buffer(struct sunxi_g2d_dev *g2d, void *vaddr,
-//                                   size_t size, const char *name)
-// {
-// 	struct file *f;
-// 	char path[128];
-// 	loff_t pos = 0;
-// 	ssize_t written;
-	
-// 	snprintf(path, sizeof(path), "/tmp/%s-%lld.raw", name, ktime_get_ns());
-	
-// 	f = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-// 	if (IS_ERR(f)) {
-// 		dev_err(g2d->dev, "Failed to create dump file %s: %ld\n",
-// 			path, PTR_ERR(f));
-// 		return;
-// 	}
-	
-// 	written = kernel_write(f, vaddr, size, &pos);
-// 	filp_close(f, NULL);
-	
-// 	if (written != size) {
-// 		dev_err(g2d->dev, "Dump incomplete: wrote %zd/%zu bytes to %s\n",
-// 			written, size, path);
-// 	} else {
-// 		dev_dbg(g2d->dev, "✅ Dumped %zu bytes to %s\n", size, path);
-// 	}
-// }
-
-/**
  * sunxi_g2d_do_scale - Isolated scaling operation using VSU
  *
  * Performs ONLY scaling (via Video Scaler Unit), no blending or other effects.
@@ -3459,66 +3688,20 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
 	
 	/* === Convert format enums to hardware values === */
 	
-	/* Source format conversion
-	 * CRITICAL: ION buffers created by userspace are in native ARGB format
-	 * The VSU reads pixels byte-by-byte and expects the format to match memory layout
-	 * DO NOT swap R↔B for source - use direct mapping like BSP does
-	 */
-	switch (src_format) {
-	case G2D_FMT_ARGB8888:
-		src_bpp = 4;
-		hw_src_fmt = G2D_FORMAT_ARGB8888;  /* Direct mapping, NO swap */
-		break;
-	case G2D_FMT_XRGB8888:
-		src_bpp = 4;
-		hw_src_fmt = G2D_FORMAT_XRGB8888;  /* Direct mapping, NO swap */
-		break;
-	case G2D_FMT_ABGR8888:
-		src_bpp = 4;
-		hw_src_fmt = G2D_FORMAT_ABGR8888;  /* Direct mapping */
-		break;
-	case G2D_FMT_XBGR8888:
-		src_bpp = 4;
-		hw_src_fmt = G2D_FORMAT_XBGR8888;  /* Direct mapping */
-		break;
-	case G2D_FMT_RGB565:
-		src_bpp = 2;
-		hw_src_fmt = G2D_FORMAT_RGB565;
-		break;
-	default:
+	/* Use unified format conversion function for all formats */
+	ret = sunxi_g2d_format_to_hw(src_format, &src_bpp);
+	if (ret < 0) {
 		dev_err(g2d->dev, "Unsupported source format: %u\n", src_format);
 		return -EINVAL;
 	}
+	hw_src_fmt = ret;  /* sunxi_g2d_format_to_hw returns hw format value */
 	
-	/* Destination format conversion
-	 * For DRM framebuffer output, we may need R↔B swap depending on DRM format
-	 * But for intermediate buffers (temp), use direct mapping
-	 */
-	switch (dst_format) {
-	case G2D_FMT_ARGB8888:
-		dst_bpp = 4;
-		hw_dst_fmt = G2D_FORMAT_ARGB8888;  /* Direct mapping for temp buffers */
-		break;
-	case G2D_FMT_XRGB8888:
-		dst_bpp = 4;
-		hw_dst_fmt = G2D_FORMAT_XRGB8888;  /* Direct mapping */
-		break;
-	case G2D_FMT_ABGR8888:
-		dst_bpp = 4;
-		hw_dst_fmt = G2D_FORMAT_ABGR8888;  /* Direct mapping */
-		break;
-	case G2D_FMT_XBGR8888:
-		dst_bpp = 4;
-		hw_dst_fmt = G2D_FORMAT_XBGR8888;  /* Direct mapping */
-		break;
-	case G2D_FMT_RGB565:
-		dst_bpp = 2;
-		hw_dst_fmt = G2D_FORMAT_RGB565;
-		break;
-	default:
+	ret = sunxi_g2d_format_to_hw(dst_format, &dst_bpp);
+	if (ret < 0) {
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
 		return -EINVAL;
 	}
+	hw_dst_fmt = ret;  /* sunxi_g2d_format_to_hw returns hw format value */
 	
 	/* Calculate DMA addresses with offsets */
 	src_offset_dma = src_dma + (src_y * src_pitch) + (src_x * src_bpp);
@@ -3783,24 +3966,14 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 		src_width, src_height, (u64)src_dma, src_x, src_y, src_crop_w, src_crop_h,
 		dst_x, dst_y, dst_w, dst_h, (u64)dst_dma);
 	
-	/* Calculate source format info for V0 configuration */
+	/* Get source format info for V0 configuration using unified format function */
 	u32 src_bpp;
-	switch (src_format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		src_bpp = 4;
-		v0_attctl = 0x00; /* ARGB8888 format code for V0_ATTCTL */
-		break;
-	case G2D_FMT_RGB565:
-		src_bpp = 2;
-		v0_attctl = 0x0a; /* RGB565 format */
-		break;
-	default:
+	int hw_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
+	if (hw_fmt < 0) {
 		dev_err(g2d->dev, "Unsupported source format: %u\n", src_format);
 		return -EINVAL;
 	}
+	v0_attctl = (u32)hw_fmt;  /* Hardware format code for V0_ATTCTL */
 	
 	src_offset_dma = src_dma + (src_y * src_pitch) + (src_x * src_bpp);
 	
@@ -3874,23 +4047,12 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 	
 	/* 6. Setup WB (writeback) with destination offset */
 	u32 dst_bpp;
-	u32 wb_att = 0;
-	switch (dst_format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		dst_bpp = 4;
-		wb_att = 0x00; /* ARGB8888 */
-		break;
-	case G2D_FMT_RGB565:
-		dst_bpp = 2;
-		wb_att = 0x0a; /* RGB565 */
-		break;
-	default:
+	int hw_dst_fmt = sunxi_g2d_format_to_hw(dst_format, &dst_bpp);
+	if (hw_dst_fmt < 0) {
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
 		return -EINVAL;
 	}
+	u32 wb_att = (u32)hw_dst_fmt;  /* Hardware format code for WB_ATT */
 	
 	/* Calculate destination address with offset */
 	dma_addr_t dst_offset_dma = dst_dma + (dst_y * dst_pitch) + (dst_x * dst_bpp);
@@ -4018,36 +4180,17 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
 	wmb();
 	
-	/* Map format to ROT format (based on BSP) */
-	switch (src_format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		src_bpp = 4;
-		rot_fmt = 0x00;  /* G2D_FORMAT_ARGB8888 */
-		break;
-	case G2D_FMT_RGB565:
-		src_bpp = 2;
-		rot_fmt = 0x0a;  /* G2D_FORMAT_RGB565 */
-		break;
-	default:
+	/* Get ROT format codes and bpp using unified format function */
+	int hw_src_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
+	if (hw_src_fmt < 0) {
 		dev_err(g2d->dev, "Unsupported ROT source format: %u\n", src_format);
 		return -EINVAL;
 	}
+	rot_fmt = (u32)hw_src_fmt;  /* Hardware format code for ROT_IFMT */
 	
 	/* Destination format should match source */
-	switch (dst_format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		dst_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		dst_bpp = 2;
-		break;
-	default:
+	int hw_dst_fmt = sunxi_g2d_format_to_hw(dst_format, &dst_bpp);
+	if (hw_dst_fmt < 0) {
 		dev_err(g2d->dev, "Unsupported ROT destination format: %u\n", dst_format);
 		return -EINVAL;
 	}
@@ -4208,10 +4351,10 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 						    out_dma_addr, /* Write to out (may == dst for in-place) */
 						    out_w, out_h,
 						    out_pitch, out_format,
-						    blend_w, blend_h,  /* out_crop = blend size */
+						    0, 0,  /* out_x, out_y */
 						    bld_mode,
-						    color_key_enable, color_key_mode,
-						    color_key_min, color_key_max);         /* Porter-Duff blend mode */
+						    color_key_min, color_key_max, color_key_mode,
+						    NULL);  /* fence_out */
 	} else {
 		/* Simple copy/scale path - use MIXER with optional VSU */
 		return sunxi_g2d_do_blit(g2d,
@@ -4223,6 +4366,1253 @@ static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
 					 out_pitch, out_format,
 					 dst_x, dst_y, blend_w, blend_h,
 					 dst_color_space);
+	}
+}
+
+/*
+ * G2D_CMD_SCALE handler: Scaling operation
+ * Scales src buffer to dst_w x dst_h size using VSU
+ */
+static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
+{
+	struct g2d_cmd cmd;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr;
+	u32 src_bpp, dst_bpp;
+	int ret;
+	struct dma_fence *fence;
+	struct sync_file *sync_file;
+	int fence_fd;
+	struct sunxi_g2d_job *job;
+	
+	/* Copy command from userspace */
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd))) {
+		dev_err(g2d->dev, "SCALE: copy_from_user failed\n");
+		return -EFAULT;
+	}
+	
+	/* Validate buffer formats */
+	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		return -EINVAL;
+	}
+	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		return -EINVAL;
+	}
+	
+	/* Import source buffer */
+	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
+	if (IS_ERR(src_dmabuf)) {
+		dev_err(g2d->dev, "SCALE: dma_buf_get(src) failed: %ld\n", PTR_ERR(src_dmabuf));
+		return PTR_ERR(src_dmabuf);
+	}
+	
+	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
+	if (IS_ERR(src_attach)) {
+		dev_err(g2d->dev, "SCALE: dma_buf_attach(src) failed: %ld\n", PTR_ERR(src_attach));
+		ret = PTR_ERR(src_attach);
+		goto err_put_src;
+	}
+	
+	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
+	if (IS_ERR(src_sgt)) {
+		dev_err(g2d->dev, "SCALE: dma_buf_map_attachment(src) failed: %ld\n", PTR_ERR(src_sgt));
+		ret = PTR_ERR(src_sgt);
+		goto err_detach_src;
+	}
+	
+	src_dma_addr = sg_dma_address(src_sgt->sgl);
+	
+	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0 */
+	if (src_dma_addr == 0 && src_sgt->nents > 0) {
+		struct scatterlist *sg = src_sgt->sgl;
+		struct page *page = sg_page(sg);
+		if (page) {
+			src_dma_addr = page_to_phys(page) + sg->offset;
+		} else {
+			dev_err(g2d->dev, "SCALE: Failed to get src physical address\n");
+			ret = -EINVAL;
+			goto err_unmap_src;
+		}
+	}
+	
+	/* Import destination buffer */
+	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
+	if (IS_ERR(dst_dmabuf)) {
+		dev_err(g2d->dev, "SCALE: dma_buf_get(dst) failed: %ld\n", PTR_ERR(dst_dmabuf));
+		ret = PTR_ERR(dst_dmabuf);
+		goto err_unmap_src;
+	}
+	
+	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+	if (IS_ERR(dst_attach)) {
+		dev_err(g2d->dev, "SCALE: dma_buf_attach(dst) failed: %ld\n", PTR_ERR(dst_attach));
+		ret = PTR_ERR(dst_attach);
+		goto err_put_dst;
+	}
+	
+	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
+	if (IS_ERR(dst_sgt)) {
+		dev_err(g2d->dev, "SCALE: dma_buf_map_attachment(dst) failed: %ld\n", PTR_ERR(dst_sgt));
+		ret = PTR_ERR(dst_sgt);
+		goto err_detach_dst;
+	}
+	
+	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
+	
+	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0 */
+	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
+		struct scatterlist *sg = dst_sgt->sgl;
+		struct page *page = sg_page(sg);
+		if (page) {
+			dst_dma_addr = page_to_phys(page) + sg->offset;
+		} else {
+			dev_err(g2d->dev, "SCALE: Failed to get dst physical address\n");
+			ret = -EINVAL;
+			goto err_unmap_dst;
+		}
+	}
+	
+	/* Create fence for async operation */
+	fence = sunxi_g2d_fence_create(g2d);
+	if (!fence) {
+		dev_err(g2d->dev, "SCALE: fence_create failed\n");
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	/* Create sync_file for userspace */
+	sync_file = sync_file_create(fence);
+	if (!sync_file) {
+		dev_err(g2d->dev, "SCALE: sync_file_create failed\n");
+		dma_fence_put(fence);
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	fence_fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fence_fd < 0) {
+		dev_err(g2d->dev, "SCALE: get_unused_fd failed\n");
+		fput(sync_file->file);
+		ret = fence_fd;
+		goto err_unmap_dst;
+	}
+	
+	/* Create async job */
+	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	if (!job) {
+		dev_err(g2d->dev, "SCALE: job allocation failed\n");
+		put_unused_fd(fence_fd);
+		fput(sync_file->file);
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+	job->g2d = g2d;
+	job->fence = fence;
+	job->src_dmabuf = src_dmabuf;
+	job->dst_dmabuf = dst_dmabuf;
+	job->src_attach = src_attach;
+	job->dst_attach = dst_attach;
+	job->src_sgt = src_sgt;
+	job->dst_sgt = dst_sgt;
+	
+	/* Setup job parameters */
+	job->type = G2D_JOB_CMD_SCALE;
+	job->src_dma = src_dma_addr;
+	job->dst_dma = dst_dma_addr;
+	
+	/* Fill blit data structure */
+	job->data.blit.src_width = cmd.src.width;
+	job->data.blit.src_height = cmd.src.height;
+	job->data.blit.src_pitch = cmd.src.stride[0];
+	job->data.blit.src_format = cmd.src.format;
+	job->data.blit.src_crop_x = cmd.src.crop_x;
+	job->data.blit.src_crop_y = cmd.src.crop_y;
+	job->data.blit.src_crop_w = cmd.src.crop_w;
+	job->data.blit.src_crop_h = cmd.src.crop_h;
+	job->data.blit.src_color_space = cmd.src.color_space;
+	
+	job->data.blit.dst_width = cmd.dst.width;
+	job->data.blit.dst_height = cmd.dst.height;
+	job->data.blit.dst_pitch = cmd.dst.stride[0];
+	job->data.blit.dst_format = cmd.dst.format;
+	job->data.blit.dst_x = cmd.dst_x;
+	job->data.blit.dst_y = cmd.dst_y;
+	job->data.blit.dst_w = cmd.dst_w;
+	job->data.blit.dst_h = cmd.dst_h;
+	job->data.blit.dst_color_space = cmd.dst.color_space;
+	
+	/* Enqueue job to worker */
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		list_add_tail(&job->node, &g2d->job_queue);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+	}
+	
+	queue_work(g2d->job_wq, &g2d->job_work);
+	
+	/* Install fence fd */
+	fd_install(fence_fd, sync_file->file);
+	
+	/* Return fence fd to userspace */
+	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
+		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
+		/* Job already enqueued, can't cleanly abort */
+		return -EFAULT;
+	}
+	
+	return 0;
+	
+err_unmap_dst:
+	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
+err_detach_dst:
+	dma_buf_detach(dst_dmabuf, dst_attach);
+err_put_dst:
+	dma_buf_put(dst_dmabuf);
+err_unmap_src:
+	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+err_detach_src:
+	dma_buf_detach(src_dmabuf, src_attach);
+err_put_src:
+	dma_buf_put(src_dmabuf);
+	return ret;
+}
+
+/*
+ * G2D_CMD_BLEND handler: Alpha blending operation
+ * Blends src + dst → out using specified Porter-Duff mode
+ */
+static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
+{
+	struct g2d_cmd cmd;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
+	u32 src_bpp, dst_bpp, out_bpp;
+	int ret;
+	struct dma_fence *fence;
+	struct sync_file *sync_file;
+	int fence_fd;
+	struct sunxi_g2d_job *job;
+	
+	/* Copy command from userspace */
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	
+	/* Validate buffer formats */
+	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		return -EINVAL;
+	}
+	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		return -EINVAL;
+	}
+	if (sunxi_g2d_format_to_hw(cmd.out.format, &out_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported output format: %u\n", cmd.out.format);
+		return -EINVAL;
+	}
+	
+	/* BLEND requires output buffer */
+	if (cmd.out.dma_fd < 0) {
+		dev_err(g2d->dev, "G2D_CMD_BLEND requires valid out.dma_fd\n");
+		return -EINVAL;
+	}
+	
+	/* Validate blend mode */
+	if (cmd.params.blend.bld_mode > G2D_BLD_XOR) {
+		dev_err(g2d->dev, "Invalid blend mode: %u\n", cmd.params.blend.bld_mode);
+		return -EINVAL;
+	}
+	
+	/* G2D_CMD_BLEND does ONLY blending, NO scaling
+	 * If scaling is needed, use G2D_CMD_SCALE first, then BLEND
+	 */
+	if (cmd.src.crop_w != cmd.dst_w || cmd.src.crop_h != cmd.dst_h) {
+		dev_err(g2d->dev, "BLEND requires no scaling (use SCALE first): src_crop=%ux%u dst=%ux%u\n",
+		       cmd.src.crop_w, cmd.src.crop_h, cmd.dst_w, cmd.dst_h);
+		return -EINVAL;
+	}
+	
+	/* Import source buffer */
+	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
+	if (IS_ERR(src_dmabuf))
+		return PTR_ERR(src_dmabuf);
+	
+	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
+	if (IS_ERR(src_attach)) {
+		ret = PTR_ERR(src_attach);
+		goto err_put_src;
+	}
+	
+	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
+	if (IS_ERR(src_sgt)) {
+		ret = PTR_ERR(src_sgt);
+		goto err_detach_src;
+	}
+	
+	src_dma_addr = sg_dma_address(src_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (src_dma_addr == 0 && src_sgt->nents > 0) {
+		struct page *page = sg_page(src_sgt->sgl);
+		if (page)
+			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_src;
+		}
+	}
+	
+	/* Import destination buffer */
+	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
+	if (IS_ERR(dst_dmabuf)) {
+		ret = PTR_ERR(dst_dmabuf);
+		goto err_unmap_src;
+	}
+	
+	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+	if (IS_ERR(dst_attach)) {
+		ret = PTR_ERR(dst_attach);
+		goto err_put_dst;
+	}
+	
+	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_TO_DEVICE);
+	if (IS_ERR(dst_sgt)) {
+		ret = PTR_ERR(dst_sgt);
+		goto err_detach_dst;
+	}
+	
+	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
+		struct page *page = sg_page(dst_sgt->sgl);
+		if (page)
+			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_dst;
+		}
+	}
+	
+	/* Import output buffer */
+	out_dmabuf = dma_buf_get(cmd.out.dma_fd);
+	if (IS_ERR(out_dmabuf)) {
+		ret = PTR_ERR(out_dmabuf);
+		goto err_unmap_dst;
+	}
+	
+	out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
+	if (IS_ERR(out_attach)) {
+		ret = PTR_ERR(out_attach);
+		goto err_put_out;
+	}
+	
+	out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
+	if (IS_ERR(out_sgt)) {
+		ret = PTR_ERR(out_sgt);
+		goto err_detach_out;
+	}
+	
+	out_dma_addr = sg_dma_address(out_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (out_dma_addr == 0 && out_sgt->nents > 0) {
+		struct page *page = sg_page(out_sgt->sgl);
+		if (page)
+			out_dma_addr = page_to_phys(page) + out_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_out;
+		}
+	}
+	
+	/* Create fence for async operation */
+	fence = sunxi_g2d_fence_create(g2d);
+	if (!fence) {
+		ret = -ENOMEM;
+		goto err_unmap_out;
+	}
+	
+	/* Create sync_file for userspace */
+	sync_file = sync_file_create(fence);
+	if (!sync_file) {
+		dma_fence_put(fence);
+		ret = -ENOMEM;
+		goto err_unmap_out;
+	}
+	
+	fence_fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fence_fd < 0) {
+		fput(sync_file->file);
+		ret = fence_fd;
+		goto err_unmap_out;
+	}
+	
+	/* Create async job */
+	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	if (!job) {
+		put_unused_fd(fence_fd);
+		fput(sync_file->file);
+		ret = -ENOMEM;
+		goto err_unmap_out;
+	}
+	
+	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+	job->g2d = g2d;
+	job->fence = fence;
+	job->src_dmabuf = src_dmabuf;
+	job->dst_dmabuf = dst_dmabuf;
+	job->out_dmabuf = out_dmabuf;
+	job->src_attach = src_attach;
+	job->dst_attach = dst_attach;
+	job->out_attach = out_attach;
+	job->src_sgt = src_sgt;
+	job->dst_sgt = dst_sgt;
+	job->out_sgt = out_sgt;
+	
+	/* Setup job parameters */
+	job->type = G2D_JOB_CMD_BLEND;
+	job->src_dma = src_dma_addr;
+	job->dst_dma = dst_dma_addr;
+	job->out_dma = out_dma_addr;
+	
+	/* Fill blit data structure */
+	job->data.blit.src_width = cmd.src.width;
+	job->data.blit.src_height = cmd.src.height;
+	job->data.blit.src_pitch = cmd.src.stride[0];
+	job->data.blit.src_format = cmd.src.format;
+	job->data.blit.src_crop_x = cmd.src.crop_x;
+	job->data.blit.src_crop_y = cmd.src.crop_y;
+	job->data.blit.src_crop_w = cmd.src.crop_w;
+	job->data.blit.src_crop_h = cmd.src.crop_h;
+	job->data.blit.src_alpha = cmd.src.alpha;
+	job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
+	job->data.blit.src_premul = cmd.src.premul_mode;
+	job->data.blit.src_color_space = cmd.src.color_space;
+	
+	job->data.blit.dst_width = cmd.dst.width;
+	job->data.blit.dst_height = cmd.dst.height;
+	job->data.blit.dst_pitch = cmd.dst.stride[0];
+	job->data.blit.dst_format = cmd.dst.format;
+	job->data.blit.dst_x = cmd.dst_x;
+	job->data.blit.dst_y = cmd.dst_y;
+	job->data.blit.dst_w = cmd.dst_w;
+	job->data.blit.dst_h = cmd.dst_h;
+	job->data.blit.dst_alpha = cmd.dst.alpha;
+	job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
+	job->data.blit.dst_premul = cmd.dst.premul_mode;
+	job->data.blit.dst_color_space = cmd.dst.color_space;
+	
+	job->data.blit.out_width = cmd.out.width;
+	job->data.blit.out_height = cmd.out.height;
+	job->data.blit.out_pitch = cmd.out.stride[0];
+	job->data.blit.out_format = cmd.out.format;
+	
+	job->data.blit.bld_mode = cmd.params.blend.bld_mode;
+	
+	/* Enqueue job to worker */
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		list_add_tail(&job->node, &g2d->job_queue);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+	}
+	
+	queue_work(g2d->job_wq, &g2d->job_work);
+	
+	/* Install fence fd */
+	fd_install(fence_fd, sync_file->file);
+	
+	/* Return fence fd to userspace */
+	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
+		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
+		/* Job already enqueued, can't cleanly abort */
+		return -EFAULT;
+	}
+	
+	dev_dbg(g2d->dev, "G2D_CMD_BLEND: enqueued job, fence_fd=%d\n", fence_fd);
+	
+	return 0;
+	
+err_unmap_out:
+	dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
+err_detach_out:
+	dma_buf_detach(out_dmabuf, out_attach);
+err_put_out:
+	dma_buf_put(out_dmabuf);
+err_unmap_dst:
+	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_TO_DEVICE);
+err_detach_dst:
+	dma_buf_detach(dst_dmabuf, dst_attach);
+err_put_dst:
+	dma_buf_put(dst_dmabuf);
+err_unmap_src:
+	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+err_detach_src:
+	dma_buf_detach(src_dmabuf, src_attach);
+err_put_src:
+	dma_buf_put(src_dmabuf);
+	return ret;
+}
+
+/*
+ * G2D_CMD_ROTATE handler: Rotation/flip operation
+ * Rotates/flips src buffer using ROT block
+ */
+static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
+{
+	struct g2d_cmd cmd;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr;
+	u32 src_bpp, dst_bpp;
+	u32 flags = 0;
+	int ret;
+	struct dma_fence *fence;
+	struct sync_file *sync_file;
+	int fence_fd;
+	struct sunxi_g2d_job *job;
+	
+	/* Copy command from userspace */
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	
+	/* Validate buffer formats */
+	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		return -EINVAL;
+	}
+	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		return -EINVAL;
+	}
+	
+	/* Validate and convert rotation angle to flags */
+	switch (cmd.params.rotate.angle) {
+	case 0:
+		/* No rotation, only flips allowed */
+		break;
+	case 90:
+		flags |= G2D_BLIT_FLAG_ROTATE_90;
+		break;
+	case 180:
+		flags |= G2D_BLIT_FLAG_ROTATE_180;
+		break;
+	case 270:
+		flags |= G2D_BLIT_FLAG_ROTATE_270;
+		break;
+	default:
+		dev_err(g2d->dev, "Invalid rotation angle: %u (must be 0, 90, 180, or 270)\n",
+			cmd.params.rotate.angle);
+		return -EINVAL;
+	}
+	
+	if (cmd.params.rotate.flip_h)
+		flags |= G2D_BLIT_FLAG_FLIP_H;
+	if (cmd.params.rotate.flip_v)
+		flags |= G2D_BLIT_FLAG_FLIP_V;
+	
+	/* Import source buffer */
+	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
+	if (IS_ERR(src_dmabuf))
+		return PTR_ERR(src_dmabuf);
+	
+	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
+	if (IS_ERR(src_attach)) {
+		ret = PTR_ERR(src_attach);
+		goto err_put_src;
+	}
+	
+	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
+	if (IS_ERR(src_sgt)) {
+		ret = PTR_ERR(src_sgt);
+		goto err_detach_src;
+	}
+	
+	src_dma_addr = sg_dma_address(src_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (src_dma_addr == 0 && src_sgt->nents > 0) {
+		struct page *page = sg_page(src_sgt->sgl);
+		if (page)
+			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_src;
+		}
+	}
+	
+	/* Import destination buffer */
+	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
+	if (IS_ERR(dst_dmabuf)) {
+		ret = PTR_ERR(dst_dmabuf);
+		goto err_unmap_src;
+	}
+	
+	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+	if (IS_ERR(dst_attach)) {
+		ret = PTR_ERR(dst_attach);
+		goto err_put_dst;
+	}
+	
+	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
+	if (IS_ERR(dst_sgt)) {
+		ret = PTR_ERR(dst_sgt);
+		goto err_detach_dst;
+	}
+	
+	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
+		struct page *page = sg_page(dst_sgt->sgl);
+		if (page)
+			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_dst;
+		}
+	}
+	
+	/* Create fence for async operation */
+	fence = sunxi_g2d_fence_create(g2d);
+	if (!fence) {
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	/* Create sync_file for userspace */
+	sync_file = sync_file_create(fence);
+	if (!sync_file) {
+		dma_fence_put(fence);
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	fence_fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fence_fd < 0) {
+		fput(sync_file->file);
+		ret = fence_fd;
+		goto err_unmap_dst;
+	}
+	
+	/* Create async job */
+	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	if (!job) {
+		put_unused_fd(fence_fd);
+		fput(sync_file->file);
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+	job->g2d = g2d;
+	job->fence = fence;
+	job->src_dmabuf = src_dmabuf;
+	job->dst_dmabuf = dst_dmabuf;
+	job->src_attach = src_attach;
+	job->dst_attach = dst_attach;
+	job->src_sgt = src_sgt;
+	job->dst_sgt = dst_sgt;
+	
+	/* Setup job parameters */
+	job->type = G2D_JOB_CMD_ROTATE;
+	job->src_dma = src_dma_addr;
+	job->dst_dma = dst_dma_addr;
+	
+	/* Fill blit data structure */
+	job->data.blit.src_width = cmd.src.width;
+	job->data.blit.src_height = cmd.src.height;
+	job->data.blit.src_pitch = cmd.src.stride[0];
+	job->data.blit.src_format = cmd.src.format;
+	job->data.blit.src_crop_x = cmd.src.crop_x;
+	job->data.blit.src_crop_y = cmd.src.crop_y;
+	job->data.blit.src_crop_w = cmd.src.crop_w;
+	job->data.blit.src_crop_h = cmd.src.crop_h;
+	job->data.blit.src_color_space = cmd.src.color_space;
+	
+	job->data.blit.dst_width = cmd.dst.width;
+	job->data.blit.dst_height = cmd.dst.height;
+	job->data.blit.dst_pitch = cmd.dst.stride[0];
+	job->data.blit.dst_format = cmd.dst.format;
+	job->data.blit.dst_x = cmd.dst_x;
+	job->data.blit.dst_y = cmd.dst_y;
+	job->data.blit.dst_w = cmd.dst_w;
+	job->data.blit.dst_h = cmd.dst_h;
+	job->data.blit.dst_color_space = cmd.dst.color_space;
+	
+	job->data.blit.flags = flags;
+	
+	/* Enqueue job to worker */
+	{
+		unsigned long iflags;
+		spin_lock_irqsave(&g2d->job_lock, iflags);
+		list_add_tail(&job->node, &g2d->job_queue);
+		spin_unlock_irqrestore(&g2d->job_lock, iflags);
+	}
+	
+	queue_work(g2d->job_wq, &g2d->job_work);
+	
+	/* Install fence fd */
+	fd_install(fence_fd, sync_file->file);
+	
+	/* Return fence fd to userspace */
+	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
+		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
+		/* Job already enqueued, can't cleanly abort */
+		return -EFAULT;
+	}
+	
+	dev_dbg(g2d->dev, "G2D_CMD_ROTATE: enqueued job, fence_fd=%d angle=%u flip_h=%u flip_v=%u\n",
+		fence_fd, cmd.params.rotate.angle, cmd.params.rotate.flip_h, cmd.params.rotate.flip_v);
+	
+	return 0;
+	
+err_unmap_dst:
+	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
+err_detach_dst:
+	dma_buf_detach(dst_dmabuf, dst_attach);
+err_put_dst:
+	dma_buf_put(dst_dmabuf);
+err_unmap_src:
+	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+err_detach_src:
+	dma_buf_detach(src_dmabuf, src_attach);
+err_put_src:
+	dma_buf_put(src_dmabuf);
+	return ret;
+}
+
+/*
+ * G2D_CMD_MASK handler: Color keying operation
+ * Makes specified color range transparent (chromakey)
+ */
+static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
+{
+	struct g2d_cmd cmd;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
+	u32 src_bpp, dst_bpp, out_bpp;
+	int ret;
+	struct dma_fence *fence;
+	struct sync_file *sync_file;
+	int fence_fd;
+	struct sunxi_g2d_job *job;
+	bool has_out_buffer;
+	
+	/* Copy command from userspace */
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	
+	/* Validate buffer formats */
+	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		return -EINVAL;
+	}
+	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		return -EINVAL;
+	}
+	
+	/* Check if output buffer is provided */
+	has_out_buffer = (cmd.out.dma_fd >= 0);
+	
+	if (has_out_buffer) {
+		if (sunxi_g2d_format_to_hw(cmd.out.format, &out_bpp) < 0) {
+			dev_err(g2d->dev, "Unsupported output format: %u\n", cmd.out.format);
+			return -EINVAL;
+		}
+	}
+	
+	/* Import source buffer */
+	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
+	if (IS_ERR(src_dmabuf))
+		return PTR_ERR(src_dmabuf);
+	
+	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
+	if (IS_ERR(src_attach)) {
+		ret = PTR_ERR(src_attach);
+		goto err_put_src;
+	}
+	
+	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
+	if (IS_ERR(src_sgt)) {
+		ret = PTR_ERR(src_sgt);
+		goto err_detach_src;
+	}
+	
+	src_dma_addr = sg_dma_address(src_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (src_dma_addr == 0 && src_sgt->nents > 0) {
+		struct page *page = sg_page(src_sgt->sgl);
+		if (page)
+			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_src;
+		}
+	}
+	
+	/* Import destination buffer */
+	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
+	if (IS_ERR(dst_dmabuf)) {
+		ret = PTR_ERR(dst_dmabuf);
+		goto err_unmap_src;
+	}
+	
+	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+	if (IS_ERR(dst_attach)) {
+		ret = PTR_ERR(dst_attach);
+		goto err_put_dst;
+	}
+	
+	dst_sgt = dma_buf_map_attachment(dst_attach, has_out_buffer ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+	if (IS_ERR(dst_sgt)) {
+		ret = PTR_ERR(dst_sgt);
+		goto err_detach_dst;
+	}
+	
+	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
+		struct page *page = sg_page(dst_sgt->sgl);
+		if (page)
+			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_dst;
+		}
+	}
+	
+	/* Import output buffer if provided */
+	if (has_out_buffer) {
+		out_dmabuf = dma_buf_get(cmd.out.dma_fd);
+		if (IS_ERR(out_dmabuf)) {
+			ret = PTR_ERR(out_dmabuf);
+			goto err_unmap_dst;
+		}
+		
+		out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
+		if (IS_ERR(out_attach)) {
+			ret = PTR_ERR(out_attach);
+			goto err_put_out;
+		}
+		
+		out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
+		if (IS_ERR(out_sgt)) {
+			ret = PTR_ERR(out_sgt);
+			goto err_detach_out;
+		}
+		
+		out_dma_addr = sg_dma_address(out_sgt->sgl);
+		/* Workaround for T113-S3 without IOMMU */
+		if (out_dma_addr == 0 && out_sgt->nents > 0) {
+			struct page *page = sg_page(out_sgt->sgl);
+			if (page)
+				out_dma_addr = page_to_phys(page) + out_sgt->sgl->offset;
+			else {
+				ret = -EINVAL;
+				goto err_unmap_out;
+			}
+		}
+	} else {
+		/* No output buffer - mask in-place (dst is both input and output) */
+		out_dma_addr = dst_dma_addr;
+	}
+	
+	/* Create fence for async operation */
+	fence = sunxi_g2d_fence_create(g2d);
+	if (!fence) {
+		ret = -ENOMEM;
+		goto err_unmap_out;
+	}
+	
+	/* Create sync_file for userspace */
+	sync_file = sync_file_create(fence);
+	if (!sync_file) {
+		dma_fence_put(fence);
+		ret = -ENOMEM;
+		goto err_unmap_out;
+	}
+	
+	fence_fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fence_fd < 0) {
+		fput(sync_file->file);
+		ret = fence_fd;
+		goto err_unmap_out;
+	}
+	
+	/* Create async job */
+	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	if (!job) {
+		put_unused_fd(fence_fd);
+		fput(sync_file->file);
+		ret = -ENOMEM;
+		goto err_unmap_out;
+	}
+	
+	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+	job->g2d = g2d;
+	job->fence = fence;
+	job->src_dmabuf = src_dmabuf;
+	job->dst_dmabuf = dst_dmabuf;
+	job->src_attach = src_attach;
+	job->dst_attach = dst_attach;
+	job->src_sgt = src_sgt;
+	job->dst_sgt = dst_sgt;
+	
+	if (has_out_buffer) {
+		job->out_dmabuf = out_dmabuf;
+		job->out_attach = out_attach;
+		job->out_sgt = out_sgt;
+	}
+	
+	/* Setup job parameters */
+	job->type = G2D_JOB_CMD_MASK;
+	job->src_dma = src_dma_addr;
+	job->dst_dma = dst_dma_addr;
+	job->out_dma = out_dma_addr;
+	
+	/* Fill blit data structure */
+	job->data.blit.src_width = cmd.src.width;
+	job->data.blit.src_height = cmd.src.height;
+	job->data.blit.src_pitch = cmd.src.stride[0];
+	job->data.blit.src_format = cmd.src.format;
+	job->data.blit.src_crop_x = cmd.src.crop_x;
+	job->data.blit.src_crop_y = cmd.src.crop_y;
+	job->data.blit.src_crop_w = cmd.src.crop_w;
+	job->data.blit.src_crop_h = cmd.src.crop_h;
+	job->data.blit.src_alpha = cmd.src.alpha;
+	job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
+	job->data.blit.src_premul = cmd.src.premul_mode;
+	job->data.blit.src_color_space = cmd.src.color_space;
+	
+	job->data.blit.dst_width = cmd.dst.width;
+	job->data.blit.dst_height = cmd.dst.height;
+	job->data.blit.dst_pitch = cmd.dst.stride[0];
+	job->data.blit.dst_format = cmd.dst.format;
+	job->data.blit.dst_x = cmd.dst_x;
+	job->data.blit.dst_y = cmd.dst_y;
+	job->data.blit.dst_w = cmd.dst_w;
+	job->data.blit.dst_h = cmd.dst_h;
+	job->data.blit.dst_alpha = cmd.dst.alpha;
+	job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
+	job->data.blit.dst_premul = cmd.dst.premul_mode;
+	job->data.blit.dst_color_space = cmd.dst.color_space;
+	
+	if (has_out_buffer) {
+		job->data.blit.out_width = cmd.out.width;
+		job->data.blit.out_height = cmd.out.height;
+		job->data.blit.out_pitch = cmd.out.stride[0];
+		job->data.blit.out_format = cmd.out.format;
+	} else {
+		/* In-place: out parameters = dst parameters */
+		job->data.blit.out_width = cmd.dst.width;
+		job->data.blit.out_height = cmd.dst.height;
+		job->data.blit.out_pitch = cmd.dst.stride[0];
+		job->data.blit.out_format = cmd.dst.format;
+	}
+	
+	/* Color keying parameters */
+	job->data.blit.color_key_enable = 1;
+	job->data.blit.color_key_mode = cmd.params.mask.color_key_mode;
+	job->data.blit.color_key_min = cmd.params.mask.color_key_min;
+	job->data.blit.color_key_max = cmd.params.mask.color_key_max;
+	
+	/* Use SRCOVER blend mode for masking */
+	job->data.blit.bld_mode = G2D_BLD_SRCOVER;
+	
+	/* Enqueue job to worker */
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		list_add_tail(&job->node, &g2d->job_queue);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+	}
+	
+	queue_work(g2d->job_wq, &g2d->job_work);
+	
+	/* Install fence fd */
+	fd_install(fence_fd, sync_file->file);
+	
+	/* Return fence fd to userspace */
+	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
+		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
+		/* Job already enqueued, can't cleanly abort */
+		return -EFAULT;
+	}
+	
+	dev_dbg(g2d->dev, "G2D_CMD_MASK: enqueued job, fence_fd=%d\n", fence_fd);
+	
+	return 0;
+	
+err_unmap_out:
+	if (has_out_buffer)
+		dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
+err_detach_out:
+	if (has_out_buffer)
+		dma_buf_detach(out_dmabuf, out_attach);
+err_put_out:
+	if (has_out_buffer)
+		dma_buf_put(out_dmabuf);
+err_unmap_dst:
+	dma_buf_unmap_attachment(dst_attach, dst_sgt, has_out_buffer ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+err_detach_dst:
+	dma_buf_detach(dst_dmabuf, dst_attach);
+err_put_dst:
+	dma_buf_put(dst_dmabuf);
+err_unmap_src:
+	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+err_detach_src:
+	dma_buf_detach(src_dmabuf, src_attach);
+err_put_src:
+	dma_buf_put(src_dmabuf);
+	return ret;
+}
+
+/*
+ * G2D_CMD_COPY handler: Simple copy/blit operation
+ * Copies src buffer region to dst buffer at specified position (no scaling)
+ */
+static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
+{
+	struct g2d_cmd cmd;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL;
+	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
+	dma_addr_t src_dma_addr, dst_dma_addr;
+	u32 src_bpp, dst_bpp;
+	int ret;
+	struct dma_fence *fence;
+	struct sync_file *sync_file;
+	int fence_fd;
+	struct sunxi_g2d_job *job;
+	
+	/* Copy command from userspace */
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	
+	/* Validate buffer formats */
+	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		return -EINVAL;
+	}
+	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		return -EINVAL;
+	}
+	
+	/* Validate dimensions - for COPY, no scaling allowed */
+	if (cmd.src.crop_w != cmd.dst_w || cmd.src.crop_h != cmd.dst_h) {
+		dev_err(g2d->dev, "G2D_CMD_COPY requires src crop size == dst size (no scaling)\n");
+		return -EINVAL;
+	}
+	
+	/* Import source buffer */
+	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
+	if (IS_ERR(src_dmabuf))
+		return PTR_ERR(src_dmabuf);
+	
+	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
+	if (IS_ERR(src_attach)) {
+		ret = PTR_ERR(src_attach);
+		goto err_put_src;
+	}
+	
+	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
+	if (IS_ERR(src_sgt)) {
+		ret = PTR_ERR(src_sgt);
+		goto err_detach_src;
+	}
+	
+	src_dma_addr = sg_dma_address(src_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (src_dma_addr == 0 && src_sgt->nents > 0) {
+		struct page *page = sg_page(src_sgt->sgl);
+		if (page)
+			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_src;
+		}
+	}
+	
+	/* Import destination buffer */
+	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
+	if (IS_ERR(dst_dmabuf)) {
+		ret = PTR_ERR(dst_dmabuf);
+		goto err_unmap_src;
+	}
+	
+	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+	if (IS_ERR(dst_attach)) {
+		ret = PTR_ERR(dst_attach);
+		goto err_put_dst;
+	}
+	
+	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
+	if (IS_ERR(dst_sgt)) {
+		ret = PTR_ERR(dst_sgt);
+		goto err_detach_dst;
+	}
+	
+	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
+	/* Workaround for T113-S3 without IOMMU */
+	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
+		struct page *page = sg_page(dst_sgt->sgl);
+		if (page)
+			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+		else {
+			ret = -EINVAL;
+			goto err_unmap_dst;
+		}
+	}
+	
+	/* Create fence for async operation */
+	fence = sunxi_g2d_fence_create(g2d);
+	if (!fence) {
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	/* Create sync_file for userspace */
+	sync_file = sync_file_create(fence);
+	if (!sync_file) {
+		dma_fence_put(fence);
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	fence_fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fence_fd < 0) {
+		fput(sync_file->file);
+		ret = fence_fd;
+		goto err_unmap_dst;
+	}
+	
+	/* Create async job */
+	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	if (!job) {
+		put_unused_fd(fence_fd);
+		fput(sync_file->file);
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+	
+	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+	job->g2d = g2d;
+	job->fence = fence;
+	job->src_dmabuf = src_dmabuf;
+	job->dst_dmabuf = dst_dmabuf;
+	job->src_attach = src_attach;
+	job->dst_attach = dst_attach;
+	job->src_sgt = src_sgt;
+	job->dst_sgt = dst_sgt;
+	
+	/* Setup job parameters */
+	job->type = G2D_JOB_CMD_COPY;
+	job->src_dma = src_dma_addr;
+	job->dst_dma = dst_dma_addr;
+	
+	/* Fill blit data structure */
+	job->data.blit.src_width = cmd.src.width;
+	job->data.blit.src_height = cmd.src.height;
+	job->data.blit.src_pitch = cmd.src.stride[0];
+	job->data.blit.src_format = cmd.src.format;
+	job->data.blit.src_crop_x = cmd.src.crop_x;
+	job->data.blit.src_crop_y = cmd.src.crop_y;
+	job->data.blit.src_crop_w = cmd.src.crop_w;
+	job->data.blit.src_crop_h = cmd.src.crop_h;
+	job->data.blit.src_color_space = cmd.src.color_space;
+	
+	job->data.blit.dst_width = cmd.dst.width;
+	job->data.blit.dst_height = cmd.dst.height;
+	job->data.blit.dst_pitch = cmd.dst.stride[0];
+	job->data.blit.dst_format = cmd.dst.format;
+	job->data.blit.dst_x = cmd.dst_x;
+	job->data.blit.dst_y = cmd.dst_y;
+	job->data.blit.dst_w = cmd.dst_w;
+	job->data.blit.dst_h = cmd.dst_h;
+	job->data.blit.dst_color_space = cmd.dst.color_space;
+	
+	/* Enqueue job to worker */
+	{
+		unsigned long flags;
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		list_add_tail(&job->node, &g2d->job_queue);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+	}
+	
+	queue_work(g2d->job_wq, &g2d->job_work);
+	
+	/* Install fence fd */
+	fd_install(fence_fd, sync_file->file);
+	
+	/* Return fence fd to userspace */
+	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
+		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
+		/* Job already enqueued, can't cleanly abort */
+		return -EFAULT;
+	}
+	
+	dev_dbg(g2d->dev, "G2D_CMD_COPY: enqueued job, fence_fd=%d\n", fence_fd);
+	
+	return 0;
+	
+err_unmap_dst:
+	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
+err_detach_dst:
+	dma_buf_detach(dst_dmabuf, dst_attach);
+err_put_dst:
+	dma_buf_put(dst_dmabuf);
+err_unmap_src:
+	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+err_detach_src:
+	dma_buf_detach(src_dmabuf, src_attach);
+err_put_src:
+	dma_buf_put(src_dmabuf);
+	return ret;
+}
+
+/*
+ * Handler for specialized G2D_IOC_CMD ioctl
+ * Dispatches to command-specific handlers based on cmd_type
+ */
+static long sunxi_g2d_ioctl_cmd(struct sunxi_g2d_dev *g2d, unsigned long arg)
+{
+	struct g2d_cmd cmd;
+	
+	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
+		return -EFAULT;
+	
+	/* Validate command type */
+	if (cmd.cmd_type > G2D_CMD_MASK) {
+		dev_err(g2d->dev, "Invalid cmd_type: %u\n", cmd.cmd_type);
+		return -EINVAL;
+	}
+	
+	/* Dispatch to command-specific handler */
+	switch (cmd.cmd_type) {
+	case G2D_CMD_COPY:
+		return sunxi_g2d_cmd_copy(g2d, arg);
+	case G2D_CMD_SCALE:
+		return sunxi_g2d_cmd_scale(g2d, arg);
+	case G2D_CMD_BLEND:
+		return sunxi_g2d_cmd_blend(g2d, arg);
+	case G2D_CMD_ROTATE:
+		return sunxi_g2d_cmd_rotate(g2d, arg);
+	case G2D_CMD_MASK:
+		return sunxi_g2d_cmd_mask(g2d, arg);
+	default:
+		dev_err(g2d->dev, "Invalid cmd_type: %u\n", cmd.cmd_type);
+		return -EINVAL;
 	}
 }
 
@@ -4349,35 +5739,15 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		dst_dma_addr = sg_phys(dst_sgt->sgl);
 	}
 	
-	/* Calculate bytes per pixel for source */
-	switch (blit.src.format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		src_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		src_bpp = 2;
-		break;
-	default:
+	/* Calculate bytes per pixel for source using format conversion helper */
+	if (sunxi_g2d_format_to_hw(blit.src.format, &src_bpp) < 0) {
 		dev_err(g2d->dev, "Unsupported source format: %u\n", blit.src.format);
 		ret = -EINVAL;
 		goto err_unmap_dst;
 	}
 	
-	/* Calculate bytes per pixel for destination */
-	switch (blit.dst.format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-		dst_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		dst_bpp = 2;
-		break;
-	default:
+	/* Calculate bytes per pixel for destination using format conversion helper */
+	if (sunxi_g2d_format_to_hw(blit.dst.format, &dst_bpp) < 0) {
 		dev_err(g2d->dev, "Unsupported destination format: %u\n", blit.dst.format);
 		ret = -EINVAL;
 		goto err_unmap_dst;
@@ -5169,391 +6539,6 @@ err_put_dmabuf:
 	return ret;
 }
 
-/*
- * DEPRECATED: sunxi_g2d_ioctl_alpha_blend()
- * This function is no longer used. G2D_IOC_ALPHA_BLEND now redirects to
- * sunxi_g2d_ioctl_blit() in the ioctl switch, which handles alpha blending
- * through the unified BLIT operation with auto-detection.
- * 
- * The entire function is commented out to avoid compilation errors with
- * the removed struct g2d_alpha_blend from the UAPI.
- */
-#if 0
-static long sunxi_g2d_ioctl_alpha_blend(struct sunxi_g2d_dev *g2d,
-					 unsigned long arg)
-{
-	struct g2d_alpha_blend blend;
-	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
-	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
-	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
-	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
-	u32 src_bpp, dst_bpp, out_bpp;
-	u32 src_pitch, dst_pitch, out_pitch;
-	int ret;
-	
-	if (copy_from_user(&blend, (void __user *)arg, sizeof(blend)))
-		return -EFAULT;
-	
-	dev_dbg(g2d->dev, "ALPHA_BLEND IOCTL: src.crop=%ux%u dst.crop=%ux%u out.crop=%ux%u\n",
-		 blend.src.crop_w, blend.src.crop_h,
-		 blend.dst.crop_w, blend.dst.crop_h,
-		 blend.out.crop_w, blend.out.crop_h);
-	
-	dev_dbg(g2d->dev, "ALPHA_BLEND: dst.crop_x=%u dst.crop_y=%u dst.crop_w=%u dst.crop_h=%u\n",
-		 blend.dst.crop_x, blend.dst.crop_y, blend.dst.crop_w, blend.dst.crop_h);
-	
-	/* Validate parameters */
-	if (blend.src.crop_w == 0 || blend.src.crop_h == 0 ||
-	    blend.dst.crop_w == 0 || blend.dst.crop_h == 0 ||
-	    blend.out.crop_w == 0 || blend.out.crop_h == 0) {
-		dev_err(g2d->dev, "Invalid dimensions\n");
-		return -EINVAL;
-	}
-	
-	/* For now, only support DMA-BUF */
-	if (blend.src.dma_fd < 0 || blend.dst.dma_fd < 0 || blend.out.dma_fd < 0) {
-		dev_err(g2d->dev, "Physical address mode not supported (need 3 dma_fds)\n");
-		return -EINVAL;
-	}
-	
-	dev_dbg(g2d->dev, "ALPHA_BLEND (3-buffer): src=%dx%d (alpha=%u mode=%u) dst=%dx%d (alpha=%u mode=%u) out=%dx%d\n",
-		 blend.src.crop_w, blend.src.crop_h, blend.src.alpha, blend.src.alpha_mode,
-		 blend.dst.crop_w, blend.dst.crop_h, blend.dst.alpha, blend.dst.alpha_mode,
-		 blend.out.crop_w, blend.out.crop_h);
-	
-	/* Import source DMA-BUF */
-	src_dmabuf = dma_buf_get(blend.src.dma_fd);
-	if (IS_ERR(src_dmabuf)) {
-		ret = PTR_ERR(src_dmabuf);
-		dev_err(g2d->dev, "Failed to get src dma_buf: %d\n", ret);
-		return ret;
-	}
-	
-	dev_dbg(g2d->dev, "src_dmabuf: size=%zu\n", src_dmabuf->size);
-	
-	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
-	if (IS_ERR(src_attach)) {
-		ret = PTR_ERR(src_attach);
-		dev_err(g2d->dev, "Failed to attach src: %d\n", ret);
-		goto err_put_src;
-	}
-	
-	dev_dbg(g2d->dev, "src attached, mapping with DMA_TO_DEVICE...\n");
-	
-	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
-	if (IS_ERR(src_sgt)) {
-		ret = PTR_ERR(src_sgt);
-		dev_err(g2d->dev, "Failed to map src: %d\n", ret);
-		goto err_detach_src;
-	}
-	
-	dev_dbg(g2d->dev, "src mapped: nents=%u orig_nents=%u\n",
-		 src_sgt->nents, src_sgt->orig_nents);
-	
-	/* Import destination DMA-BUF */
-	dst_dmabuf = dma_buf_get(blend.dst.dma_fd);
-	if (IS_ERR(dst_dmabuf)) {
-		ret = PTR_ERR(dst_dmabuf);
-		goto err_unmap_src;
-	}
-	
-	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
-	if (IS_ERR(dst_attach)) {
-		ret = PTR_ERR(dst_attach);
-		goto err_put_dst;
-	}
-	
-	/* Import output DMA-BUF (writeback destination) first to detect same buffer */
-	out_dmabuf = dma_buf_get(blend.out.dma_fd);
-	if (IS_ERR(out_dmabuf)) {
-		ret = PTR_ERR(out_dmabuf);
-		dev_err(g2d->dev, "Failed to get out dma_buf: %d\n", ret);
-		goto err_detach_dst;
-	}
-	
-	/* Check if dst and out are the same buffer (in-place blending)
-	 * If so, we need DMA_BIDIRECTIONAL for proper cache coherency */
-	bool same_buffer = (dst_dmabuf == out_dmabuf);
-	enum dma_data_direction dst_dir = same_buffer ? DMA_BIDIRECTIONAL : DMA_TO_DEVICE;
-	enum dma_data_direction out_dir = same_buffer ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
-	
-	dev_dbg(g2d->dev, "dst/out same buffer: %s (using %s)\n",
-		 same_buffer ? "YES" : "NO",
-		 same_buffer ? "DMA_BIDIRECTIONAL" : "DMA_TO/FROM_DEVICE");
-	
-	dst_sgt = dma_buf_map_attachment(dst_attach, dst_dir);
-	if (IS_ERR(dst_sgt)) {
-		ret = PTR_ERR(dst_sgt);
-		goto err_put_out;
-	}
-	
-	dev_dbg(g2d->dev, "out_dmabuf: size=%zu\n", out_dmabuf->size);
-	
-	out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
-	if (IS_ERR(out_attach)) {
-		ret = PTR_ERR(out_attach);
-		dev_err(g2d->dev, "Failed to attach out: %d\n", ret);
-		goto err_unmap_dst;
-	}
-	
-	dev_dbg(g2d->dev, "out attached, mapping with direction %s...\n",
-		 same_buffer ? "DMA_BIDIRECTIONAL" : "DMA_FROM_DEVICE");
-	
-	out_sgt = dma_buf_map_attachment(out_attach, out_dir);
-	if (IS_ERR(out_sgt)) {
-		ret = PTR_ERR(out_sgt);
-		dev_err(g2d->dev, "Failed to map out: %d\n", ret);
-		goto err_detach_out;
-	}
-	
-	dev_dbg(g2d->dev, "out mapped: nents=%u orig_nents=%u\n",
-		 out_sgt->nents, out_sgt->orig_nents);
-	
-	/* Get DMA addresses */
-	src_dma_addr = sg_dma_address(src_sgt->sgl);
-	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-	out_dma_addr = sg_dma_address(out_sgt->sgl);
-	
-	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0
-	 * In this case, use physical address directly from the page
-	 */
-	if (src_dma_addr == 0 && src_sgt->nents > 0) {
-		struct scatterlist *sg = src_sgt->sgl;
-		struct page *page = sg_page(sg);
-		if (page) {
-			src_dma_addr = page_to_phys(page) + sg->offset;
-			dev_dbg(g2d->dev, "T113 workaround: src using physical address 0x%llx\n",
-				 (u64)src_dma_addr);
-		}
-	}
-	
-	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
-		struct scatterlist *sg = dst_sgt->sgl;
-		struct page *page = sg_page(sg);
-		if (page) {
-			dst_dma_addr = page_to_phys(page) + sg->offset;
-			dev_dbg(g2d->dev, "T113 workaround: dst using physical address 0x%llx\n",
-				 (u64)dst_dma_addr);
-		}
-	}
-	
-	if (out_dma_addr == 0 && out_sgt->nents > 0) {
-		struct scatterlist *sg = out_sgt->sgl;
-		struct page *page = sg_page(sg);
-		if (page) {
-			out_dma_addr = page_to_phys(page) + sg->offset;
-			dev_dbg(g2d->dev, "T113 workaround: out using physical address 0x%llx\n",
-				 (u64)out_dma_addr);
-		}
-	}
-
-	/* If userspace provided an input fence fd for this alpha blend, wait on it */
-	if (blend.fence_fd_in >= 0) {
-		dev_dbg(g2d->dev, "alpha_blend: importing input fence fd=%d pid=%d\n",
-				blend.fence_fd_in, task_tgid_nr(current));
-		struct dma_fence *in_fence = sync_file_get_fence(blend.fence_fd_in);
-		if (!in_fence) {
-			ret = -EINVAL;
-			goto err_unmap_out;  /* FIX: was err_unmap_dst, leaked out! */
-		}
-		dev_dbg(g2d->dev, "alpha_blend: got in_fence=%p signaled=%d\n",
-				in_fence, dma_fence_is_signaled(in_fence));
-		dma_fence_wait(in_fence, false);
-		dev_dbg(g2d->dev, "alpha_blend: in_fence=%p wait done signaled=%d\n",
-				in_fence, dma_fence_is_signaled(in_fence));
-		dma_fence_put(in_fence);
-	}
-	
-	dev_dbg(g2d->dev, "DMA addresses: src_fd=%d->0x%llx dst_fd=%d->0x%llx out_fd=%d->0x%llx\n",
-			blend.src.dma_fd, (u64)src_dma_addr,
-			blend.dst.dma_fd, (u64)dst_dma_addr,
-			blend.out.dma_fd, (u64)out_dma_addr);
-	
-	/* Calculate bytes per pixel */
-	switch (blend.src.format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-		src_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		src_bpp = 2;
-		break;
-	default:
-		ret = -EINVAL;
-		goto err_unmap_out;
-	}
-	
-	switch (blend.dst.format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-		dst_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		dst_bpp = 2;
-		break;
-	default:
-		ret = -EINVAL;
-		goto err_unmap_out;
-	}
-	
-	switch (blend.out.format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-		out_bpp = 4;
-		break;
-	case G2D_FMT_RGB565:
-		out_bpp = 2;
-		break;
-	default:
-		ret = -EINVAL;
-		goto err_unmap_out;
-	}
-	
-	/* Adjust DMA addresses for crop offsets */
-	src_pitch = blend.src.stride[0] ? blend.src.stride[0] : (blend.src.width * src_bpp);
-	dst_pitch = blend.dst.stride[0] ? blend.dst.stride[0] : (blend.dst.width * dst_bpp);
-	out_pitch = blend.out.stride[0] ? blend.out.stride[0] : (blend.out.width * out_bpp);
-	
-	dev_dbg(g2d->dev, "ALPHA_BLEND PITCH: src_pitch=%u (stride=%u width=%u bpp=%u) crop=(%u,%u,%u,%u)\n",
-		 src_pitch, blend.src.stride[0], blend.src.width, src_bpp,
-		 blend.src.crop_x, blend.src.crop_y, blend.src.crop_w, blend.src.crop_h);
-	
-	/* Save base addresses BEFORE applying crop offsets */
-	dma_addr_t src_base_addr = src_dma_addr;
-	dma_addr_t dst_base_addr = dst_dma_addr;
-	dma_addr_t out_base_addr = out_dma_addr;
-	
-	/* Apply crop offsets */
-	src_dma_addr += (blend.src.crop_y * src_pitch) + (blend.src.crop_x * src_bpp);
-	dst_dma_addr += (blend.dst.crop_y * dst_pitch) + (blend.dst.crop_x * dst_bpp);
-	out_dma_addr += (blend.out.crop_y * out_pitch) + (blend.out.crop_x * out_bpp);
-	
-	dev_dbg(g2d->dev, "CROP APPLIED: dst crop=(%u,%u) bpp=%u pitch=%u offset=0x%llx base=0x%llx\n",
-		 blend.dst.crop_x, blend.dst.crop_y, dst_bpp, dst_pitch,
-		 (u64)(dst_dma_addr - dst_base_addr), (u64)dst_base_addr);
-	
-	dev_dbg(g2d->dev, "ALPHA_BLEND CALL PARAMS: src.crop=%ux%u dst.crop=%ux%u out.crop=%ux%u\n",
-		 blend.src.crop_w, blend.src.crop_h,
-		 blend.dst.crop_w, blend.dst.crop_h,
-		 blend.out.crop_w, blend.out.crop_h);
-	
-	/* v2.9.16: 3-buffer alpha blending (NO read/write conflict)
-	 * - src (V0): ball buffer - READ only
-	 * - dst (UI2): background buffer - READ only  
-	 * - out (WB): temp buffer - WRITE only
-	 * This avoids G2D reading and writing the same buffer simultaneously
-	 */
-	ret = sunxi_g2d_do_blit_alpha_3buf(g2d,
-				       src_dma_addr, blend.src.width, blend.src.height,
-				       src_pitch, blend.src.format,
-				       0, 0, blend.src.crop_w, blend.src.crop_h,
-				       blend.src.alpha, blend.src.alpha_mode, blend.src.premul_mode, blend.src.color_space,
-				       dst_dma_addr, dst_base_addr, blend.dst.width, blend.dst.height,
-				       dst_pitch, blend.dst.format,
-				       0, 0, blend.dst.crop_w, blend.dst.crop_h,
-				       blend.dst.alpha, blend.dst.alpha_mode, blend.dst.premul_mode, blend.dst.color_space,
-				       out_dma_addr, blend.out.width, blend.out.height,
-				       out_pitch, blend.out.format,
-				       blend.out.crop_w, blend.out.crop_h,
-				       blend.bld_mode,
-				       0, 0, 0, 0);  /* No chromakey for RCQ blend */
-	
-	
-	/* Create job + fence and return fence_fd_out to userspace. */
-	{
-		struct sunxi_g2d_job *job;
-		int out_fd = -1;
-
-		job = kzalloc(sizeof(*job), GFP_KERNEL);
-		if (!job) {
-			ret = -ENOMEM;
-			goto err_unmap_dst;
-		}
-
-		job->fence = sunxi_g2d_fence_create(g2d);
-		if (!job->fence) {
-			kfree(job);
-			ret = -ENOMEM;
-			goto err_unmap_dst;
-		}
-
-		out_fd = get_unused_fd_flags(O_CLOEXEC);
-		if (out_fd < 0) {
-			dma_fence_put(job->fence);
-			kfree(job);
-			ret = out_fd;
-			goto err_unmap_dst;
-		}
-
-		job->fence_fd = out_fd;
-		job->sync_file = sync_file_create(job->fence);
-		if (!job->sync_file) {
-			put_unused_fd(out_fd);
-			dma_fence_put(job->fence);
-			kfree(job);
-			ret = -ENOMEM;
-			goto err_unmap_dst;
-		}
-
-		/* Trace sync_file creation and fd reservation */
-		dev_dbg(g2d->dev, "alpha_blend: created job=%p sync_file=%p file=%p fence=%p reserved fd=%d\n",
-			 job, job->sync_file, job->sync_file ? job->sync_file->file : NULL,
-			 job->fence, out_fd);
-
-		/* Install FD into current process now (process context) so IRQ won't
-		 * need to touch file-descriptors. After fd_install, the fd table owns
-		 * the file ref; clear job->sync_file so cleanup won't fput it.
-		 */
-		if (job->sync_file && job->sync_file->file) {
-			struct file *tmpf = job->sync_file->file;
-			if (job->fence) {
-				struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-				dev_dbg(g2d->dev, "alpha_blend: installing fd=%d file=%p job=%p fence=%p seq=%llu pid=%d\n",
-							out_fd, tmpf, job, job->fence, sf->seqno, task_tgid_nr(current));
-			} else {
-				dev_dbg(g2d->dev, "alpha_blend: installing fd=%d file=%p job=%p fence=NULL pid=%d\n",
-							out_fd, tmpf, job, task_tgid_nr(current));
-			}
-			fd_install(out_fd, tmpf);
-			/* After fd_install the fd table owns the file ref */
-			job->sync_file = NULL;
-		} else {
-			dev_err(g2d->dev, "alpha_blend: unexpected NULL sync_file/file for job=%p fd=%d\n", job, out_fd);
-		}
-
-		spin_lock(&g2d->job_lock);
-		g2d->current_job = job;
-		spin_unlock(&g2d->job_lock);
-
-		blend.fence_fd_out = job->fence_fd;
-	}
-
-	if (copy_to_user((void __user *)arg, &blend, sizeof(blend)))
-		ret = -EFAULT;
-	
-err_unmap_out:
-	dma_buf_unmap_attachment(out_attach, out_sgt, out_dir);
-err_detach_out:
-	dma_buf_detach(out_dmabuf, out_attach);
-err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt, dst_dir);
-err_detach_dst:
-	dma_buf_detach(dst_dmabuf, dst_attach);
-err_put_out:
-	dma_buf_put(out_dmabuf);
-err_put_dst:
-	dma_buf_put(dst_dmabuf);
-err_unmap_src:
-	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
-err_detach_src:
-	dma_buf_detach(src_dmabuf, src_attach);
-err_put_src:
-	dma_buf_put(src_dmabuf);
-	
-	return ret;
-}
-#endif /* Deprecated sunxi_g2d_ioctl_alpha_blend */
-
 static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 					  unsigned long arg)
 {
@@ -5563,8 +6548,10 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	int fd;
 
-	if (copy_from_user(&alloc, (void __user *)arg, sizeof(alloc)))
+	if (copy_from_user(&alloc, (void __user *)arg, sizeof(alloc))) {
+		dev_err(g2d->dev, "ALLOC_BUFFER: copy_from_user failed\n");
 		return -EFAULT;
+	}
 
 	/* Validate size */
 	if (alloc.size == 0 || alloc.size > 128 * 1024 * 1024) /* Max 128 MB */
@@ -5572,12 +6559,16 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 
 	/* Allocate buffer metadata */
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
-	if (!buf)
+	if (!buf) {
+		dev_err(g2d->dev, "ALLOC_BUFFER: kzalloc failed\n");
 		return -ENOMEM;
+	}
 
 	/* Allocate DMA coherent memory */
 	buf->vaddr = dma_alloc_coherent(g2d->dev, alloc.size, &buf->dma_addr, GFP_KERNEL);
+	
 	if (!buf->vaddr) {
+		dev_err(g2d->dev, "ALLOC_BUFFER: dma_alloc_coherent FAILED\n");
 		kfree(buf);
 		return -ENOMEM;
 	}
@@ -5628,6 +6619,8 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		return sunxi_g2d_ioctl_get_version(g2d, arg);
 	case G2D_IOC_BLIT:
 		return sunxi_g2d_ioctl_blit(g2d, arg);
+	case G2D_IOC_CMD:
+		return sunxi_g2d_ioctl_cmd(g2d, arg);
 	case G2D_IOC_FILLRECT:
 		return sunxi_g2d_ioctl_fillrect(g2d, arg);
 	case G2D_IOC_FILLRECT_RCQ:
@@ -5749,8 +6742,15 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		void *vaddr;
 		int ret;
 
-		if (copy_from_user(&rw, (void __user *)arg, sizeof(rw)))
+		dev_dbg(g2d->dev, "=== G2D_IOC_WRITE_BUFFER entered ===\n");
+
+		if (copy_from_user(&rw, (void __user *)arg, sizeof(rw))) {
+			dev_dbg(g2d->dev, "WRITE_BUFFER: copy_from_user failed\n");
 			return -EFAULT;
+		}
+
+		dev_dbg(g2d->dev, "WRITE_BUFFER: fd=%d size=%llu offset=%llu\n",
+			rw.dma_fd, rw.size, rw.offset);
 
 		/* Validate parameters */
 		if (rw.dma_fd < 0 || rw.size == 0 || !rw.user_ptr)
@@ -5801,6 +6801,7 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 
 		vaddr = map.vaddr;
 		if (!vaddr) {
+			dev_err(g2d->dev, "WRITE_BUFFER: vmap returned NULL!\n");
 			dma_buf_vunmap(dmabuf, &map);
 			dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
 			dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
@@ -5809,16 +6810,36 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 			return -ENOMEM;
 		}
 
+		dev_dbg(g2d->dev, "WRITE_BUFFER: vaddr=%p offset=%llu size=%llu user_ptr=0x%llx\n",
+			 vaddr, rw.offset, rw.size, rw.user_ptr);
+
+		/* Verify what's in userspace before copying */
+		{
+			uint32_t test_words[4];
+			if (copy_from_user(test_words, (void __user *)(uintptr_t)rw.user_ptr, sizeof(test_words)) == 0) {
+				dev_dbg(g2d->dev, "WRITE_BUFFER: userspace data (first 4 words): %08x %08x %08x %08x\n",
+					 test_words[0], test_words[1], test_words[2], test_words[3]);
+			}
+		}
+
 		/* Copy from userspace to device buffer */
 		if (copy_from_user(vaddr + rw.offset, (void __user *)(uintptr_t)rw.user_ptr, rw.size)) {
+			dev_err(g2d->dev, "WRITE_BUFFER: copy_from_user FAILED!\n");
 			ret = -EFAULT;
 		} else {
+			uint32_t *check = (uint32_t *)vaddr;
+			dev_dbg(g2d->dev, "WRITE_BUFFER: buffer after copy (first 4 words): %08x %08x %08x %08x\n",
+				 check[0], check[1], check[2], check[3]);
 			ret = 0;
 		}
 
+		dev_dbg(g2d->dev, "WRITE_BUFFER: about to vunmap\n");
 		dma_buf_vunmap(dmabuf, &map);
+		dev_dbg(g2d->dev, "WRITE_BUFFER: vunmap done, about to end_cpu_access\n");
 		dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+		dev_dbg(g2d->dev, "WRITE_BUFFER: about to unmap_attachment\n");
 		dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+		dev_dbg(g2d->dev, "WRITE_BUFFER: about to detach\n");
 		dma_buf_detach(dmabuf, attach);
 		dma_buf_put(dmabuf);
 
@@ -5915,6 +6936,7 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		return ret;
 	}
 	default:
+		dev_err(g2d->dev, "Unknown ioctl cmd: 0x%08x\n", cmd);
 		return -ENOTTY;
 	}
 }
