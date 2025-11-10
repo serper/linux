@@ -782,3 +782,42 @@ case G2D_FMT_ARGB8888:
 
 *Community collaboration requested to bring RCQ mode support to mainline Linux.*
 
+
+## Patch note (10 Nov 2025)
+
+A minimal production fix was applied to the in-tree `sunxi_g2d` driver to
+resolve a unified multi-pass blit/scaler issue where the VSU-produced
+temporary buffer appeared incorrectly (opaque black or channel-swapped) when
+used in the unified path. Root cause: the isolated scale path did not program
+the V0 overlay `V0_ATTCTL` prior to running the VSU, which left V0 in a
+disabled/default state and caused the downstream reader to interpret VSU
+output incorrectly.
+
+Change summary:
+
+- Program `V0_ATTCTL` in the isolated scale path (enable layer, set
+  hw pixel format and pixel alpha) so the VSU output is interpreted by V0 the
+  same way as the atomic blit path.
+- Unify VSU format usage: VSU now receives the API format enum (`src_format`)
+  (VSU processes raw bytes), while V0/WB are programmed with the HW format
+  codes for correct overlay interpretation.
+- Remove experimental module parameters and the CPU software-scaling fallback
+  to keep the driver minimal and deterministic.
+
+Files changed (notable):
+
+- `drivers/gpu/sunxi-g2d/sunxi-g2d-main.c` (VSU config and V0_ATTCTL fix,
+  removal of diagnostic toggles)
+
+Commit: 03dd204a4216
+
+Verification: Confirmed via demo test (bouncing-ball unified demo) that the
+sprite renders correctly across multiple scaling ratios and that alpha is
+preserved. CPU fallback (used during investigation) was removed from the
+production driver; all tests were performed on hardware with the corrected
+driver.
+
+If you want this split into a standalone changelog file under
+`drivers/gpu/sunxi-g2d/CHANGELOG.md` or a formal patch formatted with
+`git format-patch`, tell me and I will add it and push as a follow-up.
+
