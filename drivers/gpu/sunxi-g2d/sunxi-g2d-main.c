@@ -59,12 +59,11 @@
 #include "sunxi-g2d-structs.h"
 #include "sunxi-g2d-rcq.h"
 
-
-#define DRIVER_NAME		"sunxi-g2d"
-#define DRIVER_VERSION		"2.9.16"
-#define DRIVER_MAJOR		2
-#define DRIVER_MINOR		9
-#define DRIVER_PATCHLEVEL	16
+#define DRIVER_NAME "sunxi-g2d"
+#define DRIVER_VERSION "2.9.16"
+#define DRIVER_MAJOR 2
+#define DRIVER_MINOR 9
+#define DRIVER_PATCHLEVEL 16
 
 /* Module parameters */
 
@@ -73,156 +72,158 @@ static bool rcq_enable_bit = true;
 module_param(rcq_enable_bit, bool, 0644);
 MODULE_PARM_DESC(rcq_enable_bit, "Enable RCQ_CTRL.EN bit (deprecated)");
 
+/* Diagnostic module parameters were removed for the production build.
+ * CPU software scaler and experimental VSU toggles were eliminated to
+ * keep the driver minimal. */
+
 /* VSU scaling filter coefficients - from BSP g2d_scal.c */
 static const s32 linearcoefftab32[32] = {
-	0x00004000, 0x00023e00, 0x00043c00, 0x00063a00, 0x00083800,
-	0x000a3600, 0x000c3400, 0x000e3200, 0x00103000, 0x00122e00,
-	0x00142c00, 0x00162a00, 0x00182800, 0x001a2600, 0x001c2400,
-	0x001e2200, 0x00202000, 0x00221e00, 0x00241c00, 0x00261a00,
-	0x00281800, 0x002a1600, 0x002c1400, 0x002e1200, 0x00301000,
-	0x00320e00, 0x00340c00, 0x00360a00, 0x00380800, 0x003a0600,
+	0x00004000, 0x00023e00, 0x00043c00, 0x00063a00, 0x00083800, 0x000a3600,
+	0x000c3400, 0x000e3200, 0x00103000, 0x00122e00, 0x00142c00, 0x00162a00,
+	0x00182800, 0x001a2600, 0x001c2400, 0x001e2200, 0x00202000, 0x00221e00,
+	0x00241c00, 0x00261a00, 0x00281800, 0x002a1600, 0x002c1400, 0x002e1200,
+	0x00301000, 0x00320e00, 0x00340c00, 0x00360a00, 0x00380800, 0x003a0600,
 	0x003c0400, 0x003e0200,
 };
 
 static const s32 lan2coefftab32_full[512] = {
-	0x00004000, 0x000140ff, 0x00033ffe, 0x00043ffd, 0x00063efc, 0xff083dfc,
-	0x000a3bfb, 0xff0d39fb, 0xff0f37fb, 0xff1136fa, 0xfe1433fb,
-	0xfe1631fb, 0xfd192ffb, 0xfd1c2cfb, 0xfd1f29fb, 0xfc2127fc,
-	0xfc2424fc, 0xfc2721fc, 0xfb291ffd, 0xfb2c1cfd, 0xfb2f19fd,
-	0xfb3116fe, 0xfb3314fe, 0xfa3611ff, 0xfb370fff, 0xfb390dff,
-	0xfb3b0a00, 0xfc3d08ff, 0xfc3e0600, 0xfd3f0400, 0xfe3f0300,
-	0xff400100,
+	0x00004000, 0x000140ff, 0x00033ffe, 0x00043ffd, 0x00063efc, 0xff083dfc, 
+	0x000a3bfb, 0xff0d39fb, 0xff0f37fb, 0xff1136fa, 0xfe1433fb, 0xfe1631fb, 
+	0xfd192ffb, 0xfd1c2cfb, 0xfd1f29fb, 0xfc2127fc, 0xfc2424fc, 0xfc2721fc, 
+	0xfb291ffd, 0xfb2c1cfd, 0xfb2f19fd, 0xfb3116fe, 0xfb3314fe, 0xfa3611ff, 
+	0xfb370fff, 0xfb390dff, 0xfb3b0a00, 0xfc3d08ff, 0xfc3e0600, 0xfd3f0400, 
+	0xfe3f0300, 0xff400100,
 	/* counter = 1 */
-	0x00004000, 0x000140ff, 0x00033ffe, 0x00043ffd, 0x00063efc,
-	0xff083dfc, 0x000a3bfb, 0xff0d39fb, 0xff0f37fb, 0xff1136fa,
-	0xfe1433fb, 0xfe1631fb, 0xfd192ffb, 0xfd1c2cfb, 0xfd1f29fb,
-	0xfc2127fc, 0xfc2424fc, 0xfc2721fc, 0xfb291ffd, 0xfb2c1cfd,
-	0xfb2f19fd, 0xfb3116fe, 0xfb3314fe, 0xfa3611ff, 0xfb370fff,
-	0xfb390dff, 0xfb3b0a00, 0xfc3d08ff, 0xfc3e0600, 0xfd3f0400,
+	
+	0x00004000, 0x000140ff, 0x00033ffe, 0x00043ffd, 0x00063efc, 0xff083dfc, 
+	0x000a3bfb, 0xff0d39fb, 0xff0f37fb, 0xff1136fa, 0xfe1433fb, 0xfe1631fb, 
+	0xfd192ffb, 0xfd1c2cfb, 0xfd1f29fb, 0xfc2127fc, 0xfc2424fc, 0xfc2721fc, 
+	0xfb291ffd, 0xfb2c1cfd, 0xfb2f19fd, 0xfb3116fe, 0xfb3314fe, 0xfa3611ff, 
+	0xfb370fff, 0xfb390dff, 0xfb3b0a00, 0xfc3d08ff, 0xfc3e0600, 0xfd3f0400, 
 	0xfe3f0300, 0xff400100,
 	/* counter = 2 */
-	0xff053804, 0xff063803, 0xff083801, 0xff093701, 0xff0a3700,
-	0xff0c3500, 0xff0e34ff, 0xff1033fe, 0xff1232fd, 0xfe1431fd,
-	0xfe162ffd, 0xfe182dfd, 0xfd1b2cfc, 0xfd1d2afc, 0xfd1f28fc,
-	0xfd2126fc, 0xfd2323fd, 0xfc2621fd, 0xfc281ffd, 0xfc2a1dfd,
-	0xfc2c1bfd, 0xfd2d18fe, 0xfd2f16fe, 0xfd3114fe, 0xfd3212ff,
-	0xfe3310ff, 0xff340eff, 0x00350cff, 0x00360a00, 0x01360900,
+	
+	0xff053804, 0xff063803, 0xff083801, 0xff093701, 0xff0a3700, 0xff0c3500, 
+	0xff0e34ff, 0xff1033fe, 0xff1232fd, 0xfe1431fd, 0xfe162ffd, 0xfe182dfd, 
+	0xfd1b2cfc, 0xfd1d2afc, 0xfd1f28fc, 0xfd2126fc, 0xfd2323fd, 0xfc2621fd, 
+	0xfc281ffd, 0xfc2a1dfd, 0xfc2c1bfd, 0xfd2d18fe, 0xfd2f16fe, 0xfd3114fe, 
+	0xfd3212ff, 0xfe3310ff, 0xff340eff, 0x00350cff, 0x00360a00, 0x01360900, 
 	0x02370700, 0x03370600,
 	/* counter = 3 */
-	0xff083207, 0xff093206, 0xff0a3205, 0xff0c3203, 0xff0d3103,
-	0xff0e3102, 0xfe113001, 0xfe132f00, 0xfe142e00, 0xfe162dff,
-	0xfe182bff, 0xfe192aff, 0xfe1b29fe, 0xfe1d27fe, 0xfe1f25fe,
-	0xfd2124fe, 0xfe2222fe, 0xfe2421fd, 0xfe251ffe, 0xfe271dfe,
-	0xfe291bfe, 0xff2a19fe, 0xff2b18fe, 0xff2d16fe, 0x002e14fe,
-	0x002f12ff, 0x013010ff, 0x02300fff, 0x03310dff, 0x04310cff,
+	
+	0xff083207, 0xff093206, 0xff0a3205, 0xff0c3203, 0xff0d3103, 0xff0e3102, 
+	0xfe113001, 0xfe132f00, 0xfe142e00, 0xfe162dff, 0xfe182bff, 0xfe192aff, 
+	0xfe1b29fe, 0xfe1d27fe, 0xfe1f25fe, 0xfd2124fe, 0xfe2222fe, 0xfe2421fd, 
+	0xfe251ffe, 0xfe271dfe, 0xfe291bfe, 0xff2a19fe, 0xff2b18fe, 0xff2d16fe, 
+	0x002e14fe, 0x002f12ff, 0x013010ff, 0x02300fff, 0x03310dff, 0x04310cff, 
 	0x05310a00, 0x06310900,
 	/* counter = 4 */
-	0xff0a2e09, 0xff0b2e08, 0xff0c2e07, 0xff0e2d06, 0xff0f2d05,
-	0xff102d04, 0xff122c03, 0xfe142c02, 0xfe152b02, 0xfe172a01,
-	0xfe182901, 0xfe1a2800, 0xfe1b2700, 0xfe1d2500, 0xff1e24ff,
-	0xfe2023ff, 0xff2121ff, 0xff2320fe, 0xff241eff, 0x00251dfe,
-	0x00261bff, 0x00281afe, 0x012818ff, 0x012a16ff, 0x022a15ff,
-	0x032b13ff, 0x032c12ff, 0x052c10ff, 0x052d0fff, 0x062d0d00,
+	
+	0xff0a2e09, 0xff0b2e08, 0xff0c2e07, 0xff0e2d06, 0xff0f2d05, 0xff102d04, 
+	0xff122c03, 0xfe142c02, 0xfe152b02, 0xfe172a01, 0xfe182901, 0xfe1a2800, 
+	0xfe1b2700, 0xfe1d2500, 0xff1e24ff, 0xfe2023ff, 0xff2121ff, 0xff2320fe, 
+	0xff241eff, 0x00251dfe, 0x00261bff, 0x00281afe, 0x012818ff, 0x012a16ff, 
+	0x022a15ff, 0x032b13ff, 0x032c12ff, 0x052c10ff, 0x052d0fff, 0x062d0d00, 
 	0x072d0c00, 0x082d0b00,
 	/* counter = 5 */
-	0xff0c2a0b, 0xff0d2a0a, 0xff0e2a09, 0xff0f2a08, 0xff102a07,
-	0xff112a06, 0xff132905, 0xff142904, 0xff162803, 0xff172703,
-	0xff182702, 0xff1a2601, 0xff1b2501, 0xff1c2401, 0xff1e2300,
-	0xff1f2200, 0x00202000, 0x00211f00, 0x01221d00, 0x01231c00,
-	0x01251bff, 0x02251aff, 0x032618ff, 0x032717ff, 0x042815ff,
-	0x052814ff, 0x052913ff, 0x06291100, 0x072a10ff, 0x082a0e00,
+	
+	0xff0c2a0b, 0xff0d2a0a, 0xff0e2a09, 0xff0f2a08, 0xff102a07, 0xff112a06, 
+	0xff132905, 0xff142904, 0xff162803, 0xff172703, 0xff182702, 0xff1a2601, 
+	0xff1b2501, 0xff1c2401, 0xff1e2300, 0xff1f2200, 0x00202000, 0x00211f00, 
+	0x01221d00, 0x01231c00, 0x01251bff, 0x02251aff, 0x032618ff, 0x032717ff, 
+	0x042815ff, 0x052814ff, 0x052913ff, 0x06291100, 0x072a10ff, 0x082a0e00, 
 	0x092a0d00, 0x0a2a0c00,
 	/* counter = 6 */
-	0xff0d280c, 0xff0e280b, 0xff0f280a, 0xff102809, 0xff112808,
-	0xff122708, 0xff142706, 0xff152705, 0xff162605, 0xff172604,
-	0xff192503, 0xff1a2403, 0x001b2302, 0x001c2202, 0x001d2201,
-	0x001e2101, 0x011f1f01, 0x01211e00, 0x01221d00, 0x02221c00,
-	0x02231b00, 0x03241900, 0x04241800, 0x04251700, 0x052616ff,
-	0x06261400, 0x072713ff, 0x08271100, 0x08271100, 0x09271000,
+	
+	0xff0d280c, 0xff0e280b, 0xff0f280a, 0xff102809, 0xff112808, 0xff122708, 
+	0xff142706, 0xff152705, 0xff162605, 0xff172604, 0xff192503, 0xff1a2403, 
+	0x001b2302, 0x001c2202, 0x001d2201, 0x001e2101, 0x011f1f01, 0x01211e00, 
+	0x01221d00, 0x02221c00, 0x02231b00, 0x03241900, 0x04241800, 0x04251700, 
+	0x052616ff, 0x06261400, 0x072713ff, 0x08271100, 0x08271100, 0x09271000, 
 	0x0a280e00, 0x0b280d00,
 	/* counter = 7 */
-	0xff0e260d, 0xff0f260c, 0xff10260b, 0xff11260a, 0xff122609,
-	0xff132608, 0xff142508, 0xff152507, 0x00152506, 0x00172405,
-	0x00182305, 0x00192304, 0x001b2203, 0x001c2103, 0x011d2002,
-	0x011d2002, 0x011f1f01, 0x021f1e01, 0x02201d01, 0x03211c00,
-	0x03221b00, 0x04221a00, 0x04231801, 0x05241700, 0x06241600,
-	0x07241500, 0x08251300, 0x09251200, 0x09261100, 0x0a261000,
+	
+	0xff0e260d, 0xff0f260c, 0xff10260b, 0xff11260a, 0xff122609, 0xff132608, 
+	0xff142508, 0xff152507, 0x00152506, 0x00172405, 0x00182305, 0x00192304, 
+	0x001b2203, 0x001c2103, 0x011d2002, 0x011d2002, 0x011f1f01, 0x021f1e01, 
+	0x02201d01, 0x03211c00, 0x03221b00, 0x04221a00, 0x04231801, 0x05241700, 
+	0x06241600, 0x07241500, 0x08251300, 0x09251200, 0x09261100, 0x0a261000, 
 	0x0b260f00, 0x0c260e00,
 	/* counter = 8 */
-	0xff0e250e, 0xff0f250d, 0xff10250c, 0xff11250b, 0x0011250a,
-	0x00132409, 0x00142408, 0x00152407, 0x00162307, 0x00172306,
-	0x00182206, 0x00192205, 0x011a2104, 0x011b2004, 0x011c2003,
-	0x021c1f03, 0x021e1e02, 0x031e1d02, 0x03201c01, 0x04201b01,
-	0x04211a01, 0x05221900, 0x05221801, 0x06231700, 0x07231600,
-	0x07241500, 0x08241400, 0x09241300, 0x0a241200, 0x0b241100,
+	
+	0xff0e250e, 0xff0f250d, 0xff10250c, 0xff11250b, 0x0011250a, 0x00132409, 
+	0x00142408, 0x00152407, 0x00162307, 0x00172306, 0x00182206, 0x00192205, 
+	0x011a2104, 0x011b2004, 0x011c2003, 0x021c1f03, 0x021e1e02, 0x031e1d02, 
+	0x03201c01, 0x04201b01, 0x04211a01, 0x05221900, 0x05221801, 0x06231700, 
+	0x07231600, 0x07241500, 0x08241400, 0x09241300, 0x0a241200, 0x0b241100, 
 	0x0c241000, 0x0d240f00,
 	/* counter = 9 */
-	0x000e240e, 0x000f240d, 0x0010240c, 0x0011240b, 0x0013230a,
-	0x0013230a, 0x00142309, 0x00152308, 0x00162208, 0x00172207,
-	0x01182106, 0x01192105, 0x011a2005, 0x021b1f04, 0x021b1f04,
-	0x021d1e03, 0x031d1d03, 0x031e1d02, 0x041e1c02, 0x041f1b02,
-	0x05201a01, 0x05211901, 0x06211801, 0x07221700, 0x07221601,
-	0x08231500, 0x09231400, 0x0a231300, 0x0a231300, 0x0b231200,
+	
+	0x000e240e, 0x000f240d, 0x0010240c, 0x0011240b, 0x0013230a, 0x0013230a, 
+	0x00142309, 0x00152308, 0x00162208, 0x00172207, 0x01182106, 0x01192105, 
+	0x011a2005, 0x021b1f04, 0x021b1f04, 0x021d1e03, 0x031d1d03, 0x031e1d02, 
+	0x041e1c02, 0x041f1b02, 0x05201a01, 0x05211901, 0x06211801, 0x07221700, 
+	0x07221601, 0x08231500, 0x09231400, 0x0a231300, 0x0a231300, 0x0b231200, 
 	0x0c231100, 0x0d231000,
 	/* counter = 10 */
-	0x000f220f, 0x0010220e, 0x0011220d, 0x0012220c, 0x0013220b,
-	0x0013220b, 0x0015210a, 0x0015210a, 0x01162108, 0x01172008,
-	0x01182007, 0x02191f06, 0x02191f06, 0x021a1e06, 0x031a1e05,
-	0x031c1d04, 0x041c1c04, 0x041d1c03, 0x051d1b03, 0x051e1a03,
-	0x061f1902, 0x061f1902, 0x07201801, 0x08201701, 0x08211601,
-	0x09211501, 0x0a211500, 0x0b211400, 0x0b221300, 0x0c221200,
+	
+	0x000f220f, 0x0010220e, 0x0011220d, 0x0012220c, 0x0013220b, 0x0013220b, 
+	0x0015210a, 0x0015210a, 0x01162108, 0x01172008, 0x01182007, 0x02191f06, 
+	0x02191f06, 0x021a1e06, 0x031a1e05, 0x031c1d04, 0x041c1c04, 0x041d1c03, 
+	0x051d1b03, 0x051e1a03, 0x061f1902, 0x061f1902, 0x07201801, 0x08201701, 
+	0x08211601, 0x09211501, 0x0a211500, 0x0b211400, 0x0b221300, 0x0c221200, 
 	0x0d221100, 0x0e221000,
 	/* counter = 11 */
-	0x0010210f, 0x0011210e, 0x0011210e, 0x0012210d, 0x0013210c,
-	0x0014200c, 0x0114200b, 0x0115200a, 0x01161f0a, 0x01171f09,
-	0x02171f08, 0x02181e08, 0x03181e07, 0x031a1d06, 0x031a1d06,
-	0x041b1c05, 0x041c1c04, 0x051c1b04, 0x051d1a04, 0x061d1a03,
-	0x071d1903, 0x071e1803, 0x081e1802, 0x081f1702, 0x091f1602,
-	0x0a201501, 0x0b1f1501, 0x0b201401, 0x0c211300, 0x0d211200,
+	
+	0x0010210f, 0x0011210e, 0x0011210e, 0x0012210d, 0x0013210c, 0x0014200c, 
+	0x0114200b, 0x0115200a, 0x01161f0a, 0x01171f09, 0x02171f08, 0x02181e08, 
+	0x03181e07, 0x031a1d06, 0x031a1d06, 0x041b1c05, 0x041c1c04, 0x051c1b04, 
+	0x051d1a04, 0x061d1a03, 0x071d1903, 0x071e1803, 0x081e1802, 0x081f1702, 
+	0x091f1602, 0x0a201501, 0x0b1f1501, 0x0b201401, 0x0c211300, 0x0d211200, 
 	0x0e201200, 0x0e211100,
 	/* counter = 12 */
-	0x00102010, 0x0011200f, 0x0012200e, 0x0013200d, 0x0013200d,
-	0x01141f0c, 0x01151f0b, 0x01151f0b, 0x01161f0a, 0x02171e09,
-	0x02171e09, 0x03181d08, 0x03191d07, 0x03191d07, 0x041a1c06,
-	0x041b1c05, 0x051b1b05, 0x051c1b04, 0x061c1a04, 0x071d1903,
-	0x071d1903, 0x081d1803, 0x081e1703, 0x091e1702, 0x0a1f1601,
-	0x0a1f1502, 0x0b1f1501, 0x0c1f1401, 0x0d201300, 0x0d201300,
+	
+	0x00102010, 0x0011200f, 0x0012200e, 0x0013200d, 0x0013200d, 0x01141f0c, 
+	0x01151f0b, 0x01151f0b, 0x01161f0a, 0x02171e09, 0x02171e09, 0x03181d08, 
+	0x03191d07, 0x03191d07, 0x041a1c06, 0x041b1c05, 0x051b1b05, 0x051c1b04, 
+	0x061c1a04, 0x071d1903, 0x071d1903, 0x081d1803, 0x081e1703, 0x091e1702, 
+	0x0a1f1601, 0x0a1f1502, 0x0b1f1501, 0x0c1f1401, 0x0d201300, 0x0d201300, 
 	0x0e201200, 0x0f201100,
 	/* counter = 13 */
-	0x00102010, 0x0011200f, 0x00121f0f, 0x00131f0e, 0x00141f0d,
-	0x01141f0c, 0x01141f0c, 0x01151e0c, 0x02161e0a, 0x02171e09,
-	0x03171d09, 0x03181d08, 0x03181d08, 0x04191c07, 0x041a1c06,
-	0x051a1b06, 0x051b1b05, 0x061b1a05, 0x061c1a04, 0x071c1904,
-	0x081c1903, 0x081d1803, 0x091d1703, 0x091e1702, 0x0a1e1602,
-	0x0b1e1502, 0x0c1e1501, 0x0c1f1401, 0x0d1f1400, 0x0e1f1300,
+	
+	0x00102010, 0x0011200f, 0x00121f0f, 0x00131f0e, 0x00141f0d, 0x01141f0c, 
+	0x01141f0c, 0x01151e0c, 0x02161e0a, 0x02171e09, 0x03171d09, 0x03181d08, 
+	0x03181d08, 0x04191c07, 0x041a1c06, 0x051a1b06, 0x051b1b05, 0x061b1a05, 
+	0x061c1a04, 0x071c1904, 0x081c1903, 0x081d1803, 0x091d1703, 0x091e1702, 
+	0x0a1e1602, 0x0b1e1502, 0x0c1e1501, 0x0c1f1401, 0x0d1f1400, 0x0e1f1300, 
 	0x0e1f1201, 0x0f1f1200,
 	/* counter = 14 */
-	0x00111e11, 0x00121e10, 0x00131e0f, 0x00131e0f, 0x01131e0e,
-	0x01141d0e, 0x02151d0c, 0x02151d0c, 0x02161d0b, 0x03161c0b,
-	0x03171c0a, 0x04171c09, 0x04181b09, 0x05181b08, 0x05191b07,
-	0x06191a07, 0x061a1a06, 0x071a1906, 0x071b1905, 0x081b1805,
-	0x091b1804, 0x091c1704, 0x0a1c1703, 0x0a1c1604, 0x0b1d1602,
-	0x0c1d1502, 0x0c1d1502, 0x0d1d1402, 0x0e1d1401, 0x0e1e1301,
+	
+	0x00111e11, 0x00121e10, 0x00131e0f, 0x00131e0f, 0x01131e0e, 0x01141d0e, 
+	0x02151d0c, 0x02151d0c, 0x02161d0b, 0x03161c0b, 0x03171c0a, 0x04171c09, 
+	0x04181b09, 0x05181b08, 0x05191b07, 0x06191a07, 0x061a1a06, 0x071a1906, 
+	0x071b1905, 0x081b1805, 0x091b1804, 0x091c1704, 0x0a1c1703, 0x0a1c1604, 
+	0x0b1d1602, 0x0c1d1502, 0x0c1d1502, 0x0d1d1402, 0x0e1d1401, 0x0e1e1301, 
 	0x0f1e1300, 0x101e1200,
 	/* counter = 15 */
-	0x00111e11, 0x00121e10, 0x00131d10, 0x01131d0f, 0x01141d0e,
-	0x01141d0e, 0x02151c0d, 0x02151c0d, 0x03161c0b, 0x03161c0b,
-	0x04171b0a, 0x04171b0a, 0x05171b09, 0x05181a09, 0x06181a08,
-	0x06191a07, 0x07191907, 0x071a1906, 0x081a1806, 0x081a1806,
-	0x091a1805, 0x0a1b1704, 0x0a1b1704, 0x0b1c1603, 0x0b1c1603,
-	0x0c1c1503, 0x0d1c1502, 0x0d1d1402, 0x0e1d1401, 0x0f1d1301,
+	
+	0x00111e11, 0x00121e10, 0x00131d10, 0x01131d0f, 0x01141d0e, 0x01141d0e, 
+	0x02151c0d, 0x02151c0d, 0x03161c0b, 0x03161c0b, 0x04171b0a, 0x04171b0a, 
+	0x05171b09, 0x05181a09, 0x06181a08, 0x06191a07, 0x07191907, 0x071a1906, 
+	0x081a1806, 0x081a1806, 0x091a1805, 0x0a1b1704, 0x0a1b1704, 0x0b1c1603, 
+	0x0b1c1603, 0x0c1c1503, 0x0d1c1502, 0x0d1d1402, 0x0e1d1401, 0x0f1d1301, 
 	0x0f1d1301, 0x101e1200,
 	/* counter = 16 */
 };
 
 /* Device limits */
-#define G2D_MAX_WIDTH		2048
-#define G2D_MAX_HEIGHT		2048
-#define G2D_MIN_WIDTH		8
-#define G2D_MIN_HEIGHT		8
+#define G2D_MAX_WIDTH 2048
+#define G2D_MAX_HEIGHT 2048
+#define G2D_MIN_WIDTH 2
+#define G2D_MIN_HEIGHT 2
 
 /* Job queue limits */
-#define G2D_MAX_JOBS		64
+#define G2D_MAX_JOBS 64
 
 /* Forward declarations */
 struct sunxi_g2d_dev;
@@ -239,71 +240,64 @@ struct sunxi_g2d_job;
  * G2D V2 limitation: Cannot combine VSU+BLD without RCQ.
  * Solution: Call this first to scale, then do blend/blit/etc.
  */
-static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
-                              dma_addr_t src_dma, u32 src_width, u32 src_height,
-                              u32 src_pitch, u32 src_format,
-                              u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-                              dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
-                              u32 dst_pitch, u32 dst_format,
-                              u32 dst_x, u32 dst_y, u32 dst_out_w, u32 dst_out_h,
-                              void *dst_vaddr);
+static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+			      u32 src_width, u32 src_height, u32 src_pitch,
+			      u32 src_format, u32 src_x, u32 src_y,
+			      u32 src_crop_w, u32 src_crop_h,
+			      dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
+			      u32 dst_pitch, u32 dst_format, u32 dst_x,
+			      u32 dst_y, u32 dst_out_w, u32 dst_out_h,
+			      void *dst_vaddr);
 
-static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
-				     dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
-				     u32 src_pitch, u32 src_format,
-				     u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				     u8 src_alpha, u8 src_alpha_mode, u8 src_premul, u8 src_color_space,
-				     dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
-				     u32 dst_pitch, u32 dst_format,
-				     u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				     u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
-				     dma_addr_t out_dma_addr, u32 out_w, u32 out_h, u32 out_pitch, u32 out_format,
-				     u32 flags, u32 bld_mode,
-				     u32 color_key_enable, u32 color_key_mode,
-				     u32 color_key_min, u32 color_key_max,
-				     bool needs_alpha, bool needs_rotation, bool needs_scaling);
+static int sunxi_g2d_do_blit_unified(
+	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma_addr, u32 src_w,
+	u32 src_h, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
+	u32 src_crop_w, u32 src_crop_h, u8 src_alpha, u8 src_alpha_mode,
+	u8 src_premul, u8 src_color_space, dma_addr_t dst_dma_addr, u32 dst_w,
+	u32 dst_h, u32 dst_pitch, u32 dst_format, u32 dst_x, u32 dst_y,
+	u32 blend_w, u32 blend_h, u8 dst_alpha, u8 dst_alpha_mode,
+	u8 dst_premul, u8 dst_color_space, dma_addr_t out_dma_addr, u32 out_w,
+	u32 out_h, u32 out_pitch, u32 out_format, u32 flags, u32 bld_mode,
+	u32 color_key_enable, u32 color_key_mode, u32 color_key_min,
+	u32 color_key_max, bool needs_alpha, bool needs_rotation,
+	bool needs_scaling);
 
 static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
-				  dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
-				  u32 src_pitch, u32 src_format,
-				  u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				  dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
-				  u32 dst_pitch, u32 dst_format,
-				  u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				  u32 flags);
+				 dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
+				 u32 src_pitch, u32 src_format, u32 src_x,
+				 u32 src_y, u32 src_crop_w, u32 src_crop_h,
+				 dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
+				 u32 dst_pitch, u32 dst_format, u32 dst_x,
+				 u32 dst_y, u32 blend_w, u32 blend_h,
+				 u32 flags);
 
-static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
-					 dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
-					 u32 src_pitch, u32 src_format,
-					 u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-					 u8 src_alpha, u8 src_alpha_mode, u8 src_premul, u8 src_color_space,
-					 dma_addr_t dst_dma_addr, dma_addr_t dst_base_addr,
-					 u32 dst_w, u32 dst_h,
-					 u32 dst_pitch, u32 dst_format,
-					 u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-					 u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
-					 dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
-					 u32 out_pitch, u32 out_format,
-					 u32 out_crop_w, u32 out_crop_h,
-					 u32 bld_mode,
-					 u32 color_key_enable, u32 color_key_mode,
-					 u32 color_key_min, u32 color_key_max);
+static int sunxi_g2d_do_blit_alpha_3buf(
+	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma_addr, u32 src_w,
+	u32 src_h, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
+	u32 src_crop_w, u32 src_crop_h, u8 src_alpha, u8 src_alpha_mode,
+	u8 src_premul, u8 src_color_space, dma_addr_t dst_dma_addr,
+	dma_addr_t dst_base_addr, u32 dst_w, u32 dst_h, u32 dst_pitch,
+	u32 dst_format, u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
+	u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
+	dma_addr_t out_dma_addr, u32 out_w, u32 out_h, u32 out_pitch,
+	u32 out_format, u32 out_crop_w, u32 out_crop_h, u32 bld_mode,
+	u32 color_key_enable, u32 color_key_mode, u32 color_key_min,
+	u32 color_key_max);
 
-static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
-                              dma_addr_t src_dma, u32 src_width, u32 src_height,
-                              u32 src_pitch, u32 src_format,
-                              u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-                              u8 src_color_space,
-                              dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
-                              u32 dst_pitch, u32 dst_format,
-                              u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
-                              u8 dst_color_space);
+static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+			     u32 src_width, u32 src_height, u32 src_pitch,
+			     u32 src_format, u32 src_x, u32 src_y,
+			     u32 src_crop_w, u32 src_crop_h, u8 src_color_space,
+			     dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
+			     u32 dst_pitch, u32 dst_format, u32 dst_x,
+			     u32 dst_y, u32 dst_w, u32 dst_h,
+			     u8 dst_color_space);
 
-static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
-				  dma_addr_t dst_dma,
-				  u32 width, u32 height,
-				  u32 pitch, u32 color,
-				  u32 color_format, u32 dst_format);
+static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d, dma_addr_t dst_dma,
+				 u32 width, u32 height, u32 pitch, u32 color,
+				 u32 color_format, u32 dst_format);
+
+static int sunxi_g2d_format_to_hw(u32 fmt, u32 *bpp);
 
 /**
  * struct sunxi_g2d_dev - G2D device structure
@@ -352,31 +346,31 @@ struct sunxi_g2d_dev {
 	struct reset_control *rst;
 	int irq;
 	struct icc_path *icc_path;
-	
+
 	/* Device node */
 	struct cdev cdev;
 	struct class *dev_class;
 	dev_t dev_num;
-	
+
 	/* Power and resource management */
 	atomic_t users;
 	bool hw_enabled;
 	struct mutex dev_mutex;
-	
+
 	/* Job queue */
 	spinlock_t job_lock;
 	struct list_head job_queue;
 	struct workqueue_struct *job_wq;
 	struct work_struct job_work;
 	struct sunxi_g2d_job *current_job;
-	
+
 	/* IRQ synchronization */
 	wait_queue_head_t irq_wait;
 	atomic_t irq_done;
 
 	/* Fence synchronization */
 	spinlock_t fence_lock;
-	
+
 	/* RCQ (Register Command Queue) */
 	struct g2d_rcq_mem rcq;
 	bool rcq_enabled;
@@ -384,7 +378,7 @@ struct sunxi_g2d_dev {
 	/* Fence support */
 	u64 fence_context;
 	atomic64_t fence_seqno;
-	
+
 	/* Temporary scaling buffer (allocated per-operation, freed after blend) */
 	void *temp_scale_buffer;
 	dma_addr_t temp_scale_dma;
@@ -392,7 +386,7 @@ struct sunxi_g2d_dev {
 
 	/* Delayed work to safely disable hardware when idle */
 	struct delayed_work disable_work;
-	
+
 	/* Statistics */
 	u32 hw_version;
 	atomic64_t jobs_submitted;
@@ -445,7 +439,7 @@ struct g2d_job_blit_data {
 	u8 src_alpha_mode;
 	u8 src_premul;
 	u8 src_color_space;
-	
+
 	/* Destination parameters */
 	u32 dst_width;
 	u32 dst_height;
@@ -459,13 +453,13 @@ struct g2d_job_blit_data {
 	u8 dst_alpha_mode;
 	u8 dst_premul;
 	u8 dst_color_space;
-	
+
 	/* Output buffer parameters (3-buffer mode) */
 	u32 out_width;
 	u32 out_height;
 	u32 out_pitch;
 	u32 out_format;
-	
+
 	/* Operation flags */
 	u32 flags;
 	u32 bld_mode;
@@ -485,55 +479,66 @@ struct sunxi_g2d_job {
 	struct sync_file *sync_file;
 	struct work_struct cleanup_work;
 	enum g2d_job_type type;
-	struct sunxi_g2d_dev *g2d;  /* Back reference for cleanup */
-	
+	struct sunxi_g2d_dev *g2d; /* Back reference for cleanup */
+
 	union {
 		struct g2d_job_blit_data blit;
 		struct g2d_job_fillrect_data fillrect;
 	} data;
-	
+
 	/* DMA addresses for HW (mapped from DMA-BUFs) */
 	dma_addr_t src_dma;
 	dma_addr_t dst_dma;
-	dma_addr_t out_dma;  /* For 3-buffer blit */
-	
+	dma_addr_t out_dma; /* For 3-buffer blit */
+
 	/* Imported DMA-BUFs to clean up */
 	struct dma_buf *src_dmabuf;
 	struct dma_buf_attachment *src_attach;
 	struct sg_table *src_sgt;
-	
+
 	struct dma_buf *dst_dmabuf;
 	struct dma_buf_attachment *dst_attach;
 	struct sg_table *dst_sgt;
-	
+
 	struct dma_buf *out_dmabuf;
 	struct dma_buf_attachment *out_attach;
 	struct sg_table *out_sgt;
-	
+
 	/* For 2-pass scale+rotate: temporary buffer allocated by driver */
-	void *temp_vaddr;           /* Virtual address of temp buffer */
-	dma_addr_t temp_dma_addr;   /* DMA address of temp buffer */
-	size_t temp_size;           /* Size of temp buffer */
-	u32 temp_width;             /* Temp buffer dimensions */
+	void *temp_vaddr; /* Virtual address of temp buffer */
+	dma_addr_t temp_dma_addr; /* DMA address of temp buffer */
+	size_t temp_size; /* Size of temp buffer */
+	u32 temp_width; /* Temp buffer dimensions */
 	u32 temp_height;
 	u32 temp_pitch;
 	u32 temp_format;
+
+	/* For 3-pass (scale -> rotate -> blend) additional temp buffer */
+	void *temp2_vaddr; /* Virtual address of second temp buffer */
+	dma_addr_t temp2_dma_addr; /* DMA address of second temp buffer */
+	size_t temp2_size;
+	u32 temp2_width;
+	u32 temp2_height;
+	u32 temp2_pitch;
+	u32 temp2_format;
 };
 
 static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 {
-	struct sunxi_g2d_job *job = container_of(work, struct sunxi_g2d_job, cleanup_work);
+	struct sunxi_g2d_job *job =
+		container_of(work, struct sunxi_g2d_job, cleanup_work);
 
 	if (!job)
 		return;
 
 	/* Trace cleanup entry */
-	pr_debug("sunxi_g2d: cleanup job %p sync_file=%p fence=%p fd=%d\n",
-			 job, job->sync_file, job->fence, job->fence_fd);
+	pr_debug("sunxi_g2d: cleanup job %p sync_file=%p fence=%p fd=%d\n", job,
+		 job->sync_file, job->fence, job->fence_fd);
 
 	/* Release sync_file if still present (not installed) */
 	if (job->sync_file) {
-		pr_debug("sunxi_g2d: cleanup - fput sync_file->file=%p\n", job->sync_file->file);
+		pr_debug("sunxi_g2d: cleanup - fput sync_file->file=%p\n",
+			 job->sync_file->file);
 		if (job->sync_file->file)
 			fput(job->sync_file->file);
 		kfree(job->sync_file);
@@ -541,13 +546,15 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 	}
 
 	if (job->fence) {
-		pr_debug("sunxi_g2d: cleanup - dma_fence_put(%p)\n", job->fence);
+		pr_debug("sunxi_g2d: cleanup - dma_fence_put(%p)\n",
+			 job->fence);
 		dma_fence_put(job->fence);
 	}
-	
+
 	/* Release imported DMA-BUFs (if any) */
 	if (job->src_sgt && job->src_attach) {
-		dma_buf_unmap_attachment(job->src_attach, job->src_sgt, DMA_TO_DEVICE);
+		dma_buf_unmap_attachment(job->src_attach, job->src_sgt,
+					 DMA_TO_DEVICE);
 		job->src_sgt = NULL;
 	}
 	if (job->src_attach && job->src_dmabuf) {
@@ -558,9 +565,10 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 		dma_buf_put(job->src_dmabuf);
 		job->src_dmabuf = NULL;
 	}
-	
+
 	if (job->dst_sgt && job->dst_attach) {
-		dma_buf_unmap_attachment(job->dst_attach, job->dst_sgt, DMA_FROM_DEVICE);
+		dma_buf_unmap_attachment(job->dst_attach, job->dst_sgt,
+					 DMA_FROM_DEVICE);
 		job->dst_sgt = NULL;
 	}
 	if (job->dst_attach && job->dst_dmabuf) {
@@ -571,9 +579,10 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 		dma_buf_put(job->dst_dmabuf);
 		job->dst_dmabuf = NULL;
 	}
-	
+
 	if (job->out_sgt && job->out_attach) {
-		dma_buf_unmap_attachment(job->out_attach, job->out_sgt, DMA_FROM_DEVICE);
+		dma_buf_unmap_attachment(job->out_attach, job->out_sgt,
+					 DMA_FROM_DEVICE);
 		job->out_sgt = NULL;
 	}
 	if (job->out_attach && job->out_dmabuf) {
@@ -584,13 +593,27 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 		dma_buf_put(job->out_dmabuf);
 		job->out_dmabuf = NULL;
 	}
-	
+
 	/* Release temporary buffer for 2-pass scale+rotate (if any) */
 	if (job->temp_vaddr && job->g2d) {
-		pr_debug("sunxi_g2d: cleanup - freeing temp buffer vaddr=%p dma=0x%llx size=%zu\n",
-			 job->temp_vaddr, (u64)job->temp_dma_addr, job->temp_size);
-		dma_free_coherent(job->g2d->dev, job->temp_size, job->temp_vaddr, job->temp_dma_addr);
+		pr_debug(
+			"sunxi_g2d: cleanup - freeing temp buffer vaddr=%p dma=0x%llx size=%zu\n",
+			job->temp_vaddr, (u64)job->temp_dma_addr,
+			job->temp_size);
+		dma_free_coherent(job->g2d->dev, job->temp_size,
+				  job->temp_vaddr, job->temp_dma_addr);
 		job->temp_vaddr = NULL;
+	}
+
+	/* Release second temporary buffer for 3-pass ops (if any) */
+	if (job->temp2_vaddr && job->g2d) {
+		pr_debug(
+			"sunxi_g2d: cleanup - freeing temp2 buffer vaddr=%p dma=0x%llx size=%zu\n",
+			job->temp2_vaddr, (u64)job->temp2_dma_addr,
+			job->temp2_size);
+		dma_free_coherent(job->g2d->dev, job->temp2_size,
+				  job->temp2_vaddr, job->temp2_dma_addr);
+		job->temp2_vaddr = NULL;
 	}
 
 	pr_debug("sunxi_g2d: cleanup - free job %p\n", job);
@@ -616,7 +639,8 @@ static const char *sunxi_g2d_fence_get_timeline_name(struct dma_fence *f)
 
 static void sunxi_g2d_fence_release(struct dma_fence *f)
 {
-	struct sunxi_g2d_fence *sf = container_of(f, struct sunxi_g2d_fence, base);
+	struct sunxi_g2d_fence *sf =
+		container_of(f, struct sunxi_g2d_fence, base);
 	kfree(sf);
 }
 
@@ -640,7 +664,8 @@ static struct dma_fence *sunxi_g2d_fence_create(struct sunxi_g2d_dev *g2d)
 	sf->seqno = seq;
 	dma_fence_init(&sf->base, &sunxi_g2d_fence_ops, &g2d->fence_lock,
 		       g2d->fence_context, seq);
-	dev_dbg(g2d->dev, "sunxi_g2d: fence_create seq=%llu fence=%p pid=%d\n", seq, &sf->base, task_tgid_nr(current));
+	dev_dbg(g2d->dev, "sunxi_g2d: fence_create seq=%llu fence=%p pid=%d\n",
+		seq, &sf->base, task_tgid_nr(current));
 	return &sf->base;
 }
 
@@ -655,27 +680,34 @@ struct g2d_selftest_work {
 static void g2d_selftest_work_func(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
-	struct g2d_selftest_work *w = container_of(dwork, struct g2d_selftest_work, dwork);
+	struct g2d_selftest_work *w =
+		container_of(dwork, struct g2d_selftest_work, dwork);
 
 	if (w->fence) {
-		struct sunxi_g2d_fence *sf = container_of(w->fence, struct sunxi_g2d_fence, base);
+		struct sunxi_g2d_fence *sf =
+			container_of(w->fence, struct sunxi_g2d_fence, base);
 		if (sf && sf->g2d && sf->g2d->dev)
-			dev_dbg(sf->g2d->dev, "selftest: signalling fence seq=%llu fence=%p\n", sf->seqno, w->fence);
+			dev_dbg(sf->g2d->dev,
+				"selftest: signalling fence seq=%llu fence=%p\n",
+				sf->seqno, w->fence);
 		else
-			pr_debug("sunxi_g2d: selftest: signalling fence %p\n", w->fence);
+			pr_debug("sunxi_g2d: selftest: signalling fence %p\n",
+				 w->fence);
 
 		dma_fence_signal(w->fence);
 
 		/* drop our reference taken for the work item */
 		if (sf && sf->g2d && sf->g2d->dev)
-			dev_dbg(sf->g2d->dev, "selftest: dma_fence_put fence=%p\n", w->fence);
+			dev_dbg(sf->g2d->dev,
+				"selftest: dma_fence_put fence=%p\n", w->fence);
 		else
-			pr_debug("sunxi_g2d: selftest: dma_fence_put fence=%p\n", w->fence);
+			pr_debug(
+				"sunxi_g2d: selftest: dma_fence_put fence=%p\n",
+				w->fence);
 	}
 	dma_fence_put(w->fence);
 	kfree(w);
 }
-
 
 /**
  * struct g2d_dma_buffer - Exported DMA-BUF buffer
@@ -729,18 +761,20 @@ static inline u32 g2d_ccu_read(struct sunxi_g2d_dev *g2d, u32 reg)
  *   Master 4: 0x0250 - 0x025F
  *  ... Master 9: 0x02A0 - 0x02AF (G2D)
  */
-#define MBUS_MAST_CFG0_BASE  0x0210  /* Base for T113/D1 master config */
-#define MBUS_MAST_CFG_STRIDE 0x0010  /* 16 bytes per master */
-#define G2D_PORT      9       /* G2D is master 9 */
+#define MBUS_MAST_CFG0_BASE 0x0210 /* Base for T113/D1 master config */
+#define MBUS_MAST_CFG_STRIDE 0x0010 /* 16 bytes per master */
+#define G2D_PORT 9 /* G2D is master 9 */
 
 /* Calculate register offset for G2D master 9:
  * MBUS_MAST_CFG0_REG(9) = 0x0210 + (0x10 * 9) = 0x02A0
  * MBUS_MAST_CFG1_REG(9) = 0x0214 + (0x10 * 9) = 0x02A4
  */
-#define MBUS_MAST_CFG0_REG(n)  (MBUS_MAST_CFG0_BASE + (MBUS_MAST_CFG_STRIDE * (n)))
-#define MBUS_MAST_CFG1_REG(n)  (MBUS_MAST_CFG0_BASE + 0x4 + (MBUS_MAST_CFG_STRIDE * (n)))
+#define MBUS_MAST_CFG0_REG(n) \
+	(MBUS_MAST_CFG0_BASE + (MBUS_MAST_CFG_STRIDE * (n)))
+#define MBUS_MAST_CFG1_REG(n) \
+	(MBUS_MAST_CFG0_BASE + 0x4 + (MBUS_MAST_CFG_STRIDE * (n)))
 #define MBUS_MAST_ABS_BWL_REG(n) (MBUS_MAST_CFG0_BASE + 0x8 + 0x10 * (n))
-#define MBUS_BW_CFG_REG          0x0200
+#define MBUS_BW_CFG_REG 0x0200
 #define MBUS_MAST_ACEN_CFG_REG(k) (0x0020 + 0x04 * (k))
 
 /* MBUS_MAST_CFG0_REG bit layout (from BSP sunxi_mbus.c):
@@ -751,9 +785,9 @@ static inline u32 g2d_ccu_read(struct sunxi_g2d_dev *g2d, u32 reg)
  * Bits 15-8: COMMAND_NUMBER (ACS)
  * Bits 31-16: BANDWIDTH_LIMIT_0 (BWL0)
  */
-#define MBUS_PRI_SHIFT   1
-#define MBUS_QOS_SHIFT   2
-#define MBUS_QOS_MASK    0x3
+#define MBUS_PRI_SHIFT 1
+#define MBUS_QOS_SHIFT 2
+#define MBUS_QOS_MASK 0x3
 
 /** Get the MBUS base address for the G2D device
  *
@@ -765,25 +799,25 @@ static inline u32 g2d_ccu_read(struct sunxi_g2d_dev *g2d, u32 reg)
  */
 static void __iomem *sunxi_g2d_map_mbus(struct device *dev)
 {
-    struct device_node *mbus_np;
-    struct resource res;
-    void __iomem *base;
+	struct device_node *mbus_np;
+	struct resource res;
+	void __iomem *base;
 
-    mbus_np = of_parse_phandle(dev->of_node, "interconnects", 0);
-    if (!mbus_np)
-        return ERR_PTR(-ENODEV);
+	mbus_np = of_parse_phandle(dev->of_node, "interconnects", 0);
+	if (!mbus_np)
+		return ERR_PTR(-ENODEV);
 
-    if (of_address_to_resource(mbus_np, 0, &res)) {
-        of_node_put(mbus_np);
-        return ERR_PTR(-ENODEV);
-    }
-    of_node_put(mbus_np);
+	if (of_address_to_resource(mbus_np, 0, &res)) {
+		of_node_put(mbus_np);
+		return ERR_PTR(-ENODEV);
+	}
+	of_node_put(mbus_np);
 
-    base = devm_ioremap(dev, res.start, resource_size(&res));
-    if (!base)
-        return ERR_PTR(-ENOMEM);
+	base = devm_ioremap(dev, res.start, resource_size(&res));
+	if (!base)
+		return ERR_PTR(-ENOMEM);
 
-    return base;
+	return base;
 }
 
 /**
@@ -797,34 +831,35 @@ static void __iomem *sunxi_g2d_map_mbus(struct device *dev)
  */
 static int sunxi_g2d_setup_mbus(struct device *dev, void __iomem *mbus)
 {
-    u32 off = MBUS_MAST_CFG0_REG(G2D_PORT);     /* -> 0x02A0 */
-    u32 v, nv;
+	u32 off = MBUS_MAST_CFG0_REG(G2D_PORT); /* -> 0x02A0 */
+	u32 v, nv;
 
-    /* 1) Asegúrate de habilitar el master en ACEN */
-    u32 reg_acen = MBUS_MAST_ACEN_CFG_REG(G2D_PORT / 32); /* 0x0020 */
-    u32 bit = G2D_PORT % 32;
-    u32 acen = readl_relaxed(mbus + reg_acen);
-    if (!(acen & BIT(bit))) {
-        writel_relaxed(acen | BIT(bit), mbus + reg_acen);
-        wmb();
-    }
+	/* 1) Asegúrate de habilitar el master en ACEN */
+	u32 reg_acen = MBUS_MAST_ACEN_CFG_REG(G2D_PORT / 32); /* 0x0020 */
+	u32 bit = G2D_PORT % 32;
+	u32 acen = readl_relaxed(mbus + reg_acen);
+	if (!(acen & BIT(bit))) {
+		writel_relaxed(acen | BIT(bit), mbus + reg_acen);
+		wmb();
+	}
 
-    /* 2) PRI=1 y QOS=3 en CFG0(9) */
-    v  = readl_relaxed(mbus + off);
-    nv = v | BIT(MBUS_PRI_SHIFT);
-    nv &= ~(MBUS_QOS_MASK << MBUS_QOS_SHIFT);
-    nv |=  (MBUS_QOS_MASK << MBUS_QOS_SHIFT);
+	/* 2) PRI=1 y QOS=3 en CFG0(9) */
+	v = readl_relaxed(mbus + off);
+	nv = v | BIT(MBUS_PRI_SHIFT);
+	nv &= ~(MBUS_QOS_MASK << MBUS_QOS_SHIFT);
+	nv |= (MBUS_QOS_MASK << MBUS_QOS_SHIFT);
 
-    if (nv != v) {
-        writel_relaxed(nv, mbus + off);
-        wmb();
-    }
+	if (nv != v) {
+		writel_relaxed(nv, mbus + off);
+		wmb();
+	}
 
-    /* (opcional) log/verify */
-    nv = readl_relaxed(mbus + off);
-    dev_dbg(dev, "MBUS CFG0(9) @0x%04x before=0x%08x after=0x%08x\n", off, v, nv);
+	/* (opcional) log/verify */
+	nv = readl_relaxed(mbus + off);
+	dev_dbg(dev, "MBUS CFG0(9) @0x%04x before=0x%08x after=0x%08x\n", off,
+		v, nv);
 
-    return 0;
+	return 0;
 }
 
 /* ========== Power management ========== */
@@ -846,83 +881,83 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 {
 	u32 val;
 	int ret;
-	
+
 	/* Step 1: Enable clocks (BSP order: bus → mod@300MHz → mbus) */
 	ret = clk_prepare_enable(g2d->clk_bus);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to enable bus clock: %d\n", ret);
 		return ret;
 	}
-	
+
 	ret = clk_set_rate(g2d->clk_mod, 300000000);
 	if (ret) {
-		dev_warn(g2d->dev, "Failed to set module clock rate: %d\n", ret);
+		dev_warn(g2d->dev, "Failed to set module clock rate: %d\n",
+			 ret);
 	}
-	
+
 	ret = clk_prepare_enable(g2d->clk_mod);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to enable module clock: %d\n", ret);
 		goto err_bus_clk;
 	}
-	
+
 	ret = clk_prepare_enable(g2d->clk_mbus);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to enable mbus clock: %d\n", ret);
 		goto err_mod_clk;
 	}
-	
+
 	dev_dbg(g2d->dev, "Clocks: mod=%lu bus=%lu mbus=%lu\n",
-			clk_get_rate(g2d->clk_mod),
-			clk_get_rate(g2d->clk_bus),
-			clk_get_rate(g2d->clk_mbus));
-	
+		clk_get_rate(g2d->clk_mod), clk_get_rate(g2d->clk_bus),
+		clk_get_rate(g2d->clk_mbus));
+
 	/* Step 2: TOP enable - open gates (0x3 = MIXER + ROT) */
-	g2d_write(g2d, G2D_SCLK_GATE, 0x3);   /* Source clocks */
-	g2d_write(g2d, G2D_HCLK_GATE, 0x3);   /* AHB clocks */
-	g2d_write(g2d, G2D_AHB_RESET, 0x0);   /* Assert reset */
+	g2d_write(g2d, G2D_SCLK_GATE, 0x3); /* Source clocks */
+	g2d_write(g2d, G2D_HCLK_GATE, 0x3); /* AHB clocks */
+	g2d_write(g2d, G2D_AHB_RESET, 0x0); /* Assert reset */
 	wmb();
 	udelay(10);
-	g2d_write(g2d, G2D_AHB_RESET, 0x3);   /* Release reset */
+	g2d_write(g2d, G2D_AHB_RESET, 0x3); /* Release reset */
 	wmb();
-	
+
 	/* Configure CMD_CTL for DRAM command control (needed for RCQ DMA) */
-	g2d_write(g2d, G2D_CMD_CTL, 0x00010001);  /* Enable CORE0 and RT_WB */
+	g2d_write(g2d, G2D_CMD_CTL, 0x00010001); /* Enable CORE0 and RT_WB */
 	wmb();
-	
-	dev_dbg(g2d->dev, "TOP: SCLK=0x%08x HCLK=0x%08x RESET=0x%08x CMD_CTL=0x%08x\n",
-			g2d_read(g2d, G2D_SCLK_GATE),
-			g2d_read(g2d, G2D_HCLK_GATE),
-			g2d_read(g2d, G2D_AHB_RESET),
-			g2d_read(g2d, G2D_CMD_CTL));
-	
+
+	dev_dbg(g2d->dev,
+		"TOP: SCLK=0x%08x HCLK=0x%08x RESET=0x%08x CMD_CTL=0x%08x\n",
+		g2d_read(g2d, G2D_SCLK_GATE), g2d_read(g2d, G2D_HCLK_GATE),
+		g2d_read(g2d, G2D_AHB_RESET), g2d_read(g2d, G2D_CMD_CTL));
+
 	/* Read VERSION */
 	val = g2d_read(g2d, G2D_VERSION);
 	g2d->hw_version = val;
 	dev_dbg(g2d->dev, "Hardware version 0x%04x\n", (val >> 16) & 0xFFFF);
-	
+
 	/* Step 3: CCU enable - enable WB/RCQ sub-blocks */
 	if (g2d->ccu_base) {
 		val = readl(g2d->ccu_base + G2D_CLK_REG);
 		val |= G2D_CLK_GATING;
 		writel(val, g2d->ccu_base + G2D_CLK_REG);
-		
-		writel(0x00010001, g2d->ccu_base + G2D_BGR_REG);  /* Gate + RST */
+
+		writel(0x00010001,
+		       g2d->ccu_base + G2D_BGR_REG); /* Gate + RST */
 		wmb();
 
 		dev_dbg(g2d->dev, "CCU: CLK_REG=0x%08x BGR_REG=0x%08x\n",
-			 readl(g2d->ccu_base + G2D_CLK_REG),
-				 readl(g2d->ccu_base + G2D_BGR_REG));
+			readl(g2d->ccu_base + G2D_CLK_REG),
+			readl(g2d->ccu_base + G2D_BGR_REG));
 	}
-	
+
 	/* Step 4: Set MBUS bandwidth (300 MB/s avg, 600 MB/s peak) */
 	if (g2d->icc_path) {
-		ret = icc_set_bw(g2d->icc_path,
-				 Bps_to_icc(300 * 1024 * 1024),
+		ret = icc_set_bw(g2d->icc_path, Bps_to_icc(300 * 1024 * 1024),
 				 Bps_to_icc(600 * 1024 * 1024));
 		if (ret)
-			dev_warn(g2d->dev, "Failed to set MBUS bandwidth: %d\n", ret);
+			dev_warn(g2d->dev, "Failed to set MBUS bandwidth: %d\n",
+				 ret);
 	}
-	
+
 	/* Step 4.5: Configure MBUS priority for G2D master (T113-S3 quirk)
 	 * CRITICAL: Without this, G2D DMA transactions are blocked/delayed,
 	 * causing RCQ operations to timeout and IRQs to never fire.
@@ -934,14 +969,13 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 	sunxi_g2d_setup_mbus(g2d->dev, mbus);
 
 	dev_dbg(g2d->dev, "RCQ_CTRL=0x%08x RCQ_STATUS=0x%08x\n",
-			 g2d_read(g2d, G2D_RCQ_CTRL),
-			 g2d_read(g2d, G2D_RCQ_STATUS));
-	
+		g2d_read(g2d, G2D_RCQ_CTRL), g2d_read(g2d, G2D_RCQ_STATUS));
+
 	/* Step 6: Configure interrupts for DIRECT mode */
 	g2d_write(g2d, G2D_MIXER_INT, G2D_MIXER_INT_FINISH_IRQ_EN);
-	
+
 	g2d->hw_enabled = true;
-	
+
 	dev_dbg(g2d->dev, "G2D hardware enabled\n");
 	return 0;
 
@@ -961,24 +995,24 @@ static void sunxi_g2d_hw_disable(struct sunxi_g2d_dev *g2d)
 {
 	if (!g2d->hw_enabled)
 		return;
-	
+
 	/* Disable interrupts */
 	g2d_write(g2d, G2D_MIXER_INT, 0);
-	
+
 	/* Reset IP */
 	g2d_write(g2d, G2D_MIXER_CTL, G2D_MIXER_CTL_RESET);
-	
+
 	/* Release MBUS bandwidth */
 	if (g2d->icc_path)
 		icc_set_bw(g2d->icc_path, 0, 0);
-	
+
 	/* Disable clocks */
 	clk_disable_unprepare(g2d->clk_mbus);
 	clk_disable_unprepare(g2d->clk_mod);
 	clk_disable_unprepare(g2d->clk_bus);
-	
+
 	g2d->hw_enabled = false;
-	
+
 	dev_dbg(g2d->dev, "G2D hardware disabled\n");
 }
 
@@ -986,25 +1020,29 @@ static void sunxi_g2d_hw_disable(struct sunxi_g2d_dev *g2d)
 static void sunxi_g2d_disable_workfn(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
-	struct sunxi_g2d_dev *g2d = container_of(dwork, struct sunxi_g2d_dev, disable_work);
+	struct sunxi_g2d_dev *g2d =
+		container_of(dwork, struct sunxi_g2d_dev, disable_work);
 	unsigned long flags;
 	bool should_disable = false;
 
 	/* Quick check under job_lock to avoid races with job enqueue/dequeue */
 	spin_lock_irqsave(&g2d->job_lock, flags);
-	if (atomic_read(&g2d->users) == 0 && list_empty(&g2d->job_queue) && g2d->current_job == NULL)
+	if (atomic_read(&g2d->users) == 0 && list_empty(&g2d->job_queue) &&
+	    g2d->current_job == NULL)
 		should_disable = true;
 	spin_unlock_irqrestore(&g2d->job_lock, flags);
 
 	if (should_disable) {
 		/* Re-check under dev_mutex and disable safely */
 		mutex_lock(&g2d->dev_mutex);
-		if (atomic_read(&g2d->users) == 0 && list_empty(&g2d->job_queue) && g2d->current_job == NULL)
+		if (atomic_read(&g2d->users) == 0 &&
+		    list_empty(&g2d->job_queue) && g2d->current_job == NULL)
 			sunxi_g2d_hw_disable(g2d);
 		mutex_unlock(&g2d->dev_mutex);
 	} else {
 		/* Not idle yet — reschedule after 100 ms */
-		queue_delayed_work(g2d->job_wq, &g2d->disable_work, msecs_to_jiffies(100));
+		queue_delayed_work(g2d->job_wq, &g2d->disable_work,
+				   msecs_to_jiffies(100));
 	}
 }
 
@@ -1019,42 +1057,42 @@ static void sunxi_g2d_disable_workfn(struct work_struct *work)
  */
 static void sunxi_g2d_job_worker(struct work_struct *work)
 {
-	struct sunxi_g2d_dev *g2d = container_of(work, struct sunxi_g2d_dev, job_work);
+	struct sunxi_g2d_dev *g2d =
+		container_of(work, struct sunxi_g2d_dev, job_work);
 	struct sunxi_g2d_job *job = NULL;
 	unsigned long flags;
 	int ret;
-	
+
 	/* Dequeue next job under lock */
 	spin_lock_irqsave(&g2d->job_lock, flags);
-	
+
 	/* Don't start new job if one is already running */
 	if (g2d->current_job) {
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
 		return;
 	}
-	
+
 	/* Check if queue has jobs */
 	if (list_empty(&g2d->job_queue)) {
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
 		return;
 	}
-	
+
 	/* Dequeue first job */
 	job = list_first_entry(&g2d->job_queue, struct sunxi_g2d_job, node);
 	list_del(&job->node);
 	g2d->current_job = job;
 	atomic64_inc(&g2d->jobs_submitted);
-	
+
 	spin_unlock_irqrestore(&g2d->job_lock, flags);
-	
+
 	dev_dbg(g2d->dev, "job_worker: executing job=%p type=%d fence=%p\n",
 		job, job->type, job->fence);
-	
+
 	/* Execute job based on type (HW will IRQ when done) */
 	switch (job->type) {
 	case G2D_JOB_FILLRECT:
-		ret = sunxi_g2d_do_fillrect(g2d,
-					    job->dst_dma,
+		ret = sunxi_g2d_do_fillrect(g2d, job->dst_dma,
 					    job->data.fillrect.width,
 					    job->data.fillrect.height,
 					    job->data.fillrect.pitch,
@@ -1062,440 +1100,518 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 					    job->data.fillrect.color_format,
 					    job->data.fillrect.dst_format);
 		if (ret) {
-			dev_err(g2d->dev, "job_worker: fillrect failed: %d\n", ret);
+			dev_err(g2d->dev, "job_worker: fillrect failed: %d\n",
+				ret);
 			dma_fence_set_error(job->fence, ret);
 			dma_fence_signal(job->fence);
-			
+
 			spin_lock_irqsave(&g2d->job_lock, flags);
 			g2d->current_job = NULL;
 			atomic64_inc(&g2d->jobs_failed);
 			spin_unlock_irqrestore(&g2d->job_lock, flags);
-			
+
 			/* Cleanup and try next job */
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
 		break;
-		
+
 	case G2D_JOB_BLIT:
-		/* Check if this is a 2-pass scale+rotate job */
-		if (job->temp_vaddr) {
-			dev_dbg(g2d->dev, "job_worker: executing 2-pass scale+rotate job=%p\n", job);
-			
-			/* STEP 1: Scale src → temp (no rotation, no alpha) */
-			dev_dbg(g2d->dev, "STEP 1 async: SCALE %ux%u -> %ux%u to temp buffer\n",
-				 job->data.blit.src_crop_w, job->data.blit.src_crop_h,
-				 job->temp_width, job->temp_height);
-			
-			ret = sunxi_g2d_do_blit(g2d,
-						job->src_dma,
-						job->data.blit.src_width,
-						job->data.blit.src_height,
-						job->data.blit.src_pitch,
-						job->data.blit.src_format,
-						job->data.blit.src_crop_x,
-						job->data.blit.src_crop_y,
-						job->data.blit.src_crop_w,
-						job->data.blit.src_crop_h,
-						job->data.blit.src_color_space,
-						job->temp_dma_addr,
-						job->temp_width,
-						job->temp_height,
-						job->temp_pitch,
-						job->temp_format,
-						0, 0,  /* Fill entire temp buffer */
-						job->temp_width,
-						job->temp_height,
-						job->data.blit.dst_color_space);
-			
+		/* Check if this is a 3-pass (scale -> rotate -> blend) job */
+		if (job->temp_vaddr && job->temp2_vaddr) {
+			dev_dbg(g2d->dev,
+				"job_worker: executing 3-pass scale+rotate+blend job=%p\n",
+				job);
+
+			/* STEP 1: Scale src → temp1 (no rotation, no alpha) */
+			dev_dbg(g2d->dev,
+				"STEP 1 async: SCALE %ux%u -> %ux%u to temp1 buffer\n",
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h, job->temp_width,
+				job->temp_height);
+
+			/* Use the isolated VSU scale path (same as atomic G2D_CMD_SCALE)
+			 * to ensure the scaler is configured identically to the atomic
+			 * path. This avoids differences in VSU configuration that can
+			 * change how alpha is written into the temp buffer.
+			 */
+			ret = sunxi_g2d_do_scale(
+				g2d, job->src_dma, job->data.blit.src_width,
+				job->data.blit.src_height,
+				job->data.blit.src_pitch,
+				job->data.blit.src_format,
+				job->data.blit.src_crop_x,
+				job->data.blit.src_crop_y,
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h, job->temp_dma_addr,
+				job->temp_width, job->temp_height,
+				job->temp_pitch, job->temp_format, 0, 0,
+				job->temp_width, job->temp_height,
+				job->temp_vaddr);
+
 			if (ret < 0) {
-				dev_err(g2d->dev, "job_worker: 2-pass STEP 1 (scale) failed: %d\n", ret);
+				dev_err(g2d->dev,
+					"job_worker: 3-pass STEP 1 (scale) failed: %d\n",
+					ret);
 				dma_fence_set_error(job->fence, ret);
 				dma_fence_signal(job->fence);
-				
+
 				spin_lock_irqsave(&g2d->job_lock, flags);
 				g2d->current_job = NULL;
 				atomic64_inc(&g2d->jobs_failed);
 				spin_unlock_irqrestore(&g2d->job_lock, flags);
-				
+
 				/* Cleanup and try next job */
 				queue_work(g2d->job_wq, &job->cleanup_work);
 				queue_work(g2d->job_wq, &g2d->job_work);
 				break;
 			}
-			
-			dev_dbg(g2d->dev, "✅ STEP 1 async complete: scaled to temp buffer\n");
-			
-			/* STEP 2: Rotate temp → out (no scaling) */
-			dev_dbg(g2d->dev, "STEP 2 async: ROTATE %ux%u -> out at (%u,%u)\n",
-				 job->temp_width, job->temp_height,
-				 job->data.blit.dst_x, job->data.blit.dst_y);
-			
-			ret = sunxi_g2d_do_blit_rot(g2d,
-						    job->temp_dma_addr,
-						    job->temp_width,
-						    job->temp_height,
-						    job->temp_pitch,
-						    job->temp_format,
-						    0, 0,  /* Full temp buffer as source */
-						    job->temp_width,
-						    job->temp_height,
-						    job->out_dma,  /* Write to out (or dst if no out) */
-						    job->data.blit.out_width,
-						    job->data.blit.out_height,
-						    job->data.blit.out_pitch,
-						    job->data.blit.out_format,
-						    job->data.blit.dst_x,
-						    job->data.blit.dst_y,
-						    job->temp_width,
-						    job->temp_height,
-						    job->data.blit.flags);  /* Apply rotation flags */
-			
+
+			dev_dbg(g2d->dev,
+				"✅ STEP 1 async complete: scaled to temp1 buffer\n");
+
+			/* STEP 2: Rotate temp1 → temp2 (no scaling) */
+			dev_dbg(g2d->dev,
+				"STEP 2 async: ROTATE %ux%u -> temp2 %ux%u\n",
+				job->temp_width, job->temp_height,
+				job->temp2_width, job->temp2_height);
+
+			ret = sunxi_g2d_do_blit_rot(
+				g2d, job->temp_dma_addr, job->temp_width,
+				job->temp_height, job->temp_pitch,
+				job->temp_format, 0,
+				0, /* Full temp1 buffer as source */
+				job->temp_width, job->temp_height,
+				job->temp2_dma_addr, /* Write to temp2 */
+				job->temp2_width, job->temp2_height,
+				job->temp2_pitch, job->temp2_format, 0,
+				0, /* dest position in temp2 */
+				job->temp_width, job->temp_height,
+				job->data.blit.flags); /* Apply rotation flags */
+
 			if (ret < 0) {
-				dev_err(g2d->dev, "job_worker: 2-pass STEP 2 (rotate) failed: %d\n", ret);
+				dev_err(g2d->dev,
+					"job_worker: 3-pass STEP 2 (rotate) failed: %d\n",
+					ret);
 				dma_fence_set_error(job->fence, ret);
 				dma_fence_signal(job->fence);
-				
+
 				spin_lock_irqsave(&g2d->job_lock, flags);
 				g2d->current_job = NULL;
 				atomic64_inc(&g2d->jobs_failed);
 				spin_unlock_irqrestore(&g2d->job_lock, flags);
-				
+
 				/* Cleanup and try next job */
 				queue_work(g2d->job_wq, &job->cleanup_work);
 				queue_work(g2d->job_wq, &g2d->job_work);
 				break;
 			}
-			
-			dev_dbg(g2d->dev, "✅ 2-pass scale+rotate async completed successfully\n");
+
+			dev_dbg(g2d->dev,
+				"✅ STEP 2 async complete: rotated into temp2 buffer\n");
+
+			/* STEP 3: Alpha blend temp2 + dst -> out (final) */
+			dev_dbg(g2d->dev,
+				"STEP 3 async: BLEND temp2 -> dst/out at (%u,%u)\n",
+				job->data.blit.dst_x, job->data.blit.dst_y);
+
+			ret = sunxi_g2d_do_blit_alpha_3buf(
+				g2d, job->temp2_dma_addr, job->temp2_width,
+				job->temp2_height, job->temp2_pitch,
+				job->temp2_format, 0,
+				0, /* src_x, src_y in temp2 */
+				job->temp2_width, job->temp2_height,
+				job->data.blit.src_alpha,
+				job->data.blit.src_alpha_mode,
+				job->data.blit.src_premul,
+				job->data.blit.src_color_space, job->dst_dma,
+				job->out_dma, /* dst_base_addr = OUT buffer for in-place write */
+				job->data.blit.dst_width,
+				job->data.blit.dst_height,
+				job->data.blit.dst_pitch,
+				job->data.blit.dst_format, job->data.blit.dst_x,
+				job->data.blit.dst_y, job->data.blit.dst_w,
+				job->data.blit.dst_h, job->data.blit.dst_alpha,
+				job->data.blit.dst_alpha_mode,
+				job->data.blit.dst_premul,
+				job->data.blit.dst_color_space, job->out_dma,
+				job->data.blit.out_width,
+				job->data.blit.out_height,
+				job->data.blit.out_pitch,
+				job->data.blit.out_format,
+				job->data.blit
+					.dst_w, /* out_crop_w = blend region width */
+				job->data.blit
+					.dst_h, /* out_crop_h = blend region height */
+				job->data.blit.bld_mode,
+				job->data.blit.color_key_enable,
+				job->data.blit.color_key_mode,
+				job->data.blit.color_key_min,
+				job->data.blit.color_key_max);
+
+			if (ret < 0) {
+				dev_err(g2d->dev,
+					"job_worker: 3-pass STEP 3 (blend) failed: %d\n",
+					ret);
+				dma_fence_set_error(job->fence, ret);
+				dma_fence_signal(job->fence);
+
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				g2d->current_job = NULL;
+				atomic64_inc(&g2d->jobs_failed);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+				/* Cleanup and try next job */
+				queue_work(g2d->job_wq, &job->cleanup_work);
+				queue_work(g2d->job_wq, &g2d->job_work);
+				break;
+			}
+
+			dev_dbg(g2d->dev,
+				"✅ 3-pass scale+rotate+blend async completed successfully\n");
 			/* IRQ will signal fence and cleanup */
-			
+
+		} else if (job->temp_vaddr) {
+			dev_dbg(g2d->dev,
+				"job_worker: executing 2-pass scale+rotate job=%p\n",
+				job);
+
+			/* STEP 1: Scale src → temp (no rotation, no alpha) */
+			dev_dbg(g2d->dev,
+				"STEP 1 async: SCALE %ux%u -> %ux%u to temp buffer\n",
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h, job->temp_width,
+				job->temp_height);
+
+			/* Use the same VSU path as the atomic SCALE command so that
+			 * scaling behavior (including alpha handling) is identical.
+			 */
+			ret = sunxi_g2d_do_scale(
+				g2d, job->src_dma, job->data.blit.src_width,
+				job->data.blit.src_height,
+				job->data.blit.src_pitch,
+				job->data.blit.src_format,
+				job->data.blit.src_crop_x,
+				job->data.blit.src_crop_y,
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h, job->temp_dma_addr,
+				job->temp_width, job->temp_height,
+				job->temp_pitch, job->temp_format, 0, 0,
+				job->temp_width, job->temp_height,
+				job->temp_vaddr);
+
+			if (ret < 0) {
+				dev_err(g2d->dev,
+					"job_worker: 2-pass STEP 1 (scale) failed: %d\n",
+					ret);
+				dma_fence_set_error(job->fence, ret);
+				dma_fence_signal(job->fence);
+
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				g2d->current_job = NULL;
+				atomic64_inc(&g2d->jobs_failed);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+				/* Cleanup and try next job */
+				queue_work(g2d->job_wq, &job->cleanup_work);
+				queue_work(g2d->job_wq, &g2d->job_work);
+				break;
+			}
+
+			dev_dbg(g2d->dev,
+				"✅ STEP 1 async complete: scaled to temp buffer\n");
+
+			/* STEP 2: Rotate temp → out (no scaling) */
+			dev_dbg(g2d->dev,
+				"STEP 2 async: ROTATE %ux%u -> out at (%u,%u)\n",
+				job->temp_width, job->temp_height,
+				job->data.blit.dst_x, job->data.blit.dst_y);
+
+			ret = sunxi_g2d_do_blit_rot(
+				g2d, job->temp_dma_addr, job->temp_width,
+				job->temp_height, job->temp_pitch,
+				job->temp_format, 0,
+				0, /* Full temp buffer as source */
+				job->temp_width, job->temp_height,
+				job->out_dma, /* Write to out (or dst if no out) */
+				job->data.blit.out_width,
+				job->data.blit.out_height,
+				job->data.blit.out_pitch,
+				job->data.blit.out_format, job->data.blit.dst_x,
+				job->data.blit.dst_y, job->temp_width,
+				job->temp_height,
+				job->data.blit.flags); /* Apply rotation flags */
+
+			if (ret < 0) {
+				dev_err(g2d->dev,
+					"job_worker: 2-pass STEP 2 (rotate) failed: %d\n",
+					ret);
+				dma_fence_set_error(job->fence, ret);
+				dma_fence_signal(job->fence);
+
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				g2d->current_job = NULL;
+				atomic64_inc(&g2d->jobs_failed);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+				/* Cleanup and try next job */
+				queue_work(g2d->job_wq, &job->cleanup_work);
+				queue_work(g2d->job_wq, &g2d->job_work);
+				break;
+			}
+
+			dev_dbg(g2d->dev,
+				"✅ 2-pass scale+rotate async completed successfully\n");
+			/* IRQ will signal fence and cleanup */
+
 		} else {
 			/* Single-pass unified BLIT */
-			ret = sunxi_g2d_do_blit_unified(g2d,
-							job->src_dma,
-							job->data.blit.src_width,
-							job->data.blit.src_height,
-							job->data.blit.src_pitch,
-							job->data.blit.src_format,
-							job->data.blit.src_crop_x,
-							job->data.blit.src_crop_y,
-							job->data.blit.src_crop_w,
-							job->data.blit.src_crop_h,
-							job->data.blit.src_alpha,
-							job->data.blit.src_alpha_mode,
-							job->data.blit.src_premul,
-							job->data.blit.src_color_space,
-							job->dst_dma,
-							job->data.blit.dst_width,
-							job->data.blit.dst_height,
-							job->data.blit.dst_pitch,
-							job->data.blit.dst_format,
-							job->data.blit.dst_x,
-							job->data.blit.dst_y,
-							job->data.blit.dst_w,
-							job->data.blit.dst_h,
-							job->data.blit.dst_alpha,
-							job->data.blit.dst_alpha_mode,
-							job->data.blit.dst_premul,
-							job->data.blit.dst_color_space,
-							job->out_dma,
-							job->data.blit.out_width,
-							job->data.blit.out_height,
-							job->data.blit.out_pitch,
-							job->data.blit.out_format,
-							job->data.blit.flags,
-							job->data.blit.bld_mode,
-							job->data.blit.color_key_enable,
-							job->data.blit.color_key_mode,
-							job->data.blit.color_key_min,
-							job->data.blit.color_key_max,
-							job->data.blit.needs_alpha,
-							job->data.blit.needs_rotation,
-							job->data.blit.needs_scaling);
+			dma_addr_t __use_src_dma = job->src_dma;
+			ret = sunxi_g2d_do_blit_unified(
+				g2d, __use_src_dma, job->data.blit.src_width,
+				job->data.blit.src_height,
+				job->data.blit.src_pitch,
+				job->data.blit.src_format,
+				job->data.blit.src_crop_x,
+				job->data.blit.src_crop_y,
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h,
+				job->data.blit.src_alpha,
+				job->data.blit.src_alpha_mode,
+				job->data.blit.src_premul,
+				job->data.blit.src_color_space, job->dst_dma,
+				job->data.blit.dst_width,
+				job->data.blit.dst_height,
+				job->data.blit.dst_pitch,
+				job->data.blit.dst_format, job->data.blit.dst_x,
+				job->data.blit.dst_y, job->data.blit.dst_w,
+				job->data.blit.dst_h, job->data.blit.dst_alpha,
+				job->data.blit.dst_alpha_mode,
+				job->data.blit.dst_premul,
+				job->data.blit.dst_color_space, job->out_dma,
+				job->data.blit.out_width,
+				job->data.blit.out_height,
+				job->data.blit.out_pitch,
+				job->data.blit.out_format, job->data.blit.flags,
+				job->data.blit.bld_mode,
+				job->data.blit.color_key_enable,
+				job->data.blit.color_key_mode,
+				job->data.blit.color_key_min,
+				job->data.blit.color_key_max,
+				job->data.blit.needs_alpha,
+				job->data.blit.needs_rotation,
+				job->data.blit.needs_scaling);
+
+			/* CPU temporary buffer path removed */
 			if (ret) {
-				dev_err(g2d->dev, "job_worker: blit failed: %d\n", ret);
+				dev_err(g2d->dev,
+					"job_worker: blit failed: %d\n", ret);
 				dma_fence_set_error(job->fence, ret);
 				dma_fence_signal(job->fence);
-				
+
 				spin_lock_irqsave(&g2d->job_lock, flags);
 				g2d->current_job = NULL;
 				atomic64_inc(&g2d->jobs_failed);
 				spin_unlock_irqrestore(&g2d->job_lock, flags);
-				
+
 				/* Cleanup and try next job */
 				queue_work(g2d->job_wq, &job->cleanup_work);
 				queue_work(g2d->job_wq, &g2d->job_work);
 			}
 		}
 		break;
-	
+
 	case G2D_JOB_CMD_SCALE:
 		/* Scaling operation using VSU */
-		ret = sunxi_g2d_do_blit(g2d,
-					job->src_dma,
-					job->data.blit.src_width,
-					job->data.blit.src_height,
-					job->data.blit.src_pitch,
-					job->data.blit.src_format,
-					job->data.blit.src_crop_x,
-					job->data.blit.src_crop_y,
-					job->data.blit.src_crop_w,
-					job->data.blit.src_crop_h,
-					job->data.blit.src_color_space,
-					job->dst_dma,
-					job->data.blit.dst_width,
-					job->data.blit.dst_height,
-					job->data.blit.dst_pitch,
-					job->data.blit.dst_format,
-					job->data.blit.dst_x,
-					job->data.blit.dst_y,
-					job->data.blit.dst_w,
-					job->data.blit.dst_h,
-					job->data.blit.dst_color_space);
-		
+		ret = sunxi_g2d_do_blit(
+			g2d, job->src_dma, job->data.blit.src_width,
+			job->data.blit.src_height, job->data.blit.src_pitch,
+			job->data.blit.src_format, job->data.blit.src_crop_x,
+			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+			job->data.blit.src_crop_h,
+			job->data.blit.src_color_space, job->dst_dma,
+			job->data.blit.dst_width, job->data.blit.dst_height,
+			job->data.blit.dst_pitch, job->data.blit.dst_format,
+			job->data.blit.dst_x, job->data.blit.dst_y,
+			job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.dst_color_space);
+
 		if (ret < 0) {
 			dev_err(g2d->dev, "G2D_CMD_SCALE failed: %d\n", ret);
 			dma_fence_set_error(job->fence, ret);
 			dma_fence_signal(job->fence);
-			
+
 			spin_lock_irqsave(&g2d->job_lock, flags);
 			g2d->current_job = NULL;
 			atomic64_inc(&g2d->jobs_failed);
 			spin_unlock_irqrestore(&g2d->job_lock, flags);
-			
+
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
 		break;
-	
+
 	case G2D_JOB_CMD_BLEND:
 		/* Alpha blending operation - 3 buffer mode (src + dst → out) */
-		/* ARCHITECTURAL ISSUES WITH CURRENT BLEND IMPLEMENTATION:
-		 * 
-		 * ISSUE 1 - Wrong layer for RGB/ARGB (V0 vs UI1) [TODO]:
-		 * V0 (video layer) is currently used for foreground (src), but this is INCORRECT for RGB/ARGB formats.
-		 * V0 is designed for YUV video data. RGB/ARGB textures should use UI1 (UI layer) instead.
-		 * User insight: "V0 pueda ser para video con formato de color yuv y quizás el layer UI1 sería RGB?"
-		 * This may cause suboptimal alpha channel handling when blending RGB/ARGB images.
-		 * 
-		 * ISSUE 2 - Src/Dst register semantics INVERTED [FIXED]:
-		 * Hardware has V0 and WB/UI registers with SWAPPED semantic roles:
-		 * - V0 (labeled "source") → acts as DESTINATION in blend equation
-		 * - WB (labeled "destination") → acts as SOURCE in blend equation
-		 * Discovered by testing: G2D_BLD_DSTOVER hw value produces correct SRCOVER behavior.
-		 * Alpha values are NORMAL (0=transparent, 255=opaque), buffer assignments backwards.
-		 * 
-		 * SOLUTION IMPLEMENTED: Swapped enum g2d_bld_mode values to compensate.
-		 * When user requests G2D_BLD_SRCOVER, driver uses DSTOVER hw register value.
-		 * Applications use standard Porter-Duff semantics, driver handles quirk internally.
-		 * See sunxi_g2d_get_bld_mode() and include/uapi/linux/sunxi_g2d.h for details.
-		 * 
-		 * FUTURE: Use UI1 for RGB/ARGB to potentially improve alpha quality.
-		 */
-		ret = sunxi_g2d_do_blit_alpha_3buf(g2d,
-						   job->src_dma,
-						   job->data.blit.src_width,
-						   job->data.blit.src_height,
-						   job->data.blit.src_pitch,
-						   job->data.blit.src_format,
-						   job->data.blit.src_crop_x,
-						   job->data.blit.src_crop_y,
-						   job->data.blit.src_crop_w,
-						   job->data.blit.src_crop_h,
-						   job->data.blit.src_alpha,
-						   job->data.blit.src_alpha_mode,
-						   job->data.blit.src_premul,
-						   job->data.blit.src_color_space,
-						   job->dst_dma,
-						   job->out_dma,  /* dst_base_addr = OUT buffer for in-place write */
-						   job->data.blit.dst_width,
-						   job->data.blit.dst_height,
-						   job->data.blit.dst_pitch,
-						   job->data.blit.dst_format,
-						   job->data.blit.dst_x,
-						   job->data.blit.dst_y,
-						   job->data.blit.dst_w,
-						   job->data.blit.dst_h,
-						   job->data.blit.dst_alpha,
-						   job->data.blit.dst_alpha_mode,
-						   job->data.blit.dst_premul,
-						   job->data.blit.dst_color_space,
-						   job->out_dma,
-						   job->data.blit.out_width,
-						   job->data.blit.out_height,
-						   job->data.blit.out_pitch,
-						   job->data.blit.out_format,
-						   job->data.blit.dst_w,  /* out_crop_w = blend region width */
-						   job->data.blit.dst_h,  /* out_crop_h = blend region height */
-						   job->data.blit.bld_mode,
-						   0, 0, 0, 0);  /* No color keying for BLEND command */
-		
+		ret = sunxi_g2d_do_blit_alpha_3buf(
+			g2d, job->src_dma, job->data.blit.src_width,
+			job->data.blit.src_height, job->data.blit.src_pitch,
+			job->data.blit.src_format, job->data.blit.src_crop_x,
+			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+			job->data.blit.src_crop_h, job->data.blit.src_alpha,
+			job->data.blit.src_alpha_mode,
+			job->data.blit.src_premul,
+			job->data.blit.src_color_space, job->dst_dma,
+			job->out_dma, /* dst_base_addr = OUT buffer for in-place write */
+			job->data.blit.dst_width, job->data.blit.dst_height,
+			job->data.blit.dst_pitch, job->data.blit.dst_format,
+			job->data.blit.dst_x, job->data.blit.dst_y,
+			job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.dst_alpha, job->data.blit.dst_alpha_mode,
+			job->data.blit.dst_premul,
+			job->data.blit.dst_color_space, job->out_dma,
+			job->data.blit.out_width, job->data.blit.out_height,
+			job->data.blit.out_pitch, job->data.blit.out_format,
+			job->data.blit
+				.dst_w, /* out_crop_w = blend region width */
+			job->data.blit
+				.dst_h, /* out_crop_h = blend region height */
+			job->data.blit.bld_mode, 0, 0, 0,
+			0); /* No color keying for BLEND command */
+
 		if (ret < 0) {
 			dev_err(g2d->dev, "G2D_CMD_BLEND failed: %d\n", ret);
 			dma_fence_set_error(job->fence, ret);
 			dma_fence_signal(job->fence);
-			
+
 			spin_lock_irqsave(&g2d->job_lock, flags);
 			g2d->current_job = NULL;
 			atomic64_inc(&g2d->jobs_failed);
 			spin_unlock_irqrestore(&g2d->job_lock, flags);
-			
+
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
 		break;
-	
+
 	case G2D_JOB_CMD_ROTATE:
 		/* Rotation/flip operation using ROT block */
-		ret = sunxi_g2d_do_blit_rot(g2d,
-					    job->src_dma,
-					    job->data.blit.src_width,
-					    job->data.blit.src_height,
-					    job->data.blit.src_pitch,
-					    job->data.blit.src_format,
-					    job->data.blit.src_crop_x,
-					    job->data.blit.src_crop_y,
-					    job->data.blit.src_crop_w,
-					    job->data.blit.src_crop_h,
-					    job->dst_dma,
-					    job->data.blit.dst_width,
-					    job->data.blit.dst_height,
-					    job->data.blit.dst_pitch,
-					    job->data.blit.dst_format,
-					    job->data.blit.dst_x,
-					    job->data.blit.dst_y,
-					    job->data.blit.dst_w,
-					    job->data.blit.dst_h,
-					    job->data.blit.flags);
-		
+		ret = sunxi_g2d_do_blit_rot(
+			g2d, job->src_dma, job->data.blit.src_width,
+			job->data.blit.src_height, job->data.blit.src_pitch,
+			job->data.blit.src_format, job->data.blit.src_crop_x,
+			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+			job->data.blit.src_crop_h, job->dst_dma,
+			job->data.blit.dst_width, job->data.blit.dst_height,
+			job->data.blit.dst_pitch, job->data.blit.dst_format,
+			job->data.blit.dst_x, job->data.blit.dst_y,
+			job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.flags);
+
 		if (ret < 0) {
 			dev_err(g2d->dev, "G2D_CMD_ROTATE failed: %d\n", ret);
 			dma_fence_set_error(job->fence, ret);
 			dma_fence_signal(job->fence);
-			
+
 			spin_lock_irqsave(&g2d->job_lock, flags);
 			g2d->current_job = NULL;
 			atomic64_inc(&g2d->jobs_failed);
 			spin_unlock_irqrestore(&g2d->job_lock, flags);
-			
+
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
 		break;
-	
+
 	case G2D_JOB_CMD_MASK:
 		/* Color keying / chromakey operation */
-		ret = sunxi_g2d_do_blit_alpha_3buf(g2d,
-						   job->src_dma,
-						   job->data.blit.src_width,
-						   job->data.blit.src_height,
-						   job->data.blit.src_pitch,
-						   job->data.blit.src_format,
-						   job->data.blit.src_crop_x,
-						   job->data.blit.src_crop_y,
-						   job->data.blit.src_crop_w,
-						   job->data.blit.src_crop_h,
-						   job->data.blit.src_alpha,
-						   job->data.blit.src_alpha_mode,
-						   job->data.blit.src_premul,
-						   job->data.blit.src_color_space,
-						   job->dst_dma,
-						   job->dst_dma,  /* dst_base_addr = dst_dma */
-						   job->data.blit.dst_width,
-						   job->data.blit.dst_height,
-						   job->data.blit.dst_pitch,
-						   job->data.blit.dst_format,
-						   job->data.blit.dst_x,
-						   job->data.blit.dst_y,
-						   job->data.blit.dst_w,
-						   job->data.blit.dst_h,
-						   job->data.blit.dst_alpha,
-						   job->data.blit.dst_alpha_mode,
-						   job->data.blit.dst_premul,
-						   job->data.blit.dst_color_space,
-						   job->out_dma,
-						   job->data.blit.out_width,
-						   job->data.blit.out_height,
-						   job->data.blit.out_pitch,
-						   job->data.blit.out_format,
-						   job->data.blit.dst_w,
-						   job->data.blit.dst_h,
-						   job->data.blit.bld_mode,
-						   job->data.blit.color_key_enable,
-						   job->data.blit.color_key_mode,
-						   job->data.blit.color_key_min,
-						   job->data.blit.color_key_max);
-		
+		ret = sunxi_g2d_do_blit_alpha_3buf(
+			g2d, job->src_dma, job->data.blit.src_width,
+			job->data.blit.src_height, job->data.blit.src_pitch,
+			job->data.blit.src_format, job->data.blit.src_crop_x,
+			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+			job->data.blit.src_crop_h, job->data.blit.src_alpha,
+			job->data.blit.src_alpha_mode,
+			job->data.blit.src_premul,
+			job->data.blit.src_color_space, job->dst_dma,
+			job->dst_dma, /* dst_base_addr = dst_dma */
+			job->data.blit.dst_width, job->data.blit.dst_height,
+			job->data.blit.dst_pitch, job->data.blit.dst_format,
+			job->data.blit.dst_x, job->data.blit.dst_y,
+			job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.dst_alpha, job->data.blit.dst_alpha_mode,
+			job->data.blit.dst_premul,
+			job->data.blit.dst_color_space, job->out_dma,
+			job->data.blit.out_width, job->data.blit.out_height,
+			job->data.blit.out_pitch, job->data.blit.out_format,
+			job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.bld_mode,
+			job->data.blit.color_key_enable,
+			job->data.blit.color_key_mode,
+			job->data.blit.color_key_min,
+			job->data.blit.color_key_max);
+
 		if (ret < 0) {
 			dev_err(g2d->dev, "G2D_CMD_MASK failed: %d\n", ret);
 			dma_fence_set_error(job->fence, ret);
 			dma_fence_signal(job->fence);
-			
+
 			spin_lock_irqsave(&g2d->job_lock, flags);
 			g2d->current_job = NULL;
 			atomic64_inc(&g2d->jobs_failed);
 			spin_unlock_irqrestore(&g2d->job_lock, flags);
-			
+
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
 		break;
-	
+
 	case G2D_JOB_CMD_COPY:
 		/* Simple copy operation - no scaling, no blending, no rotation */
-		ret = sunxi_g2d_do_blit(g2d,
-					job->src_dma,
-					job->data.blit.src_width,
-					job->data.blit.src_height,
-					job->data.blit.src_pitch,
-					job->data.blit.src_format,
-					job->data.blit.src_crop_x,
-					job->data.blit.src_crop_y,
-					job->data.blit.src_crop_w,
-					job->data.blit.src_crop_h,
-					job->data.blit.src_color_space,
-					job->dst_dma,
-					job->data.blit.dst_width,
-					job->data.blit.dst_height,
-					job->data.blit.dst_pitch,
-					job->data.blit.dst_format,
-					job->data.blit.dst_x,
-					job->data.blit.dst_y,
-					job->data.blit.dst_w,
-					job->data.blit.dst_h,
-					job->data.blit.dst_color_space);
-		
+		ret = sunxi_g2d_do_blit(
+			g2d, job->src_dma, job->data.blit.src_width,
+			job->data.blit.src_height, job->data.blit.src_pitch,
+			job->data.blit.src_format, job->data.blit.src_crop_x,
+			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+			job->data.blit.src_crop_h,
+			job->data.blit.src_color_space, job->dst_dma,
+			job->data.blit.dst_width, job->data.blit.dst_height,
+			job->data.blit.dst_pitch, job->data.blit.dst_format,
+			job->data.blit.dst_x, job->data.blit.dst_y,
+			job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.dst_color_space);
+
 		if (ret < 0) {
 			dev_err(g2d->dev, "G2D_CMD_COPY failed: %d\n", ret);
 			dma_fence_set_error(job->fence, ret);
 			dma_fence_signal(job->fence);
-			
+
 			spin_lock_irqsave(&g2d->job_lock, flags);
 			g2d->current_job = NULL;
 			atomic64_inc(&g2d->jobs_failed);
 			spin_unlock_irqrestore(&g2d->job_lock, flags);
-			
+
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
 		break;
-		
+
 	default:
-		dev_err(g2d->dev, "job_worker: unknown job type %d\n", job->type);
+		dev_err(g2d->dev, "job_worker: unknown job type %d\n",
+			job->type);
 		dma_fence_set_error(job->fence, -EINVAL);
 		dma_fence_signal(job->fence);
-		
+
 		spin_lock_irqsave(&g2d->job_lock, flags);
 		g2d->current_job = NULL;
 		atomic64_inc(&g2d->jobs_failed);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
-		
+
 		queue_work(g2d->job_wq, &job->cleanup_work);
 		queue_work(g2d->job_wq, &g2d->job_work);
 		break;
 	}
-	
+
 	/* On success, HW is now running. IRQ handler will:
 	 *  1. Signal job->fence
 	 *  2. Schedule cleanup_work
@@ -1512,11 +1628,12 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 	static volatile struct g2d_mixer_glb_reg *g2d_mixer;
 	u32 rot_status, rcq_status_before, rcq_status_after;
 	bool handled = false;
-	
+
 	/* Map base to hardware structures */
 	g2d_top = (volatile struct g2d_top_reg *)g2d->base;
-	g2d_mixer = (volatile struct g2d_mixer_glb_reg *)(g2d->base + G2D_MIXER);
-	
+	g2d_mixer =
+		(volatile struct g2d_mixer_glb_reg *)(g2d->base + G2D_MIXER);
+
 	/* v2.1.6: CRITICAL - task_end_irq is for execution completion!
 	 * cfg_finish_irq = RCQ config accepted (headers read)
 	 * task_end_irq = RCQ commands executed (drawing done)
@@ -1524,11 +1641,11 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 	 */
 	if (g2d_top->rcq_status.bits.task_end_irq) {
 		rcq_status_before = g2d_top->rcq_status.dwval;
-		
+
 		/* Disable task_end IRQ to prevent retrigger */
 		g2d_top->rcq_irq_ctl.bits.task_end_irq_en = 0;
 		wmb();
-		
+
 		/* v2.1.8: MIXER reset CRITICAL! BSP does this immediately after detecting task_end.
 		 * Reset sequence: 0->1 (assert reset, then deassert)
 		 */
@@ -1536,65 +1653,67 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 		wmb();
 		g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
 		wmb();
-		
+
 		/* Clear ONLY task_end_irq bit (bit 0) with direct W1C write */
 		writel(0x00000001, g2d->base + G2D_RCQ_STATUS);
 		wmb();
-		
+
 		rcq_status_after = g2d_top->rcq_status.dwval;
-		
-		dev_dbg(g2d->dev, "RCQ IRQ: task_end! status before=0x%08x after=0x%08x\n",
-				rcq_status_before, rcq_status_after);
-		
+
+		dev_dbg(g2d->dev,
+			"RCQ IRQ: task_end! status before=0x%08x after=0x%08x\n",
+			rcq_status_before, rcq_status_after);
+
 		/* Signal completion */
 		atomic_set(&g2d->irq_done, 1);
 		wake_up(&g2d->irq_wait);
 		handled = true;
 	}
-	
+
 	/* v2.4.0: Check MIXER interrupt for RCQ completion
 	 * T113-S3 G2D IP 0x0110 uses MIXER_IRQ (not task_end_irq) for completion.
 	 * This is the ONLY reliable IRQ for detecting when MIXER finishes execution.
 	 */
 	if (g2d_mixer->mixer_interrupt.bits.mixer_irq) {
 		u32 mixer_int_before = g2d_mixer->mixer_interrupt.dwval;
-		
+
 		/* v2.4.0: MIXER reset after completion (BSP pattern) */
 		g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
 		wmb();
 		g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
 		wmb();
-		
+
 		/* Clear MIXER interrupt (W1C: Write 1 to clear) */
 		g2d_mixer->mixer_interrupt.bits.mixer_irq = 1;
 		wmb();
-		
+
 		dev_dbg(g2d->dev, "MIXER IRQ: completion! mixer_int=0x%08x\n",
-				mixer_int_before);
-		
+			mixer_int_before);
+
 		/* Signal completion */
 		atomic_set(&g2d->irq_done, 1);
 		wake_up(&g2d->irq_wait);
 		handled = true;
 	}
-	
+
 	/* Check ROT interrupt */
 	rot_status = g2d_read(g2d, ROT_INT);
 	if (rot_status & ROT_INT_FINISH) {
 		/* Clear ROT interrupt */
 		g2d_write(g2d, ROT_INT, ROT_INT_FINISH);
 
-		dev_dbg(g2d->dev, "ROT IRQ received: status=0x%08x\n", rot_status);
+		dev_dbg(g2d->dev, "ROT IRQ received: status=0x%08x\n",
+			rot_status);
 
 		/* Signal completion */
 		atomic_set(&g2d->irq_done, 1);
 		wake_up(&g2d->irq_wait);
 		handled = true;
 	}
-	
+
 	if (!handled)
 		return IRQ_NONE;
-	
+
 	/* Update statistics */
 	if (g2d->current_job) {
 		/* Signal user fence (if any) and install user FD for sync_file */
@@ -1610,9 +1729,14 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 			if (job) {
 				/* Signal the fence */
 				if (job->fence) {
-					struct sunxi_g2d_fence *sf = container_of(job->fence, struct sunxi_g2d_fence, base);
-					dev_dbg(g2d->dev, "IRQ: signaling fence seq=%llu fd=%d\n",
-							sf->seqno, job->fence_fd);
+					struct sunxi_g2d_fence *sf =
+						container_of(
+							job->fence,
+							struct sunxi_g2d_fence,
+							base);
+					dev_dbg(g2d->dev,
+						"IRQ: signaling fence seq=%llu fd=%d\n",
+						sf->seqno, job->fence_fd);
 					dma_fence_signal(job->fence);
 				}
 
@@ -1623,30 +1747,38 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 				 * will be NULL if installation succeeded.
 				 */
 
-			atomic64_inc(&g2d->jobs_done);
+				atomic64_inc(&g2d->jobs_done);
 
-			/* Schedule cleanup in workqueue to avoid freeing in IRQ context */
-			INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-			if (!queue_work(g2d->job_wq, &job->cleanup_work)) {
-				/* If queueing failed, perform cleanup synchronously (fallback) */
-				sunxi_g2d_job_cleanup_workfn(&job->cleanup_work);
-			}
-			
-			/* Schedule next job if queue not empty */
-			queue_work(g2d->job_wq, &g2d->job_work);
+				/* Schedule cleanup in workqueue to avoid freeing in IRQ context */
+				INIT_WORK(&job->cleanup_work,
+					  sunxi_g2d_job_cleanup_workfn);
+				if (!queue_work(g2d->job_wq,
+						&job->cleanup_work)) {
+					/* If queueing failed, perform cleanup synchronously (fallback) */
+					sunxi_g2d_job_cleanup_workfn(
+						&job->cleanup_work);
+				}
 
-			/* If there are no users, schedule immediate disable check to speed shutdown */
-			if (atomic_read(&g2d->users) == 0) {
-				unsigned long __flags;
-				spin_lock_irqsave(&g2d->job_lock, __flags);
-				if (list_empty(&g2d->job_queue) && g2d->current_job == NULL)
-					queue_delayed_work(g2d->job_wq, &g2d->disable_work, 0);
-				spin_unlock_irqrestore(&g2d->job_lock, __flags);
-			}
+				/* Schedule next job if queue not empty */
+				queue_work(g2d->job_wq, &g2d->job_work);
+
+				/* If there are no users, schedule immediate disable check to speed shutdown */
+				if (atomic_read(&g2d->users) == 0) {
+					unsigned long __flags;
+					spin_lock_irqsave(&g2d->job_lock,
+							  __flags);
+					if (list_empty(&g2d->job_queue) &&
+					    g2d->current_job == NULL)
+						queue_delayed_work(
+							g2d->job_wq,
+							&g2d->disable_work, 0);
+					spin_unlock_irqrestore(&g2d->job_lock,
+							       __flags);
+				}
 			}
 		}
 	}
-	
+
 	return IRQ_HANDLED;
 }
 
@@ -1666,175 +1798,175 @@ static int sunxi_g2d_format_to_hw(u32 fmt, u32 *bpp)
 {
 	u32 hw_fmt;
 	u32 bytes_pp = 0;
-	
+
 	switch (fmt) {
 	/* RGB formats - 32bpp */
 	case G2D_FMT_ARGB8888:
-		hw_fmt = G2D_FORMAT_ARGB8888;  /* 0x00 */
+		hw_fmt = G2D_FORMAT_ARGB8888; /* 0x00 */
 		bytes_pp = 4;
 		break;
 	case G2D_FMT_ABGR8888:
-		hw_fmt = G2D_FORMAT_ABGR8888;  /* 0x01 */
+		hw_fmt = G2D_FORMAT_ABGR8888; /* 0x01 */
 		bytes_pp = 4;
 		break;
 	case G2D_FMT_RGBA8888:
-		hw_fmt = G2D_FORMAT_RGBA8888;  /* 0x02 */
+		hw_fmt = G2D_FORMAT_RGBA8888; /* 0x02 */
 		bytes_pp = 4;
 		break;
 	case G2D_FMT_BGRA8888:
-		hw_fmt = G2D_FORMAT_BGRA8888;  /* 0x03 */
+		hw_fmt = G2D_FORMAT_BGRA8888; /* 0x03 */
 		bytes_pp = 4;
 		break;
 	case G2D_FMT_XRGB8888:
-		hw_fmt = G2D_FORMAT_XRGB8888;  /* 0x04 */
+		hw_fmt = G2D_FORMAT_XRGB8888; /* 0x04 */
 		bytes_pp = 4;
 		break;
 	case G2D_FMT_XBGR8888:
-		hw_fmt = G2D_FORMAT_XBGR8888;  /* 0x05 */
+		hw_fmt = G2D_FORMAT_XBGR8888; /* 0x05 */
 		bytes_pp = 4;
 		break;
 	case G2D_FMT_RGBX8888:
-		hw_fmt = G2D_FORMAT_RGBX8888;  /* 0x06 */
+		hw_fmt = G2D_FORMAT_RGBX8888; /* 0x06 */
 		bytes_pp = 4;
 		break;
 	case G2D_FMT_BGRX8888:
-		hw_fmt = G2D_FORMAT_BGRX8888;  /* 0x07 */
+		hw_fmt = G2D_FORMAT_BGRX8888; /* 0x07 */
 		bytes_pp = 4;
 		break;
-		
+
 	/* RGB formats - 24bpp */
 	case G2D_FMT_RGB888:
-		hw_fmt = G2D_FORMAT_RGB888;  /* 0x08 */
+		hw_fmt = G2D_FORMAT_RGB888; /* 0x08 */
 		bytes_pp = 3;
 		break;
 	case G2D_FMT_BGR888:
-		hw_fmt = G2D_FORMAT_BGR888;  /* 0x09 */
+		hw_fmt = G2D_FORMAT_BGR888; /* 0x09 */
 		bytes_pp = 3;
 		break;
-		
+
 	/* RGB formats - 16bpp */
 	case G2D_FMT_RGB565:
-		hw_fmt = G2D_FORMAT_RGB565;  /* 0x0A */
+		hw_fmt = G2D_FORMAT_RGB565; /* 0x0A */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_BGR565:
-		hw_fmt = G2D_FORMAT_BGR565;  /* 0x0B */
+		hw_fmt = G2D_FORMAT_BGR565; /* 0x0B */
 		bytes_pp = 2;
 		break;
-		
+
 	/* RGB formats - 16bpp with alpha */
 	case G2D_FMT_ARGB4444:
-		hw_fmt = G2D_FORMAT_ARGB4444;  /* 0x0C */
+		hw_fmt = G2D_FORMAT_ARGB4444; /* 0x0C */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_ABGR4444:
-		hw_fmt = G2D_FORMAT_ABGR4444;  /* 0x0D */
+		hw_fmt = G2D_FORMAT_ABGR4444; /* 0x0D */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_RGBA4444:
-		hw_fmt = G2D_FORMAT_RGBA4444;  /* 0x0E */
+		hw_fmt = G2D_FORMAT_RGBA4444; /* 0x0E */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_BGRA4444:
-		hw_fmt = G2D_FORMAT_BGRA4444;  /* 0x0F */
+		hw_fmt = G2D_FORMAT_BGRA4444; /* 0x0F */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_ARGB1555:
-		hw_fmt = G2D_FORMAT_ARGB1555;  /* 0x10 */
+		hw_fmt = G2D_FORMAT_ARGB1555; /* 0x10 */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_ABGR1555:
-		hw_fmt = G2D_FORMAT_ABGR1555;  /* 0x11 */
+		hw_fmt = G2D_FORMAT_ABGR1555; /* 0x11 */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_RGBA5551:
-		hw_fmt = G2D_FORMAT_RGBA5551;  /* 0x12 */
+		hw_fmt = G2D_FORMAT_RGBA5551; /* 0x12 */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_BGRA5551:
-		hw_fmt = G2D_FORMAT_BGRA5551;  /* 0x13 */
+		hw_fmt = G2D_FORMAT_BGRA5551; /* 0x13 */
 		bytes_pp = 2;
 		break;
-		
+
 	/* YUV formats - Interleaved (packed) 422 */
 	case G2D_FMT_YUV422_I_YVYU:
-		hw_fmt = G2D_FORMAT_IYUV422_V0Y1U0Y0;  /* 0x20 */
-		bytes_pp = 2;  /* 2 bytes per pixel (averaged) */
+		hw_fmt = G2D_FORMAT_IYUV422_V0Y1U0Y0; /* 0x20 */
+		bytes_pp = 2; /* 2 bytes per pixel (averaged) */
 		break;
 	case G2D_FMT_YUV422_I_YUYV:
-		hw_fmt = G2D_FORMAT_IYUV422_Y1V0Y0U0;  /* 0x21 */
+		hw_fmt = G2D_FORMAT_IYUV422_Y1V0Y0U0; /* 0x21 */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_YUV422_I_UYVY:
-		hw_fmt = G2D_FORMAT_IYUV422_U0Y1V0Y0;  /* 0x22 */
+		hw_fmt = G2D_FORMAT_IYUV422_U0Y1V0Y0; /* 0x22 */
 		bytes_pp = 2;
 		break;
 	case G2D_FMT_YUV422_I_VYUY:
-		hw_fmt = G2D_FORMAT_IYUV422_Y1U0Y0V0;  /* 0x23 */
+		hw_fmt = G2D_FORMAT_IYUV422_Y1U0Y0V0; /* 0x23 */
 		bytes_pp = 2;
 		break;
-		
+
 	/* YUV formats - Semi-planar 422 */
 	case G2D_FMT_YUV422_SP_UVUV:
-		hw_fmt = G2D_FORMAT_YUV422UVC_V1U1V0U0;  /* 0x24 */
-		bytes_pp = 1;  /* Y plane: 1 byte per pixel */
+		hw_fmt = G2D_FORMAT_YUV422UVC_V1U1V0U0; /* 0x24 */
+		bytes_pp = 1; /* Y plane: 1 byte per pixel */
 		break;
 	case G2D_FMT_YUV422_SP_VUVU:
-		hw_fmt = G2D_FORMAT_YUV422UVC_U1V1U0V0;  /* 0x25 */
+		hw_fmt = G2D_FORMAT_YUV422UVC_U1V1U0V0; /* 0x25 */
 		bytes_pp = 1;
 		break;
-		
+
 	/* YUV formats - Planar 422 */
 	case G2D_FMT_YUV422_P:
-		hw_fmt = G2D_FORMAT_YUV422_PLANAR;  /* 0x26 */
-		bytes_pp = 1;  /* Y plane: 1 byte per pixel */
+		hw_fmt = G2D_FORMAT_YUV422_PLANAR; /* 0x26 */
+		bytes_pp = 1; /* Y plane: 1 byte per pixel */
 		break;
-		
+
 	/* YUV formats - Semi-planar 420 */
 	case G2D_FMT_YUV420_SP_UVUV:
-		hw_fmt = G2D_FORMAT_YUV420UVC_V1U1V0U0;  /* 0x28 */
+		hw_fmt = G2D_FORMAT_YUV420UVC_V1U1V0U0; /* 0x28 */
 		bytes_pp = 1;
 		break;
 	case G2D_FMT_YUV420_SP_VUVU:
-		hw_fmt = G2D_FORMAT_YUV420UVC_U1V1U0V0;  /* 0x29 */
+		hw_fmt = G2D_FORMAT_YUV420UVC_U1V1U0V0; /* 0x29 */
 		bytes_pp = 1;
 		break;
-		
+
 	/* YUV formats - Planar 420 (I420/YV12) */
 	case G2D_FMT_YUV420_P:
-		hw_fmt = G2D_FORMAT_YUV420_PLANAR;  /* 0x2A */
+		hw_fmt = G2D_FORMAT_YUV420_PLANAR; /* 0x2A */
 		bytes_pp = 1;
 		break;
-		
+
 	/* YUV formats - Semi-planar 411 */
 	case G2D_FMT_YUV411_SP_UVUV:
-		hw_fmt = G2D_FORMAT_YUV411UVC_V1U1V0U0;  /* 0x2C */
+		hw_fmt = G2D_FORMAT_YUV411UVC_V1U1V0U0; /* 0x2C */
 		bytes_pp = 1;
 		break;
 	case G2D_FMT_YUV411_SP_VUVU:
-		hw_fmt = G2D_FORMAT_YUV411UVC_U1V1U0V0;  /* 0x2D */
+		hw_fmt = G2D_FORMAT_YUV411UVC_U1V1U0V0; /* 0x2D */
 		bytes_pp = 1;
 		break;
-		
+
 	/* YUV formats - Planar 411 */
 	case G2D_FMT_YUV411_P:
-		hw_fmt = G2D_FORMAT_YUV411_PLANAR;  /* 0x2E */
+		hw_fmt = G2D_FORMAT_YUV411_PLANAR; /* 0x2E */
 		bytes_pp = 1;
 		break;
-		
+
 	/* Monochrome formats */
 	case G2D_FMT_8BPP_MONO:
-		hw_fmt = G2D_FORMAT_Y8;  /* 0x30 - Grayscale */
+		hw_fmt = G2D_FORMAT_Y8; /* 0x30 - Grayscale */
 		bytes_pp = 1;
 		break;
-		
+
 	default:
 		return -EINVAL;
 	}
-	
+
 	if (bpp)
 		*bpp = bytes_pp;
-		
+
 	return hw_fmt;
 }
 
@@ -1872,28 +2004,29 @@ static inline bool sunxi_g2d_is_yuv_format(u32 fmt)
  * Coefficients are in S12.0 fixed-point format (13-bit signed integer).
  * Constants are in S19.0 format (20-bit signed integer).
  */
-static void sunxi_g2d_configure_csc(struct sunxi_g2d_dev *g2d, int csc_id, u32 color_space)
+static void sunxi_g2d_configure_csc(struct sunxi_g2d_dev *g2d, int csc_id,
+				    u32 color_space)
 {
 	/* BT.601 YUV→RGB coefficients (scaled by 1024 for fixed-point) */
 	static const s16 bt601_coeffs[3][3] = {
-		{ 1192,    0,  1634 },  /* R = 1.164Y + 0.000U + 1.596Cr */
-		{ 1192, -400,  -833 },  /* G = 1.164Y - 0.391U - 0.813Cr */
-		{ 1192, 2066,     0 }   /* B = 1.164Y + 2.018U + 0.000Cr */
+		{ 1192, 0, 1634 }, /* R = 1.164Y + 0.000U + 1.596Cr */
+		{ 1192, -400, -833 }, /* G = 1.164Y - 0.391U - 0.813Cr */
+		{ 1192, 2066, 0 } /* B = 1.164Y + 2.018U + 0.000Cr */
 	};
 	static const s32 bt601_offsets[3] = { -223, 136, -277 };
-	
+
 	/* BT.709 YUV→RGB coefficients (scaled by 1024 for fixed-point) */
 	static const s16 bt709_coeffs[3][3] = {
-		{ 1192,    0,  1836 },  /* R = 1.164Y + 0.000U + 1.793Cr */
-		{ 1192, -218,  -546 },  /* G = 1.164Y - 0.213U - 0.533Cr */
-		{ 1192, 2166,     0 }   /* B = 1.164Y + 2.112U + 0.000Cr */
+		{ 1192, 0, 1836 }, /* R = 1.164Y + 0.000U + 1.793Cr */
+		{ 1192, -218, -546 }, /* G = 1.164Y - 0.213U - 0.533Cr */
+		{ 1192, 2166, 0 } /* B = 1.164Y + 2.112U + 0.000Cr */
 	};
 	static const s32 bt709_offsets[3] = { -248, 77, -289 };
-	
-	const s16 (*coeffs)[3];
+
+	const s16(*coeffs)[3];
 	const s32 *offsets;
 	u32 base_reg;
-	
+
 	/* Select matrix based on color space */
 	if (color_space == G2D_COLOR_SPACE_BT709) {
 		coeffs = bt709_coeffs;
@@ -1902,31 +2035,31 @@ static void sunxi_g2d_configure_csc(struct sunxi_g2d_dev *g2d, int csc_id, u32 c
 		coeffs = bt601_coeffs;
 		offsets = bt601_offsets;
 	}
-	
+
 	/* Calculate base register offset for this CSC unit
 	 * CSC0: 0x110, CSC1: 0x140, CSC2: 0x170 (0x30 bytes apart)
 	 */
 	base_reg = BLD_CSC0_COEF00 + (csc_id * 0x30);
-	
+
 	/* Program 3x3 matrix + 3 constants (12 registers total) */
 	/* Row 0: R coefficients + constant */
-	g2d_write(g2d, base_reg + 0x00, coeffs[0][0] & 0x1FFF);  /* coeff00: Y */
-	g2d_write(g2d, base_reg + 0x04, coeffs[0][1] & 0x1FFF);  /* coeff01: U */
-	g2d_write(g2d, base_reg + 0x08, coeffs[0][2] & 0x1FFF);  /* coeff02: V */
-	g2d_write(g2d, base_reg + 0x0C, offsets[0] & 0xFFFFF);   /* const0 */
-	
+	g2d_write(g2d, base_reg + 0x00, coeffs[0][0] & 0x1FFF); /* coeff00: Y */
+	g2d_write(g2d, base_reg + 0x04, coeffs[0][1] & 0x1FFF); /* coeff01: U */
+	g2d_write(g2d, base_reg + 0x08, coeffs[0][2] & 0x1FFF); /* coeff02: V */
+	g2d_write(g2d, base_reg + 0x0C, offsets[0] & 0xFFFFF); /* const0 */
+
 	/* Row 1: G coefficients + constant */
-	g2d_write(g2d, base_reg + 0x10, coeffs[1][0] & 0x1FFF);  /* coeff10: Y */
-	g2d_write(g2d, base_reg + 0x14, coeffs[1][1] & 0x1FFF);  /* coeff11: U */
-	g2d_write(g2d, base_reg + 0x18, coeffs[1][2] & 0x1FFF);  /* coeff12: V */
-	g2d_write(g2d, base_reg + 0x1C, offsets[1] & 0xFFFFF);   /* const1 */
-	
+	g2d_write(g2d, base_reg + 0x10, coeffs[1][0] & 0x1FFF); /* coeff10: Y */
+	g2d_write(g2d, base_reg + 0x14, coeffs[1][1] & 0x1FFF); /* coeff11: U */
+	g2d_write(g2d, base_reg + 0x18, coeffs[1][2] & 0x1FFF); /* coeff12: V */
+	g2d_write(g2d, base_reg + 0x1C, offsets[1] & 0xFFFFF); /* const1 */
+
 	/* Row 2: B coefficients + constant */
-	g2d_write(g2d, base_reg + 0x20, coeffs[2][0] & 0x1FFF);  /* coeff20: Y */
-	g2d_write(g2d, base_reg + 0x24, coeffs[2][1] & 0x1FFF);  /* coeff21: U */
-	g2d_write(g2d, base_reg + 0x28, coeffs[2][2] & 0x1FFF);  /* coeff22: V */
-	g2d_write(g2d, base_reg + 0x2C, offsets[2] & 0xFFFFF);   /* const2 */
-	
+	g2d_write(g2d, base_reg + 0x20, coeffs[2][0] & 0x1FFF); /* coeff20: Y */
+	g2d_write(g2d, base_reg + 0x24, coeffs[2][1] & 0x1FFF); /* coeff21: U */
+	g2d_write(g2d, base_reg + 0x28, coeffs[2][2] & 0x1FFF); /* coeff22: V */
+	g2d_write(g2d, base_reg + 0x2C, offsets[2] & 0xFFFFF); /* const2 */
+
 	dev_dbg(g2d->dev, "CSC%d configured: %s\n", csc_id,
 		color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
 }
@@ -1938,36 +2071,38 @@ static void sunxi_g2d_configure_csc(struct sunxi_g2d_dev *g2d, int csc_id, u32 c
  * 
  * Based on fillrect v1.0.0 STABLE proven sequence
  */
-static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
-				  dma_addr_t dst_dma,
-				  u32 width, u32 height,
-				  u32 pitch, u32 color,
-				  u32 color_format, u32 dst_format)
+static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d, dma_addr_t dst_dma,
+				 u32 width, u32 height, u32 pitch, u32 color,
+				 u32 color_format, u32 dst_format)
 {
-	struct g2d_mixer_ovl_v_reg v0 = {0};
-	struct g2d_mixer_bld_reg bld = {0};
-	struct g2d_mixer_write_back_reg wb = {0};
-	union g2d_mixer_ctrl mixer_ctrl = {0};
-	union g2d_mixer_interrupt mixer_int = {0};
+	struct g2d_mixer_ovl_v_reg v0 = { 0 };
+	struct g2d_mixer_bld_reg bld = { 0 };
+	struct g2d_mixer_write_back_reg wb = { 0 };
+	union g2d_mixer_ctrl mixer_ctrl = { 0 };
+	union g2d_mixer_interrupt mixer_int = { 0 };
 	unsigned long timeout;
 	int color_fmt_val, dst_fmt_val;
-	
+
 	/* Convert formats using helper function */
 	color_fmt_val = sunxi_g2d_format_to_hw(color_format, NULL);
 	if (color_fmt_val < 0) {
-		dev_err(g2d->dev, "Unsupported color format: %u\n", color_format);
+		dev_err(g2d->dev, "Unsupported color format: %u\n",
+			color_format);
 		return -EINVAL;
 	}
-	
+
 	dst_fmt_val = sunxi_g2d_format_to_hw(dst_format, NULL);
 	if (dst_fmt_val < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			dst_format);
 		return -EINVAL;
 	}
-	
-	dev_dbg(g2d->dev, "FILLRECT: %ux%u color=0x%08x fmt=%u->0x%02X dst_fmt=%u->0x%02X\n",
-		width, height, color, color_format, color_fmt_val, dst_format, dst_fmt_val);
-	
+
+	dev_dbg(g2d->dev,
+		"FILLRECT: %ux%u color=0x%08x fmt=%u->0x%02X dst_fmt=%u->0x%02X\n",
+		width, height, color, color_format, color_fmt_val, dst_format,
+		dst_fmt_val);
+
 	/* Convert color value ONLY when writing to framebuffer (XBGR destination)
 	 * 
 	 * For ION buffers (ABGR): DON'T swap. The fill_color writes to memory via
@@ -1982,37 +2117,39 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 	 */
 	u32 hw_color = color;
 	if (dst_fmt_val == G2D_FORMAT_XBGR8888) {
-		hw_color = (color & 0xFF00FF00) |        /* Keep A and G */
-		           ((color & 0x00FF0000) >> 16) | /* R -> B position */
-		           ((color & 0x000000FF) << 16);  /* B -> R position */
-		
-		dev_dbg(g2d->dev, "Color swap for XBGR framebuffer: 0x%08x -> 0x%08x\n", 
+		hw_color = (color & 0xFF00FF00) | /* Keep A and G */
+			   ((color & 0x00FF0000) >> 16) | /* R -> B position */
+			   ((color & 0x000000FF) << 16); /* B -> R position */
+
+		dev_dbg(g2d->dev,
+			"Color swap for XBGR framebuffer: 0x%08x -> 0x%08x\n",
 			color, hw_color);
 	}
-	
+
 	/* 1. Reset G2D */
 	g2d_write(g2d, G2D_AHB_RESET, 0x0);
 	g2d_write(g2d, G2D_AHB_RESET, 0x3);
 	wmb();
-	
+
 	/* 2. Setup V0 layer - fillcolor mode using struct */
 	v0.ovl_attr.bits.lay_en = 1;
-	v0.ovl_attr.bits.lay_fillcolor_en = 1;  /* Use fill color, not memory */
-	v0.ovl_attr.bits.lay_fbfmt = color_fmt_val;  /* Use specified color format */
+	v0.ovl_attr.bits.lay_fillcolor_en = 1; /* Use fill color, not memory */
+	v0.ovl_attr.bits.lay_fbfmt =
+		color_fmt_val; /* Use specified color format */
 	v0.ovl_attr.bits.lay_glbalpha = 0xFF;
-	
+
 	v0.ovl_mem.bits.lay_width = width - 1;
 	v0.ovl_mem.bits.lay_height = height - 1;
-	
+
 	v0.ovl_winsize.bits.width = width - 1;
 	v0.ovl_winsize.bits.height = height - 1;
-	
+
 	v0.ovl_mem_coor.bits.lay_xcoor = 0;
 	v0.ovl_mem_coor.bits.lay_ycoor = 0;
-	
+
 	v0.ovl_mem_pitch0 = pitch;
-	v0.ovl_fill_color = hw_color;  /* Use converted color for hardware */
-	
+	v0.ovl_fill_color = hw_color; /* Use converted color for hardware */
+
 	/* Write V0 registers */
 	g2d_write(g2d, V0_ATTCTL, v0.ovl_attr.dwval);
 	g2d_write(g2d, V0_MBSIZE, v0.ovl_mem.dwval);
@@ -2020,27 +2157,27 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, V0_COOR, v0.ovl_mem_coor.dwval);
 	g2d_write(g2d, V0_PITCH0, v0.ovl_mem_pitch0);
 	g2d_write(g2d, V0_FILLC, v0.ovl_fill_color);
-	
+
 	/* 3. Setup BLD (blender) using struct */
-	bld.bld_en_ctrl.bits.p0_en = 1;  /* Enable pipe 0 (V0) */
-	bld.bld_en_ctrl.bits.p0_fcen = 0;  /* Read from layer, not fill color */
-	
-	bld.premulti_ctrl.dwval = 0;  /* No premultiplication */
-	
+	bld.bld_en_ctrl.bits.p0_en = 1; /* Enable pipe 0 (V0) */
+	bld.bld_en_ctrl.bits.p0_fcen = 0; /* Read from layer, not fill color */
+
+	bld.premulti_ctrl.dwval = 0; /* No premultiplication */
+
 	bld.mem_size[0].bits.width = width - 1;
 	bld.mem_size[0].bits.height = height - 1;
-	
+
 	bld.mem_coor[0].bits.xcoor = 0;
 	bld.mem_coor[0].bits.ycoor = 0;
-	
+
 	bld.out_size.bits.width = width - 1;
 	bld.out_size.bits.height = height - 1;
-	
-	bld.out_color.bits.alpha_mode = 0;  /* RGB mode (not YUV) */
+
+	bld.out_color.bits.alpha_mode = 0; /* RGB mode (not YUV) */
 	bld.out_color.bits.premul_en = 0;
-	
-	bld.bld_ctrl.dwval = 0;  /* Simple copy mode */
-	
+
+	bld.bld_ctrl.dwval = 0; /* Simple copy mode */
+
 	/* Write BLD registers */
 	g2d_write(g2d, BLD_EN_CTL, bld.bld_en_ctrl.dwval);
 	g2d_write(g2d, BLD_PREMUL_CTL, bld.premulti_ctrl.dwval);
@@ -2050,22 +2187,22 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, BLD_SIZE, bld.out_size.dwval);
 	g2d_write(g2d, BLD_OUT_COLOR, bld.out_color.dwval);
 	g2d_write(g2d, BLD_CTL, bld.bld_ctrl.dwval);
-	
+
 	/* 4. Setup ROP (keep legacy values for now) */
 	g2d_write(g2d, ROP_CTL, 0x000000f0);
 	g2d_write(g2d, ROP_INDEX0, 0x00061080);
-	
+
 	/* 5. Setup WB (writeback) using struct */
-	wb.wb_attr.bits.fmt = dst_fmt_val;  /* Use destination format */
+	wb.wb_attr.bits.fmt = dst_fmt_val; /* Use destination format */
 	wb.wb_attr.bits.round_en = 0;
-	
+
 	wb.data_size.bits.width = width - 1;
 	wb.data_size.bits.height = height - 1;
-	
+
 	wb.pitch0 = pitch;
 	wb.laddr0 = lower_32_bits(dst_dma);
 	wb.haddr0 = upper_32_bits(dst_dma);
-	
+
 	/* Write WB registers */
 	g2d_write(g2d, WB_ATT, wb.wb_attr.dwval);
 	g2d_write(g2d, WB_SIZE, wb.data_size.dwval);
@@ -2073,39 +2210,40 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, WB_LADD0, wb.laddr0);
 	g2d_write(g2d, WB_HADD0, wb.haddr0);
 	wmb();
-	
+
 	/* 6. Setup MIXER control and interrupts */
-	mixer_int.bits.mixer_irq = 0;  /* Clear any pending */
-	mixer_int.bits.finish_irq_en = 1;  /* Enable finish interrupt */
-	
-	mixer_ctrl.bits.start = 0;  /* Clear before setting */
-	
+	mixer_int.bits.mixer_irq = 0; /* Clear any pending */
+	mixer_int.bits.finish_irq_en = 1; /* Enable finish interrupt */
+
+	mixer_ctrl.bits.start = 0; /* Clear before setting */
+
 	/* Clear MIXER and IRQ */
 	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
 	g2d_write(g2d, G2D_MIXER_CTL, mixer_ctrl.dwval);
 	wmb();
-	
+
 	/* Enable IRQ */
 	atomic_set(&g2d->irq_done, 0);
 	g2d_write(g2d, G2D_MIXER_INT, mixer_int.dwval);
 	wmb();
-	
+
 	/* 7. Start MIXER */
 	mixer_ctrl.bits.start = 1;
 	g2d_write(g2d, G2D_MIXER_CTL, mixer_ctrl.dwval);
 	wmb();
-	
+
 	/* 8. Wait for IRQ completion */
 	timeout = wait_event_timeout(g2d->irq_wait,
-				      atomic_read(&g2d->irq_done) == 1,
-				      msecs_to_jiffies(1000));
-	
+				     atomic_read(&g2d->irq_done) == 1,
+				     msecs_to_jiffies(1000));
+
 	if (timeout == 0) {
 		u32 status = g2d_read(g2d, G2D_MIXER_INT);
-		dev_err(g2d->dev, "FILLRECT timeout (no IRQ), status=0x%08x\n", status);
+		dev_err(g2d->dev, "FILLRECT timeout (no IRQ), status=0x%08x\n",
+			status);
 		return -ETIMEDOUT;
 	}
-	
+
 	dev_dbg(g2d->dev, "FILLRECT completed via IRQ\n");
 	return 0;
 }
@@ -2640,13 +2778,15 @@ err_put_dmabuf:
 
 static int sunxi_g2d_open(struct inode *inode, struct file *file)
 {
-	struct sunxi_g2d_dev *g2d = container_of(inode->i_cdev,
-						  struct sunxi_g2d_dev, cdev);
+	struct sunxi_g2d_dev *g2d =
+		container_of(inode->i_cdev, struct sunxi_g2d_dev, cdev);
 	int ret = 0;
-	
+
 	dev_dbg(g2d->dev, "=== MODULE WITH NEW G2D_IOC_CMD API LOADED ===\n");
-	dev_dbg(g2d->dev, "sizeof(g2d_buf)=%zu sizeof(g2d_cmd)=%zu G2D_IOC_CMD=0x%08lx\n",
-		sizeof(struct g2d_buf), sizeof(struct g2d_cmd), (unsigned long)G2D_IOC_CMD);
+	dev_dbg(g2d->dev,
+		"sizeof(g2d_buf)=%zu sizeof(g2d_cmd)=%zu G2D_IOC_CMD=0x%08lx\n",
+		sizeof(struct g2d_buf), sizeof(struct g2d_cmd),
+		(unsigned long)G2D_IOC_CMD);
 	dev_dbg(g2d->dev, "Device opened\n");
 
 	file->private_data = g2d;
@@ -2669,20 +2809,20 @@ static int sunxi_g2d_open(struct inode *inode, struct file *file)
 		}
 		dev_dbg(g2d->dev, "Hardware enabled successfully\n");
 	}
-	
+
 	mutex_unlock(&g2d->dev_mutex);
 
 	dev_dbg(g2d->dev, "Open completed successfully\n");
-	
+
 	return 0;
 }
 
 static int sunxi_g2d_release(struct inode *inode, struct file *file)
 {
 	struct sunxi_g2d_dev *g2d = file->private_data;
-	
+
 	dev_dbg(g2d->dev, "Device released\n");
-	
+
 	/* Decrement user count and schedule hardware disable if last user.
 	 * We schedule a delayed work to ensure the HW is not disabled while
 	 * there are still jobs pending or running. The work will re-check
@@ -2694,29 +2834,30 @@ static int sunxi_g2d_release(struct inode *inode, struct file *file)
 		/* Schedule delayed disable: gives time for in-flight jobs to finish.
 		 * disable_work will re-check and reschedule until fully idle.
 		 */
-		queue_delayed_work(g2d->job_wq, &g2d->disable_work, msecs_to_jiffies(100));
+		queue_delayed_work(g2d->job_wq, &g2d->disable_work,
+				   msecs_to_jiffies(100));
 	}
 
 	mutex_unlock(&g2d->dev_mutex);
-	
+
 	return 0;
 }
 
 /* ========== DMA-BUF export operations ========== */
 
 static int g2d_dmabuf_attach(struct dma_buf *dmabuf,
-			      struct dma_buf_attachment *attach)
+			     struct dma_buf_attachment *attach)
 {
 	return 0;
 }
 
 static void g2d_dmabuf_detach(struct dma_buf *dmabuf,
-			       struct dma_buf_attachment *attach)
+			      struct dma_buf_attachment *attach)
 {
 }
 
 static struct sg_table *g2d_dmabuf_map(struct dma_buf_attachment *attach,
-					enum dma_data_direction dir)
+				       enum dma_data_direction dir)
 {
 	struct g2d_dma_buffer *buf = attach->dmabuf->priv;
 	struct sg_table *sgt;
@@ -2726,7 +2867,8 @@ static struct sg_table *g2d_dmabuf_map(struct dma_buf_attachment *attach,
 	if (!sgt)
 		return ERR_PTR(-ENOMEM);
 
-	ret = dma_get_sgtable(buf->dev, sgt, buf->vaddr, buf->dma_addr, buf->size);
+	ret = dma_get_sgtable(buf->dev, sgt, buf->vaddr, buf->dma_addr,
+			      buf->size);
 	if (ret < 0) {
 		kfree(sgt);
 		return ERR_PTR(ret);
@@ -2736,8 +2878,7 @@ static struct sg_table *g2d_dmabuf_map(struct dma_buf_attachment *attach,
 }
 
 static void g2d_dmabuf_unmap(struct dma_buf_attachment *attach,
-			      struct sg_table *sgt,
-			      enum dma_data_direction dir)
+			     struct sg_table *sgt, enum dma_data_direction dir)
 {
 	sg_free_table(sgt);
 	kfree(sgt);
@@ -2756,13 +2897,13 @@ static int g2d_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	struct g2d_dma_buffer *buf = dmabuf->priv;
 	int ret;
 
-	pr_info("g2d_dmabuf_mmap: size=%zu vma_size=%lu\n", 
-		buf->size, vma->vm_end - vma->vm_start);
+	pr_info("g2d_dmabuf_mmap: size=%zu vma_size=%lu\n", buf->size,
+		vma->vm_end - vma->vm_start);
 
 	/* Let DMA framework handle the mmap */
-	ret = dma_mmap_attrs(buf->dev, vma, buf->vaddr, buf->dma_addr, 
-			      buf->size, DMA_ATTR_WRITE_COMBINE);
-	
+	ret = dma_mmap_attrs(buf->dev, vma, buf->vaddr, buf->dma_addr,
+			     buf->size, DMA_ATTR_WRITE_COMBINE);
+
 	pr_info("g2d_dmabuf_mmap: ret=%d\n", ret);
 	return ret;
 }
@@ -2788,7 +2929,7 @@ static const struct dma_buf_ops g2d_dmabuf_ops = {
 /* ========== IOCTL handlers ========== */
 
 static long sunxi_g2d_ioctl_get_version(struct sunxi_g2d_dev *g2d,
-					 unsigned long arg)
+					unsigned long arg)
 {
 	struct g2d_version ver = {
 		.hw_version = g2d->hw_version,
@@ -2796,10 +2937,10 @@ static long sunxi_g2d_ioctl_get_version(struct sunxi_g2d_dev *g2d,
 		.driver_minor = DRIVER_MINOR,
 		.driver_patchlevel = DRIVER_PATCHLEVEL,
 	};
-	
+
 	if (copy_to_user((void __user *)arg, &ver, sizeof(ver)))
 		return -EFAULT;
-	
+
 	return 0;
 }
 
@@ -2819,14 +2960,22 @@ static u32 g2d_vsu_calc_fir_coef(u32 step)
 	scale_ratio = step >> (VSU_PHASE_FRAC_BITWIDTH - 3);
 	int_part = scale_ratio >> 3;
 	float_part = scale_ratio & 0x7;
-	
-	fir_coef_ofst = (int_part == 0) ? VSU_ZOOM0_SIZE :
-	    (int_part == 1) ? VSU_ZOOM0_SIZE + float_part :
-	    (int_part == 2) ? VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + (float_part >> 1) :
-	    (int_part == 3) ? VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + VSU_ZOOM2_SIZE :
-	    (int_part == 4) ? VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + VSU_ZOOM2_SIZE + VSU_ZOOM3_SIZE :
-	    VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + VSU_ZOOM2_SIZE + VSU_ZOOM3_SIZE + VSU_ZOOM4_SIZE;
-	
+
+	fir_coef_ofst =
+		(int_part == 0) ?
+			VSU_ZOOM0_SIZE :
+		(int_part == 1) ?
+			VSU_ZOOM0_SIZE + float_part :
+		(int_part == 2) ?
+			VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + (float_part >> 1) :
+		(int_part == 3) ?
+			VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + VSU_ZOOM2_SIZE :
+		(int_part == 4) ?
+			VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + VSU_ZOOM2_SIZE +
+				VSU_ZOOM3_SIZE :
+			VSU_ZOOM0_SIZE + VSU_ZOOM1_SIZE + VSU_ZOOM2_SIZE +
+				VSU_ZOOM3_SIZE + VSU_ZOOM4_SIZE;
+
 	pt_coef = fir_coef_ofst * VSU_PHASE_NUM;
 	return pt_coef;
 }
@@ -2847,8 +2996,8 @@ static u32 g2d_vsu_calc_fir_coef(u32 step)
  *
  * Returns 0 on success, negative error code on failure.
  */
-static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
-			       u32 in_w, u32 in_h, u32 out_w, u32 out_h, u8 alpha)
+static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt, u32 in_w,
+			       u32 in_h, u32 out_w, u32 out_h, u8 alpha)
 {
 	u64 temp;
 	u32 yhstep, yvstep;
@@ -2856,31 +3005,39 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	u32 format;
 	int i;
 
-	dev_dbg(g2d->dev, "🔧 VSU: Setup scaling %ux%u -> %ux%u, alpha=%u fmt=%u (%s)\n",
-		 in_w, in_h, out_w, out_h, alpha, fmt,
-		 fmt == G2D_FMT_ARGB8888 ? "API:ARGB8888" :
-		 fmt == G2D_FMT_ABGR8888 ? "API:ABGR8888" :
-		 fmt == G2D_FMT_XRGB8888 ? "API:XRGB8888" :
-		 fmt == G2D_FMT_XBGR8888 ? "API:XBGR8888" :
-		 fmt == G2D_FMT_RGB565 ? "API:RGB565" : "UNKNOWN");
+	dev_dbg(g2d->dev,
+		"🔧 VSU: Setup scaling %ux%u -> %ux%u, alpha=%u fmt=%u (%s)\n",
+		in_w, in_h, out_w, out_h, alpha, fmt,
+		fmt == G2D_FMT_ARGB8888 ? "API:ARGB8888" :
+		fmt == G2D_FMT_ABGR8888 ? "API:ABGR8888" :
+		fmt == G2D_FMT_XRGB8888 ? "API:XRGB8888" :
+		fmt == G2D_FMT_XBGR8888 ? "API:XBGR8888" :
+		fmt == G2D_FMT_RGB565	? "API:RGB565" :
+					  "UNKNOWN");
 
-	/* Determine format type
-	 * CRITICAL: Now accepts API format enums (G2D_FMT_*), not hardware (G2D_FORMAT_*)
-	 * VSU processes pixels byte-by-byte, doesn't care about ARGB vs ABGR
-	 * V0/WB handle the byte order interpretation when reading/writing
+	/* Validate format using canonical helper and accept any supported format
+	 * sunxi_g2d_format_to_hw() returns <0 for unsupported API formats.
+	 * Use sunxi_g2d_is_yuv_format() to decide between RGB vs YUV VSU paths.
 	 */
-	switch (fmt) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_XBGR8888:
-	case G2D_FMT_RGB565:
-		format = VSU_FORMAT_RGB;
-		dev_dbg(g2d->dev, "   VSU format determined: VSU_FORMAT_RGB (0x03)\n");
-		break;
-	default:
-		dev_err(g2d->dev, "VSU: Unsupported format %u\n", fmt);
-		return -EINVAL;
+	{
+		u32 bpp;
+		int ret_hw = sunxi_g2d_format_to_hw(fmt, &bpp);
+		if (ret_hw < 0) {
+			dev_err(g2d->dev, "VSU: Unsupported format %u\n", fmt);
+			return -EINVAL;
+		}
+
+		if (sunxi_g2d_is_yuv_format(fmt))
+			format =
+				VSU_FORMAT_YUV422; /* pick a YUV category; driver handles chroma in later code */
+		else
+			format = VSU_FORMAT_RGB;
+
+		dev_dbg(g2d->dev,
+			"   VSU format determined: %s (fmt=%u bpp=%u)\n",
+			format == VSU_FORMAT_RGB ? "VSU_FORMAT_RGB" :
+						   "VSU_FORMAT_YUV",
+			fmt, bpp);
 	}
 
 	/* BSP CRITICAL ORDER: Write VS_CTRL FIRST to enable coefficient access
@@ -2892,23 +3049,33 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	 * filter_type=1 causes timeout - confirmed incorrect for RGB
 	 */
 	if (format == VSU_FORMAT_RGB) {
-		g2d_write(g2d, VS_CTRL, 0x00101);  /* RGB mode: filter_type=0 + COEF_ACCESS + EN */
-		dev_dbg(g2d->dev, "📝 VS_CTRL(initial) = 0x00101 (filter_type=0 RGB)\n");
+		g2d_write(
+			g2d, VS_CTRL,
+			0x00101); /* RGB mode: filter_type=0 + COEF_ACCESS + EN */
+		dev_dbg(g2d->dev,
+			"📝 VS_CTRL(initial) = 0x00101 (filter_type=0 RGB)\n");
 	} else {
-		g2d_write(g2d, VS_CTRL, 0x10101);  /* YUV mode: filter_type=1 + COEF_ACCESS + EN */
-		dev_dbg(g2d->dev, "📝 VS_CTRL(initial) = 0x10101 (filter_type=1 YUV)\n");
+		g2d_write(
+			g2d, VS_CTRL,
+			0x10101); /* YUV mode: filter_type=1 + COEF_ACCESS + EN */
+		dev_dbg(g2d->dev,
+			"📝 VS_CTRL(initial) = 0x10101 (filter_type=1 YUV)\n");
 	}
 
 	/* Set output size */
-	g2d_write(g2d, VS_OUT_SIZE, ((out_w - 1) & 0x1FFF) | (((out_h - 1) & 0x1FFF) << 16));
+	g2d_write(g2d, VS_OUT_SIZE,
+		  ((out_w - 1) & 0x1FFF) | (((out_h - 1) & 0x1FFF) << 16));
 	g2d_write(g2d, VS_GLB_ALPHA, alpha);
 
 	/* Set Y channel (luma/RGB) input size */
-	g2d_write(g2d, VS_Y_SIZE, ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16));
-	
-	dev_dbg(g2d->dev, "VSU REGS: VS_OUT_SIZE=0x%08X (out=%ux%u) VS_Y_SIZE=0x%08X (in=%ux%u)\n",
-		 ((out_w - 1) & 0x1FFF) | (((out_h - 1) & 0x1FFF) << 16), out_w, out_h,
-		 ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16), in_w, in_h);
+	g2d_write(g2d, VS_Y_SIZE,
+		  ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16));
+
+	dev_dbg(g2d->dev,
+		"VSU REGS: VS_OUT_SIZE=0x%08X (out=%ux%u) VS_Y_SIZE=0x%08X (in=%ux%u)\n",
+		((out_w - 1) & 0x1FFF) | (((out_h - 1) & 0x1FFF) << 16), out_w,
+		out_h, ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16),
+		in_w, in_h);
 
 	/* Calculate horizontal step (input_width / output_width) in fixed-point */
 	temp = (u64)in_w << VSU_PHASE_FRAC_BITWIDTH;
@@ -2917,7 +3084,7 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	else
 		temp = 0;
 	yhstep = (u32)temp;
-	
+
 	/* T113 G2D spec: Supports 1/16× to 32× resize ratio
 	 * However, empirical testing shows timeout at yhstep=0x5F229 (110→74)
 	 * Last working: yhstep=0x58000 (110→80)
@@ -2930,12 +3097,12 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	 * For now, we'll log a warning but ALLOW the operation to proceed,
 	 * so we can gather more data about what actually fails.
 	 */
-	
+
 	if (yhstep == 0) {
 		dev_err(g2d->dev, "❌ VSU: yhstep is zero (out_w=%u)\n", out_w);
 		return -EINVAL;
 	}
-	
+
 	/* VSU Step Register Write
 	 * CRITICAL CORRECTION after extensive investigation:
 	 * 
@@ -2953,7 +3120,10 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	 *   yhstep = temp / out_w;
 	 *   p_reg->y_hor_step.dwval = yhstep << 1;
 	 */
-	g2d_write(g2d, VS_Y_HSTEP, yhstep << 1);  /* BSP standard: << 1 */
+	dev_dbg(g2d->dev,
+		"VSU: writing Y_HSTEP register: yhstep=0x%08x reg=0x%08x (<<1)\n",
+		yhstep, (u32)(yhstep << 1));
+	g2d_write(g2d, VS_Y_HSTEP, yhstep << 1);
 
 	/* Calculate vertical step (input_height / output_height) in fixed-point */
 	temp = (u64)in_h << VSU_PHASE_FRAC_BITWIDTH;
@@ -2962,15 +3132,18 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	else
 		temp = 0;
 	yvstep = (u32)temp;
-	
+
 	if (yvstep == 0) {
 		dev_err(g2d->dev, "❌ VSU: yvstep is zero (out_h=%u)\n", out_h);
 		return -EINVAL;
 	}
-	
+
 	/* BSP standard: << 1 for vertical step */
+	dev_dbg(g2d->dev,
+		"VSU: writing Y_VSTEP register: yvstep=0x%08x reg=0x%08x (<<1)\n",
+		yvstep, (u32)(yvstep << 1));
 	g2d_write(g2d, VS_Y_VSTEP, yvstep << 1);
-	
+
 	/* BSP ORDER: Load Y coefficients IMMEDIATELY after steps, BEFORE chroma config
 	 * CRITICAL: Calculate coefficient offsets based on step values!
 	 * BSP: yhcoef_offset = g2d_vsu_calc_fir_coef(yhstep);
@@ -2992,7 +3165,8 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	if (format == VSU_FORMAT_RGB) {
 		/* RGB: Use linear interpolation for vertical (BSP line 1217) */
 		for (i = 0; i < VSU_PHASE_NUM; i++) {
-			g2d_write(g2d, VS_Y_VCOEF0 + i * 4, linearcoefftab32[i]);
+			g2d_write(g2d, VS_Y_VCOEF0 + i * 4,
+				  linearcoefftab32[i]);
 		}
 	} else {
 		/* YUV: Use Lanczos for vertical */
@@ -3001,12 +3175,13 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 				  lan2coefftab32_full[yvcoef_offset + i]);
 		}
 	}
-	
+
 	g2d_write(g2d, VS_Y_HPHASE, 0);
 	g2d_write(g2d, VS_Y_VPHASE0, 0);
 
-	dev_dbg(g2d->dev, "🎯 VSU: About to configure chroma, format=%u (RGB=%u)\n",
-		 format, VSU_FORMAT_RGB);
+	dev_dbg(g2d->dev,
+		"🎯 VSU: About to configure chroma, format=%u (RGB=%u)\n",
+		format, VSU_FORMAT_RGB);
 
 	/* === Configure Chroma (UV) channels for RGB ===
 	 * BSP uses << 1 for step registers (with 19-bit fractional calculation)
@@ -3019,24 +3194,30 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	 */
 	if (format == VSU_FORMAT_RGB) {
 		/* Set chroma input/output size same as luma */
-		g2d_write(g2d, VS_C_SIZE, ((in_w - 1) & 0x1FFF) | (((in_h - 1) & 0x1FFF) << 16));
-		
+		g2d_write(g2d, VS_C_SIZE,
+			  ((in_w - 1) & 0x1FFF) |
+				  (((in_h - 1) & 0x1FFF) << 16));
+
 		/* BSP standard: << 1 for chroma step registers */
+		dev_dbg(g2d->dev,
+			"VSU: writing C_HSTEP/C_VSTEP registers: yhstep=0x%08x yvstep=0x%08x (<<1)\n",
+			yhstep, yvstep);
 		g2d_write(g2d, VS_C_HSTEP, yhstep << 1);
 		g2d_write(g2d, VS_C_VSTEP, yvstep << 1);
-		
+
 		/* Load chroma horizontal coefficients (same as luma for RGB) */
 		for (i = 0; i < VSU_PHASE_NUM; i++) {
 			g2d_write(g2d, VS_C_HCOEF0 + i * 4,
 				  lan2coefftab32_full[yhcoef_offset + i]);
 		}
-		
+
 		/* Zero phase for chroma */
 		g2d_write(g2d, VS_C_HPHASE, 0);
 		g2d_write(g2d, VS_C_VPHASE0, 0);
-		
-		dev_dbg(g2d->dev, "🎨 VSU CHROMA: size=%ux%u hstep=0x%08x vstep=0x%08x (BSP << 1)\n",
-			 in_w, in_h, yhstep << 1, yvstep << 1);
+
+		dev_dbg(g2d->dev,
+			"🎨 VSU CHROMA: size=%ux%u hstep=0x%08x vstep=0x%08x (BSP << 1)\n",
+			in_w, in_h, yhstep << 1, yvstep << 1);
 	}
 
 	/* BSP CRITICAL: For RGB, DO NOT load VS_C_VCOEF0!
@@ -3056,14 +3237,17 @@ static int sunxi_g2d_vsu_setup(struct sunxi_g2d_dev *g2d, u32 fmt,
 	 * YUV formats: VS_CTRL = 0x10001 (filter_type=1 + EN)
 	 */
 	if (format == VSU_FORMAT_RGB) {
-		g2d_write(g2d, VS_CTRL, 0x00001);  /* RGB: filter_type=0 + EN */
-		dev_dbg(g2d->dev, "📝 VS_CTRL(final) = 0x00001 (filter_type=0 RGB)\n");
+		g2d_write(g2d, VS_CTRL, 0x00001); /* RGB: filter_type=0 + EN */
+		dev_dbg(g2d->dev,
+			"📝 VS_CTRL(final) = 0x00001 (filter_type=0 RGB)\n");
 	} else {
-		g2d_write(g2d, VS_CTRL, 0x10001);  /* YUV: filter_type=1 + EN */
-		dev_dbg(g2d->dev, "📝 VS_CTRL(final) = 0x10001 (filter_type=1 YUV)\n");
+		g2d_write(g2d, VS_CTRL, 0x10001); /* YUV: filter_type=1 + EN */
+		dev_dbg(g2d->dev,
+			"📝 VS_CTRL(final) = 0x10001 (filter_type=1 YUV)\n");
 	}
 
-	dev_dbg(g2d->dev, "✅ VSU: Enabled for scaling %ux%u->%ux%u (yhstep=0x%08x yvstep=0x%08x)\n",
+	dev_dbg(g2d->dev,
+		"✅ VSU: Enabled for scaling %ux%u->%ux%u (yhstep=0x%08x yvstep=0x%08x)\n",
 		in_w, in_h, out_w, out_h, yhstep, yvstep);
 
 	return 0;
@@ -3120,32 +3304,32 @@ static int sunxi_g2d_do_blit_alpha_rcq(struct sunxi_g2d_dev *g2d,
 static u32 sunxi_g2d_get_bld_mode(u32 mode)
 {
 	switch (mode) {
-	case G2D_BLD_CLEAR:	/* 0 */
+	case G2D_BLD_CLEAR: /* 0 */
 		return 0x00000000;
-	case G2D_BLD_COPY:	/* 1 */
+	case G2D_BLD_COPY: /* 1 */
 		return 0x00010001;
-	case G2D_BLD_DST:	/* 2 */
+	case G2D_BLD_DST: /* 2 */
 		return 0x01000100;
-	case G2D_BLD_SRCOVER:	/* 4 (swapped!) - use DSTOVER hw value */
+	case G2D_BLD_SRCOVER: /* 4 (swapped!) - use DSTOVER hw value */
 		return 0x01030103;
-	case G2D_BLD_DSTOVER:	/* 3 (swapped!) - use SRCOVER hw value */
+	case G2D_BLD_DSTOVER: /* 3 (swapped!) - use SRCOVER hw value */
 		return 0x03010301;
-	case G2D_BLD_SRCIN:	/* 6 (swapped!) - use DSTIN hw value */
+	case G2D_BLD_SRCIN: /* 6 (swapped!) - use DSTIN hw value */
 		return 0x02000200;
-	case G2D_BLD_DSTIN:	/* 5 (swapped!) - use SRCIN hw value */
+	case G2D_BLD_DSTIN: /* 5 (swapped!) - use SRCIN hw value */
 		return 0x00020002;
-	case G2D_BLD_SRCOUT:	/* 8 (swapped!) - use DSTOUT hw value */
+	case G2D_BLD_SRCOUT: /* 8 (swapped!) - use DSTOUT hw value */
 		return 0x03000300;
-	case G2D_BLD_DSTOUT:	/* 7 (swapped!) - use SRCOUT hw value */
+	case G2D_BLD_DSTOUT: /* 7 (swapped!) - use SRCOUT hw value */
 		return 0x00030003;
-	case G2D_BLD_SRCATOP:	/* 10 (swapped!) - use DSTATOP hw value */
+	case G2D_BLD_SRCATOP: /* 10 (swapped!) - use DSTATOP hw value */
 		return 0x02030203;
-	case G2D_BLD_DSTATOP:	/* 9 (swapped!) - use SRCATOP hw value */
+	case G2D_BLD_DSTATOP: /* 9 (swapped!) - use SRCATOP hw value */
 		return 0x03020302;
-	case G2D_BLD_XOR:	/* 11 - symmetric, no swap needed */
+	case G2D_BLD_XOR: /* 11 - symmetric, no swap needed */
 		return 0x03030303;
 	default:
-		return 0x01030103;  /* Default to SRCOVER (hw DSTOVER value) */
+		return 0x01030103; /* Default to SRCOVER (hw DSTOVER value) */
 	}
 }
 
@@ -3157,28 +3341,30 @@ static u32 sunxi_g2d_get_bld_mode(u32 mode)
  * - dst/UI2: background layer (gradient) - READ ONLY
  * - out/WB: output layer (temp) - WRITE ONLY
  */
-static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
-				    dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
-				    u32 src_pitch, u32 src_format,
-				    u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				    u8 src_alpha, u8 src_alpha_mode, u8 src_premul, u8 src_color_space,
-				    dma_addr_t dst_dma_addr, dma_addr_t dst_base_addr,
-				    u32 dst_w, u32 dst_h,
-				    u32 dst_pitch, u32 dst_format,
-				    u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				    u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
-				    dma_addr_t out_dma_addr, u32 out_w, u32 out_h,
-				    u32 out_pitch, u32 out_format,
-				    u32 out_crop_w, u32 out_crop_h,
-				    u32 bld_mode,
-				    u32 color_key_enable, u32 color_key_mode,
-				    u32 color_key_min, u32 color_key_max)
+static int sunxi_g2d_do_blit_alpha_3buf(
+	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma_addr, u32 src_w,
+	u32 src_h, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
+	u32 src_crop_w, u32 src_crop_h, u8 src_alpha, u8 src_alpha_mode,
+	u8 src_premul, u8 src_color_space, dma_addr_t dst_dma_addr,
+	dma_addr_t dst_base_addr, u32 dst_w, u32 dst_h, u32 dst_pitch,
+	u32 dst_format, u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
+	u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
+	dma_addr_t out_dma_addr, u32 out_w, u32 out_h, u32 out_pitch,
+	u32 out_format, u32 out_crop_w, u32 out_crop_h, u32 bld_mode,
+	u32 color_key_enable, u32 color_key_mode, u32 color_key_min,
+	u32 color_key_max)
 {
 	/* v2.9.16: 3-buffer alpha blending - UI2 (dst READ) + V0 (src READ) → WB (out WRITE) */
-	struct g2d_mixer_ovl_u_reg ui2 = {0};  /* Pipe0: background (dst) - READ ONLY */
-	struct g2d_mixer_ovl_v_reg v0 = {0};   /* Pipe1: foreground (src) - READ ONLY */
-	struct g2d_mixer_bld_reg bld = {0};    /* Blender */
-	struct g2d_mixer_write_back_reg wb = {0}; /* Writeback (out) - WRITE ONLY */
+	struct g2d_mixer_ovl_u_reg ui2 = {
+		0
+	}; /* Pipe0: background (dst) - READ ONLY */
+	struct g2d_mixer_ovl_v_reg v0 = {
+		0
+	}; /* Pipe1: foreground (src) - READ ONLY */
+	struct g2d_mixer_bld_reg bld = { 0 }; /* Blender */
+	struct g2d_mixer_write_back_reg wb = {
+		0
+	}; /* Writeback (out) - WRITE ONLY */
 
 	int src_fmt_val, dst_fmt_val, out_fmt_val;
 	dma_addr_t ui2_addr, v0_addr, wb_addr;
@@ -3186,23 +3372,24 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	unsigned long timeout;
 	int ret;
 
-	dev_dbg(g2d->dev, "BLIT_ALPHA_3BUF: src=%ux%u@(%u,%u) alpha=%u/%u premul=%u dst=%ux%u@(%u,%u) alpha=%u/%u premul=%u out=%ux%u blend=%ux%u\n",
-			src_crop_w, src_crop_h, src_x, src_y, src_alpha, src_alpha_mode, src_premul,
-			dst_w, dst_h, dst_x, dst_y, dst_alpha, dst_alpha_mode, dst_premul,
-			out_crop_w, out_crop_h, blend_w, blend_h);
+	dev_dbg(g2d->dev,
+		"BLIT_ALPHA_3BUF: src=%ux%u@(%u,%u) alpha=%u/%u premul=%u dst=%ux%u@(%u,%u) alpha=%u/%u premul=%u out=%ux%u blend=%ux%u\n",
+		src_crop_w, src_crop_h, src_x, src_y, src_alpha, src_alpha_mode,
+		src_premul, dst_w, dst_h, dst_x, dst_y, dst_alpha,
+		dst_alpha_mode, dst_premul, out_crop_w, out_crop_h, blend_w,
+		blend_h);
 
-	/* SIMPLIFIED VERSION: No scaling support - operation must be atomic
-	 * If scaling needed, do it in a separate operation before blending */
-	if (src_crop_w != blend_w || src_crop_h != blend_h) {
-		dev_err(g2d->dev, "Scaling not supported in atomic blend mode. "
-			"src=%ux%u blend=%ux%u - do separate scale operation first.\n",
+	/* Check if scaling is needed (G2D V2 requires TWO operations for scale+blend)
+	 * Older simplified implementation rejected scaling. Enable multi-step
+	 * flow here: if source crop size differs from blend size we must
+	 * perform a scale into a temporary buffer first. */
+	bool needs_scaling = (src_crop_w != blend_w) || (src_crop_h != blend_h);
+
+	if (needs_scaling)
+		dev_dbg(g2d->dev,
+			"BLIT_ALPHA_3BUF: scaling required %ux%u -> %ux%u\n",
 			src_crop_w, src_crop_h, blend_w, blend_h);
-		return -EINVAL;
-	}
 
-	/* Check if scaling is needed (G2D V2 requires TWO operations for scale+blend) */
-	bool needs_scaling = false;  /* Always false now */
-	
 	if (needs_scaling) {
 		/*
 		 * G2D V2 CRITICAL LIMITATION: VSU cannot do positioning!
@@ -3220,10 +3407,13 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		 * This matches BSP behavior: g2d_bsp_bitblt() allocates temp buffers
 		 * for intermediate scaling results.
 		 */
-		dev_dbg(g2d->dev, "╔═══════════════════════════════════════════════════════════════╗\n");
-		dev_dbg(g2d->dev, "║ SCALING REQUIRED: MULTI-STEP OPERATION                       ║\n");
-		dev_dbg(g2d->dev, "╚═══════════════════════════════════════════════════════════════╝\n");
-		
+		dev_dbg(g2d->dev,
+			"╔═══════════════════════════════════════════════════════════════╗\n");
+		dev_dbg(g2d->dev,
+			"║ SCALING REQUIRED: MULTI-STEP OPERATION                       ║\n");
+		dev_dbg(g2d->dev,
+			"╚═══════════════════════════════════════════════════════════════╝\n");
+
 		/*
 		 * CRITICAL: Allocate internal temp buffer for scaled result
 		 * Size: blend_w × blend_h (exact scaled size, no positioning)
@@ -3231,59 +3421,88 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		 * PITCH ALIGNMENT: G2D hardware requires pitch aligned to 128 bytes
 		 * Tight pitch (width * 4) causes horizontal line shifting artifacts
 		 */
-		u32 temp_pitch = ALIGN(blend_w * 4, 128);  /* Align pitch to 128 bytes */
-		u32 temp_size = temp_pitch * blend_h;      /* Use aligned pitch for buffer size */
+		/* Determine bytes-per-pixel for temporary buffer from source format.
+		 * Scaling should be a raw copy of pixels (no blending), therefore the
+		 * temp buffer must match the source pixel layout. If the source
+		 * format is unsupported for some reason, fall back to output bpp or 4.
+		 */
+		u32 temp_bpp = 4;
+		if (sunxi_g2d_format_to_hw(src_format, &temp_bpp) < 0) {
+			dev_warn(
+				g2d->dev,
+				"VSU: failed to get bpp for src fmt=%u, falling back to out fmt\n",
+				src_format);
+			if (sunxi_g2d_format_to_hw(out_format, &temp_bpp) < 0)
+				temp_bpp = 4;
+		}
+
+		u32 temp_pitch = ALIGN(blend_w * temp_bpp,
+				       128); /* Align pitch to 128 bytes */
+		u32 temp_size = temp_pitch *
+				blend_h; /* Use aligned pitch for buffer size */
 		void *temp_vaddr = NULL;
 		dma_addr_t temp_dma = 0;
-		
-		/* Force ARGB format to preserve alpha channel */
-		u32 temp_format = (src_format == G2D_FMT_ARGB8888) ? G2D_FMT_ARGB8888 : out_format;
-		
-		dev_dbg(g2d->dev, "⚠️  Allocating internal temp buffer: %ux%u pitch=%u (%u bytes) fmt=%u\n",
-			 blend_w, blend_h, temp_pitch, temp_size, temp_format);
-		
-		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size, &temp_dma, GFP_KERNEL);
+
+		/* Use the source's pixel format for the temporary buffer. Scaling
+		 * is a raw resampling operation and must not apply blending or
+		 * reinterpret pixel component ordering. */
+		u32 temp_format = src_format;
+
+		dev_dbg(g2d->dev,
+			"⚠️  Allocating internal temp buffer: %ux%u pitch=%u (%u bytes) fmt=%u\n",
+			blend_w, blend_h, temp_pitch, temp_size, temp_format);
+
+		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size, &temp_dma,
+						GFP_KERNEL);
 		if (!temp_vaddr) {
-			dev_err(g2d->dev, "Failed to allocate temp buffer for scaling\n");
+			dev_err(g2d->dev,
+				"Failed to allocate temp buffer for scaling\n");
 			return -ENOMEM;
 		}
-		
+
 		/* Clear temp buffer to avoid garbage/stale data affecting blend */
 		memset(temp_vaddr, 0, temp_size);
-		
-		dev_dbg(g2d->dev, "✅ Temp buffer allocated: vaddr=%p dma=0x%llx pitch=%u (aligned to 128)\n",
+
+		dev_dbg(g2d->dev,
+			"✅ Temp buffer allocated: vaddr=%p dma=0x%llx pitch=%u (aligned to 128)\n",
 			temp_vaddr, (u64)temp_dma, temp_pitch);
-		
+
 		/* 
 		* STEP 1: Scale src → temp buffer (EXACT size, no positioning)
 		* VSU writes to (0,0) of temp buffer, which is perfect because
 		* temp buffer is exactly blend_w × blend_h
 		*/
-		dev_dbg(g2d->dev, "STEP 1: SCALE %ux%u → %ux%u (into temp buffer)\n",
+		dev_dbg(g2d->dev,
+			"STEP 1: SCALE %ux%u → %ux%u (into temp buffer)\n",
 			src_crop_w, src_crop_h, blend_w, blend_h);
-		dev_dbg(g2d->dev, "  src: 0x%llx (%ux%u) fmt=%u crop=(%u,%u,%ux%u) pitch=%u\n",
-			(u64)src_dma_addr, src_w, src_h, src_format,
-			src_x, src_y, src_crop_w, src_crop_h, src_pitch);
-		dev_dbg(g2d->dev, "  temp: 0x%llx (%ux%u) fmt=%u pitch=%u (ALIGNED)\n",
-			(u64)temp_dma, blend_w, blend_h, temp_format, temp_pitch);
-		
-		ret = sunxi_g2d_do_scale(g2d,
-		                         src_dma_addr, src_w, src_h,
-		                         src_pitch, src_format,
-		                         src_x, src_y, src_crop_w, src_crop_h,
-		                         temp_dma, blend_w, blend_h,  /* TEMP: exact size */
-		                         temp_pitch, temp_format,     /* pitch = ALIGNED */
-		                         0, 0, blend_w, blend_h,       /* Write at (0,0) */
-		                         temp_vaddr);                  /* DUMP temp buffer for debug */
+		dev_dbg(g2d->dev,
+			"  src: 0x%llx (%ux%u) fmt=%u crop=(%u,%u,%ux%u) pitch=%u\n",
+			(u64)src_dma_addr, src_w, src_h, src_format, src_x,
+			src_y, src_crop_w, src_crop_h, src_pitch);
+		dev_dbg(g2d->dev,
+			"  temp: 0x%llx (%ux%u) fmt=%u pitch=%u (ALIGNED)\n",
+			(u64)temp_dma, blend_w, blend_h, temp_format,
+			temp_pitch);
+
+		ret = sunxi_g2d_do_scale(
+			g2d, src_dma_addr, src_w, src_h, src_pitch, src_format,
+			src_x, src_y, src_crop_w, src_crop_h, temp_dma, blend_w,
+			blend_h, /* TEMP: exact size */
+			temp_pitch, temp_format, /* pitch = ALIGNED */
+			0, 0, blend_w, blend_h, /* Write at (0,0) */
+			temp_vaddr); /* DUMP temp buffer for debug */
 		if (ret) {
-			dev_err(g2d->dev, "❌ Step 1 (scale) failed: %d\n", ret);
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma);
+			dev_err(g2d->dev, "❌ Step 1 (scale) failed: %d\n",
+				ret);
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
+					  temp_dma);
 			return ret;
 		}
-		
-		dev_dbg(g2d->dev, "✅ Step 1 complete: ball scaled %ux%u → %ux%u in temp\n",
-			 src_crop_w, src_crop_h, blend_w, blend_h);
-		
+
+		dev_dbg(g2d->dev,
+			"✅ Step 1 complete: ball scaled %ux%u → %ux%u in temp\n",
+			src_crop_w, src_crop_h, blend_w, blend_h);
+
 		/* 
 		 * STEP 2: Alpha blend using scaled temp buffer
 		 * Now we blend:
@@ -3293,32 +3512,35 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		 */
 		dev_dbg(g2d->dev, "STEP 2: ALPHA BLEND (temp + bg → out)\n");
 		dev_dbg(g2d->dev, "  OLD src: dma=0x%llx fmt=%u w=%u h=%u\n",
-			 (u64)src_dma_addr, src_format, src_crop_w, src_crop_h);
-		
+			(u64)src_dma_addr, src_format, src_crop_w, src_crop_h);
+
 		/* Update src parameters to point to temp buffer */
-		src_dma_addr = temp_dma;           /* Read from temp buffer */
-		src_w = blend_w;                   /* Temp buffer width */
-		src_h = blend_h;                   /* Temp buffer height */
-		src_pitch = temp_pitch;            /* Temp buffer pitch (ALIGNED to 128) */
-		src_format = temp_format;          /* Preserved alpha format */
-		src_x = 0;                         /* Read from (0,0) of temp */
+		src_dma_addr = temp_dma; /* Read from temp buffer */
+		src_w = blend_w; /* Temp buffer width */
+		src_h = blend_h; /* Temp buffer height */
+		src_pitch = temp_pitch; /* Temp buffer pitch (ALIGNED to 128) */
+		src_format = temp_format; /* Preserved alpha format */
+		src_x = 0; /* Read from (0,0) of temp */
 		src_y = 0;
-		src_crop_w = blend_w;              /* Read entire temp buffer */
+		src_crop_w = blend_w; /* Read entire temp buffer */
 		src_crop_h = blend_h;
-		
-		dev_dbg(g2d->dev, "  NEW src: dma=0x%llx fmt=%u (%s) w=%u h=%u pitch=%u (ALIGNED)\n",
-			 (u64)src_dma_addr, src_format,
-			 src_format == G2D_FMT_ARGB8888 ? "ARGB8888" :
-			 src_format == G2D_FMT_XRGB8888 ? "XRGB8888" : "OTHER",
-			 src_w, src_h, src_pitch);
-		dev_dbg(g2d->dev, "  src_crop: (%u,%u) %ux%u (FULL TEMP BUFFER)\n",
-			 src_x, src_y, src_crop_w, src_crop_h);
-		
+
+		dev_dbg(g2d->dev,
+			"  NEW src: dma=0x%llx fmt=%u (%s) w=%u h=%u pitch=%u (ALIGNED)\n",
+			(u64)src_dma_addr, src_format,
+			src_format == G2D_FMT_ARGB8888 ? "ARGB8888" :
+			src_format == G2D_FMT_XRGB8888 ? "XRGB8888" :
+							 "OTHER",
+			src_w, src_h, src_pitch);
+		dev_dbg(g2d->dev,
+			"  src_crop: (%u,%u) %ux%u (FULL TEMP BUFFER)\n", src_x,
+			src_y, src_crop_w, src_crop_h);
+
 		dev_dbg(g2d->dev, "→ Proceeding to STEP 2 (alpha blend)...\n");
-		
+
 		/* Fall through to normal alpha blend below (without scaling) */
 		/* IMPORTANT: temp buffer will be freed after blend completes */
-		
+
 		/* Store temp buffer info for cleanup after blend */
 		g2d->temp_scale_buffer = temp_vaddr;
 		g2d->temp_scale_dma = temp_dma;
@@ -3331,7 +3553,8 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		/* Cleanup temp buffer if allocated */
 		if (g2d->temp_scale_buffer) {
 			dma_free_coherent(g2d->dev, g2d->temp_scale_size,
-					  g2d->temp_scale_buffer, g2d->temp_scale_dma);
+					  g2d->temp_scale_buffer,
+					  g2d->temp_scale_dma);
 			g2d->temp_scale_buffer = NULL;
 		}
 		return ret;
@@ -3340,19 +3563,22 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	/* Map formats to hardware values using helper function */
 	src_fmt_val = sunxi_g2d_format_to_hw(src_format, NULL);
 	if (src_fmt_val < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", src_format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			src_format);
 		return -EINVAL;
 	}
 
 	dst_fmt_val = sunxi_g2d_format_to_hw(dst_format, &ui2_bpp);
 	if (dst_fmt_val < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			dst_format);
 		return -EINVAL;
 	}
 
 	out_fmt_val = sunxi_g2d_format_to_hw(out_format, NULL);
 	if (out_fmt_val < 0) {
-		dev_err(g2d->dev, "Unsupported output format: %u\n", out_format);
+		dev_err(g2d->dev, "Unsupported output format: %u\n",
+			out_format);
 		return -EINVAL;
 	}
 
@@ -3366,9 +3592,11 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 	/* === Configure MIXER - single pipe mode === */
 	g2d_write(g2d, MIXER_FILLCOLOR0, 0xFF000000);
-	g2d_write(g2d, MIXER_SIZE, ((blend_w - 1) & 0x1FFF) | (((blend_h - 1) & 0x1FFF) << 16));
+	g2d_write(g2d, MIXER_SIZE,
+		  ((blend_w - 1) & 0x1FFF) | (((blend_h - 1) & 0x1FFF) << 16));
 
-	dev_dbg(g2d->dev, "MIXER: single pipe mode size=%ux%u\n", blend_w, blend_h);
+	dev_dbg(g2d->dev, "MIXER: single pipe mode size=%ux%u\n", blend_w,
+		blend_h);
 
 	/* === Configure UI2 (Pipe0: background from temp buffer) === */
 
@@ -3378,30 +3606,35 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	 */
 	ui2_addr = dst_dma_addr + (dst_y * dst_pitch) + (dst_x * ui2_bpp);
 
-	dev_dbg(g2d->dev, "UI2 addressing: base=0x%llx offset=(x=%u y=%u) → addr=0x%llx pitch=%u\n",
-			(u64)dst_dma_addr, dst_x, dst_y, (u64)ui2_addr, dst_pitch);
+	dev_dbg(g2d->dev,
+		"UI2 addressing: base=0x%llx offset=(x=%u y=%u) → addr=0x%llx pitch=%u\n",
+		(u64)dst_dma_addr, dst_x, dst_y, (u64)ui2_addr, dst_pitch);
 
 	/* Configure UI2 attributes - background with user alpha settings */
 	ui2.ovl_attr.bits.lay_en = 1;
-	ui2.ovl_attr.bits.alpha_mode = dst_alpha_mode;  /* User's dst alpha mode */
+	ui2.ovl_attr.bits.alpha_mode =
+		dst_alpha_mode; /* User's dst alpha mode */
 	ui2.ovl_attr.bits.lay_fbfmt = dst_fmt_val;
-	ui2.ovl_attr.bits.lay_glbalpha = dst_alpha;  /* User's dst alpha value */
+	ui2.ovl_attr.bits.lay_glbalpha = dst_alpha; /* User's dst alpha value */
 
-	dev_dbg(g2d->dev, "UI2 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
-			 dst_alpha_mode, dst_alpha);
+	dev_dbg(g2d->dev,
+		"UI2 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
+		dst_alpha_mode, dst_alpha);
 
 	/* UI2 memory configuration - read the blend region from dst buffer
 	 * The address (ui2_addr = dst_dma_addr) already points to (dst_x, dst_y),
 	 * so we read blend_w x blend_h starting from (0,0) relative to that address
 	 */
-	ui2.ovl_mem.bits.lay_width = blend_w - 1;   /* Blend area width */
-	ui2.ovl_mem.bits.lay_height = blend_h - 1;  /* Blend area height */
-	ui2.ovl_mem_coor.bits.lay_xcoor = 0;  /* Already at correct position via address */
+	ui2.ovl_mem.bits.lay_width = blend_w - 1; /* Blend area width */
+	ui2.ovl_mem.bits.lay_height = blend_h - 1; /* Blend area height */
+	ui2.ovl_mem_coor.bits.lay_xcoor =
+		0; /* Already at correct position via address */
 	ui2.ovl_mem_coor.bits.lay_ycoor = 0;
-	ui2.ovl_mem_pitch0 = dst_pitch;  /* Full framebuffer stride */
+	ui2.ovl_mem_pitch0 = dst_pitch; /* Full framebuffer stride */
 	ui2.ovl_mem_low_addr0 = (u32)ui2_addr;
 	ui2.ovl_mem_high_addr = (u32)((u64)ui2_addr >> 32);
-	ui2.ovl_winsize.bits.width = blend_w - 1;   /* Output to blend area size */
+	ui2.ovl_winsize.bits.width =
+		blend_w - 1; /* Output to blend area size */
 	ui2.ovl_winsize.bits.height = blend_h - 1;
 
 	/* Write UI2 to hardware */
@@ -3413,36 +3646,42 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, UI2_HADD, ui2.ovl_mem_high_addr);
 	g2d_write(g2d, UI2_SIZE, ui2.ovl_winsize.dwval);
 
-	dev_dbg(g2d->dev, "UI2 (Pipe0/BG): addr=0x%llx size=%ux%u pitch=%u win=%ux%u alpha=%u mode=%u\n",
-			 (u64)ui2_addr, blend_w, blend_h, dst_pitch, blend_w, blend_h, dst_alpha, dst_alpha_mode);
+	dev_dbg(g2d->dev,
+		"UI2 (Pipe0/BG): addr=0x%llx size=%ux%u pitch=%u win=%ux%u alpha=%u mode=%u\n",
+		(u64)ui2_addr, blend_w, blend_h, dst_pitch, blend_w, blend_h,
+		dst_alpha, dst_alpha_mode);
 
 	/* === Configure V0 (Pipe1: foreground/source with alpha) === */
 
 	/* Get bytes per pixel for V0 using unified format function */
 	if (sunxi_g2d_format_to_hw(src_format, &v0_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported V0 source format: %u\n", src_format);
+		dev_err(g2d->dev, "Unsupported V0 source format: %u\n",
+			src_format);
 		return -EINVAL;
 	}
 
 	/* V0 address = ball buffer base + offset */
 	v0_addr = src_dma_addr + (src_y * src_pitch) + (src_x * v0_bpp);
-	
-	dev_dbg(g2d->dev, "ALPHA_BLEND V0 ADDR: base=0x%llx crop_xy=(%u,%u) pitch=%u bpp=%u -> v0_addr=0x%llx\n",
-			(u64)src_dma_addr, src_x, src_y, src_pitch, v0_bpp, (u64)v0_addr);
+
+	dev_dbg(g2d->dev,
+		"ALPHA_BLEND V0 ADDR: base=0x%llx crop_xy=(%u,%u) pitch=%u bpp=%u -> v0_addr=0x%llx\n",
+		(u64)src_dma_addr, src_x, src_y, src_pitch, v0_bpp,
+		(u64)v0_addr);
 
 	/* Configure V0 attributes - foreground with user alpha */
 	v0.ovl_attr.bits.lay_en = 1;
-	v0.ovl_attr.bits.alpha_mode = src_alpha_mode;  /* User's alpha mode */
+	v0.ovl_attr.bits.alpha_mode = src_alpha_mode; /* User's alpha mode */
 	v0.ovl_attr.bits.lay_fbfmt = src_fmt_val;
-	v0.ovl_attr.bits.lay_glbalpha = src_alpha;  /* User's alpha value */
+	v0.ovl_attr.bits.lay_glbalpha = src_alpha; /* User's alpha value */
 
-	dev_dbg(g2d->dev, "V0 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
-			 src_alpha_mode, src_alpha);
+	dev_dbg(g2d->dev,
+		"V0 config: alpha_mode=%u (0=PIXEL,1=GLOBAL) global_alpha=%u\n",
+		src_alpha_mode, src_alpha);
 
 	/* V0 memory configuration */
 	v0.ovl_mem.bits.lay_width = src_crop_w - 1;
 	v0.ovl_mem.bits.lay_height = src_crop_h - 1;
-	v0.ovl_mem_coor.bits.lay_xcoor = 0;  /* Already offset in v0_addr */
+	v0.ovl_mem_coor.bits.lay_xcoor = 0; /* Already offset in v0_addr */
 	v0.ovl_mem_coor.bits.lay_ycoor = 0;
 	v0.ovl_mem_pitch0 = src_pitch;
 	v0.ovl_mem_low_addr0 = (u32)v0_addr;
@@ -3452,8 +3691,8 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 	dev_dbg(g2d->dev, "ALPHA_BLEND V0 PITCH: %u\n", v0.ovl_mem_pitch0);
 	dev_dbg(g2d->dev, "ALPHA_BLEND V0 REGS: MBSIZE=%ux%u SIZE=%ux%u\n",
-			v0.ovl_mem.bits.lay_width + 1, v0.ovl_mem.bits.lay_height + 1,
-			v0.ovl_winsize.bits.width + 1, v0.ovl_winsize.bits.height + 1);
+		v0.ovl_mem.bits.lay_width + 1, v0.ovl_mem.bits.lay_height + 1,
+		v0.ovl_winsize.bits.width + 1, v0.ovl_winsize.bits.height + 1);
 
 	/* Write V0 to hardware */
 	g2d_write(g2d, V0_ATTCTL, v0.ovl_attr.dwval);
@@ -3464,27 +3703,32 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, V0_HADD, v0.ovl_mem_high_addr.dwval);
 	g2d_write(g2d, V0_SIZE, v0.ovl_winsize.dwval);
 
-	dev_dbg(g2d->dev, "V0 (Pipe1/FOREGROUND): attr=0x%08X addr=0x%llx size=%ux%u alpha=%u mode=%u\n",
-			v0.ovl_attr.dwval, (u64)v0_addr, src_crop_w, src_crop_h, src_alpha, src_alpha_mode);
+	dev_dbg(g2d->dev,
+		"V0 (Pipe1/FOREGROUND): attr=0x%08X addr=0x%llx size=%ux%u alpha=%u mode=%u\n",
+		v0.ovl_attr.dwval, (u64)v0_addr, src_crop_w, src_crop_h,
+		src_alpha, src_alpha_mode);
 
 	/* === Configure BLD (Blender) - Two pipe alpha blending === */
 
-	bld.bld_en_ctrl.bits.p0_en = 1;    /* Enable pipe0 (UI2/background) */
-	bld.bld_en_ctrl.bits.p0_fcen = 0;  /* Use UI2 layer */
-	bld.bld_en_ctrl.bits.p1_en = 1;    /* Enable pipe1 (V0/foreground) */
-	bld.bld_en_ctrl.bits.p1_fcen = 0;  /* Use V0 layer */
+	bld.bld_en_ctrl.bits.p0_en = 1; /* Enable pipe0 (UI2/background) */
+	bld.bld_en_ctrl.bits.p0_fcen = 0; /* Use UI2 layer */
+	bld.bld_en_ctrl.bits.p1_en = 1; /* Enable pipe1 (V0/foreground) */
+	bld.bld_en_ctrl.bits.p1_fcen = 0; /* Use V0 layer */
 
 	/* Configure premultiplication for alpha blending
 	 * 0 = non-premultiplied alpha (straight alpha) - standard ARGB data
 	 * 1 = premultiplied alpha (color already multiplied by alpha)
 	 */
-	bld.premulti_ctrl.bits.p0_alpha_mode = dst_premul;  /* Pipe0 (UI2/background) */
-	bld.premulti_ctrl.bits.p1_alpha_mode = src_premul;  /* Pipe1 (V0/foreground) */
+	bld.premulti_ctrl.bits.p0_alpha_mode =
+		dst_premul; /* Pipe0 (UI2/background) */
+	bld.premulti_ctrl.bits.p1_alpha_mode =
+		src_premul; /* Pipe1 (V0/foreground) */
 
 	/* Pipe input sizes - MUST match actual layer sizes for correct alpha blending */
-	bld.mem_size[0].bits.width = blend_w - 1;     /* UI2: blend region size */
+	bld.mem_size[0].bits.width = blend_w - 1; /* UI2: blend region size */
 	bld.mem_size[0].bits.height = blend_h - 1;
-	bld.mem_size[1].bits.width = blend_w - 1;     /* V0: blend region size (NOT src_crop!) */
+	bld.mem_size[1].bits.width =
+		blend_w - 1; /* V0: blend region size (NOT src_crop!) */
 	bld.mem_size[1].bits.height = blend_h - 1;
 
 	/* Pipe positions - both at (0,0) for overlay */
@@ -3507,17 +3751,19 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	 */
 	bld.bld_ctrl.dwval = sunxi_g2d_get_bld_mode(bld_mode);
 
-	dev_dbg(g2d->dev, "BLD CONFIG: mode=%u bld_ctrl=0x%08X bld_en_ctrl=0x%08X premulti_ctrl=0x%08X\n",
-		bld_mode, bld.bld_ctrl.dwval, bld.bld_en_ctrl.dwval, bld.premulti_ctrl.dwval);
+	dev_dbg(g2d->dev,
+		"BLD CONFIG: mode=%u bld_ctrl=0x%08X bld_en_ctrl=0x%08X premulti_ctrl=0x%08X\n",
+		bld_mode, bld.bld_ctrl.dwval, bld.bld_en_ctrl.dwval,
+		bld.premulti_ctrl.dwval);
 	dev_dbg(g2d->dev, "BLD SIZES: p0=%ux%u p1=%ux%u out=%ux%u\n",
 		bld.mem_size[0].bits.width + 1, bld.mem_size[0].bits.height + 1,
 		bld.mem_size[1].bits.width + 1, bld.mem_size[1].bits.height + 1,
 		bld.out_size.bits.width + 1, bld.out_size.bits.height + 1);
 
 	/* Output in RGB mode (framebuffer is XRGB8888) */
-	bld.out_color.dwval = 0;  /* Clear all first */
-	bld.out_color.bits.alpha_mode = 0;  /* RGB mode (not YUV) */
-	bld.out_color.bits.premul_en = 0;   /* No premultiplication on output */
+	bld.out_color.dwval = 0; /* Clear all first */
+	bld.out_color.bits.alpha_mode = 0; /* RGB mode (not YUV) */
+	bld.out_color.bits.premul_en = 0; /* No premultiplication on output */
 
 	/* === Configure Color Key (Chroma Key) === */
 	if (color_key_enable) {
@@ -3531,12 +3777,13 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 		/* Enable color key on pipe1 (V0/source layer) */
 		bld.color_key.bits.key0_en = 1;
-		bld.color_key.bits.key0_match_dir = color_key_mode;  /* 0=inside, 1=outside */
+		bld.color_key.bits.key0_match_dir =
+			color_key_mode; /* 0=inside, 1=outside */
 
 		/* Match all RGB channels */
-		bld.color_key_cfg.bits.key0b_match = 1;  /* Match blue */
-		bld.color_key_cfg.bits.key0g_match = 1;  /* Match green */
-		bld.color_key_cfg.bits.key0y_match = 1;  /* Match red */
+		bld.color_key_cfg.bits.key0b_match = 1; /* Match blue */
+		bld.color_key_cfg.bits.key0g_match = 1; /* Match green */
+		bld.color_key_cfg.bits.key0y_match = 1; /* Match red */
 
 		/* Set color range */
 		bld.color_key_min.bits.min_r = min_r;
@@ -3546,9 +3793,10 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 		bld.color_key_max.bits.max_g = max_g;
 		bld.color_key_max.bits.max_b = max_b;
 
-		dev_dbg(g2d->dev, "CHROMAKEY: enabled mode=%u range=0x%06X-0x%06X (R:%u-%u G:%u-%u B:%u-%u)\n",
-			 color_key_mode, color_key_min, color_key_max,
-			 min_r, max_r, min_g, max_g, min_b, max_b);
+		dev_dbg(g2d->dev,
+			"CHROMAKEY: enabled mode=%u range=0x%06X-0x%06X (R:%u-%u G:%u-%u B:%u-%u)\n",
+			color_key_mode, color_key_min, color_key_max, min_r,
+			max_r, min_g, max_g, min_b, max_b);
 	} else {
 		/* Disable color key */
 		bld.color_key.dwval = 0;
@@ -3565,17 +3813,27 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	if (sunxi_g2d_is_yuv_format(dst_format)) {
 		/* CSC0: pipe0 (UI2/destination) YUV→RGB conversion */
 		sunxi_g2d_configure_csc(g2d, 0, dst_color_space);
-		g2d_write(g2d, BLD_CSC_CTL, g2d_read(g2d, BLD_CSC_CTL) | BIT(0));  /* Enable CSC0 */
-		dev_dbg(g2d->dev, "CSC0 enabled for dst (pipe0/UI2) format=0x%02X %s\n",
-				dst_format, dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+		g2d_write(g2d, BLD_CSC_CTL,
+			  g2d_read(g2d, BLD_CSC_CTL) |
+				  BIT(0)); /* Enable CSC0 */
+		dev_dbg(g2d->dev,
+			"CSC0 enabled for dst (pipe0/UI2) format=0x%02X %s\n",
+			dst_format,
+			dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" :
+								   "BT.601");
 	}
-	
+
 	if (sunxi_g2d_is_yuv_format(src_format)) {
 		/* CSC1: pipe1 (V0/source) YUV→RGB conversion */
 		sunxi_g2d_configure_csc(g2d, 1, src_color_space);
-		g2d_write(g2d, BLD_CSC_CTL, g2d_read(g2d, BLD_CSC_CTL) | BIT(1));  /* Enable CSC1 */
-		dev_dbg(g2d->dev, "CSC1 enabled for src (pipe1/V0) format=0x%02X %s\n",
-			 src_format, src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+		g2d_write(g2d, BLD_CSC_CTL,
+			  g2d_read(g2d, BLD_CSC_CTL) |
+				  BIT(1)); /* Enable CSC1 */
+		dev_dbg(g2d->dev,
+			"CSC1 enabled for src (pipe1/V0) format=0x%02X %s\n",
+			src_format,
+			src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" :
+								   "BT.601");
 	}
 
 	/* Write BLD configuration */
@@ -3592,13 +3850,14 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, BLD_OUT_COLOR, bld.out_color.dwval);
 
 	dev_dbg(g2d->dev, "BLD: en=0x%08X ctl=0x%08X (UI2+alpha V0 blending)\n",
-			bld.bld_en_ctrl.dwval, bld.bld_ctrl.dwval);
+		bld.bld_en_ctrl.dwval, bld.bld_ctrl.dwval);
 
 	/* === Configure Writeback - Write result to OUTPUT buffer (separate from inputs) === */
 
 	/* Get bytes per pixel for writeback using unified format function (needed for offset calculation) */
 	if (sunxi_g2d_format_to_hw(out_format, &wb_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported writeback output format: %u\n", out_format);
+		dev_err(g2d->dev, "Unsupported writeback output format: %u\n",
+			out_format);
 		return -EINVAL;
 	}
 
@@ -3612,17 +3871,19 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	if (out_dma_addr == dst_base_addr) {
 		/* In-place operation: apply position offset */
 		wb_addr = out_dma_addr + (dst_y * out_pitch) + (dst_x * wb_bpp);
-		dev_dbg(g2d->dev, "WB (IN-PLACE): base=0x%llx offset=(x=%u y=%u) → addr=0x%llx\n",
-			 (u64)out_dma_addr, dst_x, dst_y, (u64)wb_addr);
+		dev_dbg(g2d->dev,
+			"WB (IN-PLACE): base=0x%llx offset=(x=%u y=%u) → addr=0x%llx\n",
+			(u64)out_dma_addr, dst_x, dst_y, (u64)wb_addr);
 	} else {
 		/* Separate output buffer: write at (0, 0) */
 		wb_addr = out_dma_addr;
-		dev_dbg(g2d->dev, "WB (SEPARATE): base=0x%llx (writing at 0,0 of output buffer)\n",
-				 (u64)out_dma_addr);
+		dev_dbg(g2d->dev,
+			"WB (SEPARATE): base=0x%llx (writing at 0,0 of output buffer)\n",
+			(u64)out_dma_addr);
 	}
 
 	/* Configure writeback */
-	wb.wb_attr.dwval = 0;  /* Clear all bits first */
+	wb.wb_attr.dwval = 0; /* Clear all bits first */
 	wb.wb_attr.bits.fmt = out_fmt_val;
 	wb.wb_attr.bits.round_en = 0;
 	wb.data_size.bits.width = blend_w - 1;
@@ -3638,8 +3899,10 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, WB_LADD0, wb.laddr0);
 	g2d_write(g2d, WB_HADD0, wb.haddr0);
 
-	dev_dbg(g2d->dev, "WB: addr=0x%llx size=%ux%u pitch=%u offset=0x%llx (WRITE to output buffer at position)\n",
-		 (u64)wb_addr, blend_w, blend_h, out_pitch, (u64)(wb_addr - out_dma_addr));
+	dev_dbg(g2d->dev,
+		"WB: addr=0x%llx size=%ux%u pitch=%u offset=0x%llx (WRITE to output buffer at position)\n",
+		(u64)wb_addr, blend_w, blend_h, out_pitch,
+		(u64)(wb_addr - out_dma_addr));
 
 	/* 
 	 * Note: VSU (scaling) is NOT configured here because:
@@ -3647,7 +3910,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 	 * - This step (Step 2) only does alpha blending without scaling
 	 * - src_crop_w/h now equals blend_w/h (1:1 operation)
 	 */
-	g2d_write(g2d, VS_CTRL, 0);  /* Ensure VSU is disabled for alpha blend */
+	g2d_write(g2d, VS_CTRL, 0); /* Ensure VSU is disabled for alpha blend */
 
 	/* === Start operation === */
 	g2d_write(g2d, CMD_CTL, CMD_CTL_START);
@@ -3656,7 +3919,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 	/* Wait for completion */
 	timeout = wait_event_timeout(g2d->irq_wait, atomic_read(&g2d->irq_done),
-				      msecs_to_jiffies(100));
+				     msecs_to_jiffies(100));
 
 	dev_dbg(g2d->dev, "MIXER wait returned: timeout=%lu irq_done=%d\n",
 		timeout, atomic_read(&g2d->irq_done));
@@ -3675,18 +3938,20 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
 
 	dev_dbg(g2d->dev, "BLIT_ALPHA_CORRECT completed via IRQ\n");
 	sunxi_g2d_hw_disable(g2d);
-	
+
 	/* Free temporary scaling buffer if it was allocated */
 	if (g2d->temp_scale_buffer) {
-		dev_dbg(g2d->dev, "Freeing temp scale buffer: vaddr=%p dma=0x%llx size=%zu\n",
-				 g2d->temp_scale_buffer, (u64)g2d->temp_scale_dma, g2d->temp_scale_size);
+		dev_dbg(g2d->dev,
+			"Freeing temp scale buffer: vaddr=%p dma=0x%llx size=%zu\n",
+			g2d->temp_scale_buffer, (u64)g2d->temp_scale_dma,
+			g2d->temp_scale_size);
 		dma_free_coherent(g2d->dev, g2d->temp_scale_size,
 				  g2d->temp_scale_buffer, g2d->temp_scale_dma);
 		g2d->temp_scale_buffer = NULL;
 		g2d->temp_scale_dma = 0;
 		g2d->temp_scale_size = 0;
 	}
-	
+
 	return 0;
 }
 
@@ -3708,109 +3973,118 @@ static int sunxi_g2d_do_blit_alpha_3buf(struct sunxi_g2d_dev *g2d,
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
-                              dma_addr_t src_dma, u32 src_width, u32 src_height,
-                              u32 src_pitch, u32 src_format,
-                              u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-                              dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
-                              u32 dst_pitch, u32 dst_format,
-                              u32 dst_x, u32 dst_y, u32 dst_out_w, u32 dst_out_h,
-                              void *dst_vaddr)
+static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+			      u32 src_width, u32 src_height, u32 src_pitch,
+			      u32 src_format, u32 src_x, u32 src_y,
+			      u32 src_crop_w, u32 src_crop_h,
+			      dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
+			      u32 dst_pitch, u32 dst_format, u32 dst_x,
+			      u32 dst_y, u32 dst_out_w, u32 dst_out_h,
+			      void *dst_vaddr)
 {
-	struct g2d_mixer_ovl_v_reg v0 = {0};      /* V0 layer (video pipe with VSU) */
-	struct g2d_mixer_bld_reg bld = {0};       /* Blender */
-	struct g2d_mixer_write_back_reg wb = {0}; /* Writeback */
-	
+	struct g2d_mixer_ovl_v_reg v0 = {
+		0
+	}; /* V0 layer (video pipe with VSU) */
+	struct g2d_mixer_bld_reg bld = { 0 }; /* Blender */
+	struct g2d_mixer_write_back_reg wb = { 0 }; /* Writeback */
+
 	u32 hw_src_fmt, hw_dst_fmt;
 	dma_addr_t src_offset_dma, dst_offset_dma;
 	u32 src_bpp, dst_bpp;
 	unsigned long timeout;
 	u32 mixer_ctl;
 	int ret;
-	
-	dev_dbg(g2d->dev, "SCALE: %ux%u@(%u,%u) crop=%ux%u → %ux%u@(%u,%u) scaled=%ux%u\n",
-		 src_width, src_height, src_x, src_y, src_crop_w, src_crop_h,
-		 dst_width, dst_height, dst_x, dst_y, dst_out_w, dst_out_h);
-	
+
+	dev_dbg(g2d->dev,
+		"SCALE: %ux%u@(%u,%u) crop=%ux%u → %ux%u@(%u,%u) scaled=%ux%u\n",
+		src_width, src_height, src_x, src_y, src_crop_w, src_crop_h,
+		dst_width, dst_height, dst_x, dst_y, dst_out_w, dst_out_h);
+
 	/* === Convert format enums to hardware values === */
-	
+
 	/* Use unified format conversion function for all formats */
 	ret = sunxi_g2d_format_to_hw(src_format, &src_bpp);
 	if (ret < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", src_format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			src_format);
 		return -EINVAL;
 	}
-	hw_src_fmt = ret;  /* sunxi_g2d_format_to_hw returns hw format value */
-	
+	hw_src_fmt = ret; /* sunxi_g2d_format_to_hw returns hw format value */
+
 	ret = sunxi_g2d_format_to_hw(dst_format, &dst_bpp);
 	if (ret < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			dst_format);
 		return -EINVAL;
 	}
-	hw_dst_fmt = ret;  /* sunxi_g2d_format_to_hw returns hw format value */
-	
+	hw_dst_fmt = ret; /* sunxi_g2d_format_to_hw returns hw format value */
+
 	/* Calculate DMA addresses with offsets */
 	src_offset_dma = src_dma + (src_y * src_pitch) + (src_x * src_bpp);
 	dst_offset_dma = dst_dma + (dst_y * dst_pitch) + (dst_x * dst_bpp);
-	
+
 	/* Enable hardware */
 	ret = sunxi_g2d_hw_enable(g2d);
 	if (ret)
 		return ret;
-	
+
 	/* Reset IRQ flag */
 	atomic_set(&g2d->irq_done, 0);
-	
+
 	/* === Hardware Configuration === */
-	
+
 	/* 1. Reset G2D */
 	g2d_write(g2d, G2D_AHB_RESET, 0x0);
 	g2d_write(g2d, G2D_AHB_RESET, 0x3);
 	wmb();
-	
+
 	/* Clear and enable interrupts */
 	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
 	udelay(1);
 	g2d_write(g2d, G2D_MIXER_INT, 0x00000011);
-	
+
 	/* === Configure V0 Layer (Source with VSU) === */
-	
+
 	v0.ovl_attr.dwval = 0;
-	v0.ovl_attr.bits.lay_en = 1;                      /* Enable layer */
-	v0.ovl_attr.bits.alpha_mode = 0;                  /* Pixel alpha mode */
-	v0.ovl_attr.bits.lay_fbfmt = src_format;          /* TEST: Use API format directly, no conversion */
-	v0.ovl_attr.bits.lay_glbalpha = 0xFF;             /* Global alpha */
-	
-	v0.ovl_mem.bits.lay_width = src_crop_w - 1;       /* Input width (buffer size) */
-	v0.ovl_mem.bits.lay_height = src_crop_h - 1;      /* Input height (buffer size) */
-	
-	v0.ovl_mem_coor.bits.lay_xcoor = 0;               /* Position in blender */
+	v0.ovl_attr.bits.lay_en = 1; /* Enable layer */
+	v0.ovl_attr.bits.alpha_mode = 0; /* Pixel alpha mode */
+	v0.ovl_attr.bits.lay_fbfmt =
+		src_format; /* TEST: Use API format directly, no conversion */
+	v0.ovl_attr.bits.lay_glbalpha = 0xFF; /* Global alpha */
+
+	v0.ovl_mem.bits.lay_width =
+		src_crop_w - 1; /* Input width (buffer size) */
+	v0.ovl_mem.bits.lay_height =
+		src_crop_h - 1; /* Input height (buffer size) */
+
+	v0.ovl_mem_coor.bits.lay_xcoor = 0; /* Position in blender */
 	v0.ovl_mem_coor.bits.lay_ycoor = 0;
-	
+
 	v0.ovl_mem_pitch0 = src_pitch;
 	v0.ovl_mem_low_addr0 = (u32)src_offset_dma;
 	v0.ovl_mem_high_addr.bits.lay_y_hadd = (u32)((u64)src_offset_dma >> 32);
-	
-	v0.ovl_fill_color = 0;  /* Not used in image mode */
-	
+
+	v0.ovl_fill_color = 0; /* Not used in image mode */
+
 	/* TEST v2.9.43: ovl_winsize should match INPUT size when using VSU
 	 * The VSU output size is configured separately in VS_OUT_SIZE
 	 * ovl_winsize may define the "window" of pixels to READ, not WRITE
 	 */
-	v0.ovl_winsize.bits.width = src_crop_w - 1;   /* TEST: Use INPUT size */
-	v0.ovl_winsize.bits.height = src_crop_h - 1;  /* TEST: Use INPUT size */
-	
+	v0.ovl_winsize.bits.width = src_crop_w - 1; /* TEST: Use INPUT size */
+	v0.ovl_winsize.bits.height = src_crop_h - 1; /* TEST: Use INPUT size */
+
 	/* BSP: DO NOT write HDS/VDS registers for RGB formats
 	 * Only YUV formats or very aggressive scaling (>8x/4x) use HDS/VDS
 	 * For RGB with VSU, leave HDS/VDS untouched (default disabled)
 	 */
 	/* Removed HDS/VDS writes */
-	
+
 	dev_dbg(g2d->dev, "📐 VSU INPUT: src_crop=%ux%u, dst_out=%ux%u\n",
-			src_crop_w, src_crop_h, dst_out_w, dst_out_h);
+		src_crop_w, src_crop_h, dst_out_w, dst_out_h);
 	dev_dbg(g2d->dev, "📐 V0 CONFIG: mem=%ux%u, win=%ux%u, pitch=%u\n",
-			src_crop_w - 1, src_crop_h - 1, dst_out_w - 1, dst_out_h - 1, src_pitch);
-	
+		src_crop_w - 1, src_crop_h - 1, dst_out_w - 1, dst_out_h - 1,
+		src_pitch);
+
 	/* Write V0 registers using struct */
 	g2d_write(g2d, V0_MBSIZE, v0.ovl_mem.dwval);
 	g2d_write(g2d, V0_COOR, v0.ovl_mem_coor.dwval);
@@ -3820,55 +4094,67 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, V0_FILLC, v0.ovl_fill_color);
 	g2d_write(g2d, V0_SIZE, v0.ovl_winsize.dwval);
 	/* BSP: DO NOT write HDS/VDS for RGB - removed writes */
-	
-	dev_dbg(g2d->dev, "V0: fmt=%u (hw=%u) mem=%ux%u win=%ux%u pitch=%u addr=0x%llx alpha=0x%02X\n",
-		 src_format, hw_src_fmt, src_crop_w, src_crop_h,
-		 dst_out_w, dst_out_h, src_pitch,
-		 (u64)src_offset_dma, v0.ovl_attr.bits.lay_glbalpha);
-	
+
+	/* CRITICAL: Enable V0 layer and set correct HW pixel format.
+	 * Without this, V0_ATTCTL remains 0 and VSU path reads zeros,
+	 * which matches the TEMP DUMP 0xff000000 (RGB=0, A=255) symptom.
+	 * Use the same programming model as the atomic blit path.
+	 */
+	{
+		u32 v0_attctl = (u32)hw_src_fmt; /* Hardware format code */
+		/* alpha=0xff, pixel_alpha=1, fillcolor_en=0, EN=1 */
+		v0_attctl |= 0xff010001;
+		g2d_write(g2d, V0_ATTCTL, v0_attctl);
+	}
+
+	dev_dbg(g2d->dev,
+		"V0: fmt=%u (hw=%u) mem=%ux%u win=%ux%u pitch=%u addr=0x%llx alpha=0x%02X\n",
+		src_format, hw_src_fmt, src_crop_w, src_crop_h, dst_out_w,
+		dst_out_h, src_pitch, (u64)src_offset_dma,
+		v0.ovl_attr.bits.lay_glbalpha);
+
 	/* === Setup VSU (Video Scaler Unit) === */
-	/* CRITICAL FIX: Pass API format (src_format), NOT hardware format (hw_src_fmt)!
-	 * VSU processes pixels byte-by-byte agnostic to ARGB/ABGR order
-	 * The ARGB↔ABGR conversion is for V0/WB overlay layers, not VSU
-	 * V0 reads from VSU output with the correct hw_src_fmt interpretation
+	/* Pass API format (src_format). VSU operates on byte streams and
+	 * doesn't need the overlay HW code; V0/WB interpret pixels using
+	 * their respective HW formats.
 	 */
 	ret = sunxi_g2d_vsu_setup(g2d, src_format, src_crop_w, src_crop_h,
-	                          dst_out_w, dst_out_h, 0xff);
+				  dst_out_w, dst_out_h, 0xff);
 	if (ret) {
 		dev_err(g2d->dev, "VSU setup failed: %d\n", ret);
 		sunxi_g2d_hw_disable(g2d);
 		return ret;
 	}
-	
+
 	/* === Configure BLD (Blender) === */
-	
+
 	bld.bld_en_ctrl.dwval = 0;
-	bld.bld_en_ctrl.bits.p0_en = 1;  /* Enable pipe 0 (V0) */
-	
-	bld.premulti_ctrl.dwval = 0;   /* No premultiply */
-	
-	bld.mem_coor[0].bits.xcoor = 0;  /* Channel 0 position */
+	bld.bld_en_ctrl.bits.p0_en = 1; /* Enable pipe 0 (V0) */
+
+	bld.premulti_ctrl.dwval = 0; /* No premultiply */
+
+	bld.mem_coor[0].bits.xcoor = 0; /* Channel 0 position */
 	bld.mem_coor[0].bits.ycoor = 0;
-	
+
 	/* v2.9.45: REVERT v2.9.44 - BSP uses OUTPUT size for BLD_CH_ISIZE0
 	 * BSP code (line 2007-2011): rect0.w = dst->clip_rect.w (OUTPUT)
 	 * When VSU is enabled, BLD receives VSU OUTPUT, not input
 	 */
-	bld.mem_size[0].bits.width = dst_out_w - 1;   /* BSP: Use OUTPUT size */
-	bld.mem_size[0].bits.height = dst_out_h - 1;  /* BSP: Use OUTPUT size */
-	
-	bld.out_size.bits.width = dst_out_w - 1;      /* Output size */
+	bld.mem_size[0].bits.width = dst_out_w - 1; /* BSP: Use OUTPUT size */
+	bld.mem_size[0].bits.height = dst_out_h - 1; /* BSP: Use OUTPUT size */
+
+	bld.out_size.bits.width = dst_out_w - 1; /* Output size */
 	bld.out_size.bits.height = dst_out_h - 1;
-	
+
 	bld.out_color.dwval = 0;
-	bld.out_color.bits.alpha_mode = 0;  /* RGB mode (not YUV) */
-	bld.out_color.bits.premul_en = 0;   /* No premultiplication on output */
-	
-	bld.bld_ctrl.dwval = 0;  /* Simple passthrough */
-	
-	bld.rop_ctrl.dwval = 0x000000f0;     /* ROP3: S (source copy) */
+	bld.out_color.bits.alpha_mode = 0; /* RGB mode (not YUV) */
+	bld.out_color.bits.premul_en = 0; /* No premultiplication on output */
+
+	bld.bld_ctrl.dwval = 0; /* Simple passthrough */
+
+	bld.rop_ctrl.dwval = 0x000000f0; /* ROP3: S (source copy) */
 	bld.ch3_index0.dwval = 0x00061080;
-	
+
 	/* Write BLD registers using struct */
 	g2d_write(g2d, BLD_EN_CTL, bld.bld_en_ctrl.dwval);
 	g2d_write(g2d, BLD_PREMUL_CTL, bld.premulti_ctrl.dwval);
@@ -3879,55 +4165,76 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, BLD_CTL, bld.bld_ctrl.dwval);
 	g2d_write(g2d, ROP_CTL, bld.rop_ctrl.dwval);
 	g2d_write(g2d, ROP_INDEX0, bld.ch3_index0.dwval);
-	
+
 	/* === Configure Writeback === */
-	
+
 	wb.wb_attr.dwval = 0;
-	wb.wb_attr.bits.fmt = hw_dst_fmt;    /* Destination format (converted) */
+	wb.wb_attr.bits.fmt = hw_dst_fmt; /* Destination format (converted) */
 	wb.wb_attr.bits.round_en = 0;
-	
+
 	wb.data_size.bits.width = dst_out_w - 1;
 	wb.data_size.bits.height = dst_out_h - 1;
-	
+
 	wb.pitch0 = dst_pitch;
 	wb.laddr0 = (u32)dst_offset_dma;
 	wb.haddr0 = (u32)((u64)dst_offset_dma >> 32);
-	
+
 	/* Write WB registers using struct */
 	g2d_write(g2d, WB_ATT, wb.wb_attr.dwval);
 	g2d_write(g2d, WB_SIZE, wb.data_size.dwval);
 	g2d_write(g2d, WB_PITCH0, wb.pitch0);
 	g2d_write(g2d, WB_LADD0, wb.laddr0);
 	g2d_write(g2d, WB_HADD0, wb.haddr0);
-	
-	dev_dbg(g2d->dev, "WB: fmt=%u (hw=%u) size=%ux%u pitch=%u addr=0x%llx\n",
-		 dst_format, hw_dst_fmt, dst_out_w, dst_out_h, dst_pitch,
-		 (u64)dst_offset_dma);
-	
+
+	dev_dbg(g2d->dev,
+		"WB: fmt=%u (hw=%u) size=%ux%u pitch=%u addr=0x%llx\n",
+		dst_format, hw_dst_fmt, dst_out_w, dst_out_h, dst_pitch,
+		(u64)dst_offset_dma);
+
 	/* === Start Operation === */
-	
+
 	mixer_ctl = G2D_MIXER_CTL_START;
 	g2d_write(g2d, G2D_MIXER_CTL, mixer_ctl);
-	
+
+	/* Extra register dumps for deep debugging: VSU, V0 and WB registers */
+	dev_dbg(
+		g2d->dev,
+		"REG DUMP BEFORE START: VS_CTRL=0x%08x VS_OUT_SIZE=0x%08x VS_Y_SIZE=0x%08x VS_Y_HSTEP=0x%08x VS_Y_VSTEP=0x%08x VS_GLB_ALPHA=0x%08x\n",
+		g2d_read(g2d, VS_CTRL), g2d_read(g2d, VS_OUT_SIZE),
+		g2d_read(g2d, VS_Y_SIZE), g2d_read(g2d, VS_Y_HSTEP),
+		g2d_read(g2d, VS_Y_VSTEP), g2d_read(g2d, VS_GLB_ALPHA));
+
+	dev_dbg(
+		g2d->dev,
+		"REG DUMP BEFORE START: V0_ATTCTL=0x%08x V0_PITCH0=0x%08x V0_LADD0=0x%08x V0_HADD=0x%08x V0_SIZE=0x%08x\n",
+		g2d_read(g2d, V0_ATTCTL), g2d_read(g2d, V0_PITCH0),
+		g2d_read(g2d, V0_LADD0), g2d_read(g2d, V0_HADD),
+		g2d_read(g2d, V0_SIZE));
+
+	dev_dbg(
+		g2d->dev,
+		"REG DUMP BEFORE START: WB_ATT=0x%08x WB_PITCH0=0x%08x WB_LADD0=0x%08x WB_HADD0=0x%08x\n",
+		g2d_read(g2d, WB_ATT), g2d_read(g2d, WB_PITCH0),
+		g2d_read(g2d, WB_LADD0), g2d_read(g2d, WB_HADD0));
+
 	/* Wait for completion */
-	timeout = wait_event_timeout(g2d->irq_wait,
-	                              atomic_read(&g2d->irq_done),
-	                              msecs_to_jiffies(100));
+	timeout = wait_event_timeout(g2d->irq_wait, atomic_read(&g2d->irq_done),
+				     msecs_to_jiffies(100));
 	if (timeout == 0) {
 		dev_err(g2d->dev, "Scale operation timeout (100ms)\n");
 		sunxi_g2d_hw_disable(g2d);
 		return -ETIMEDOUT;
 	}
-	
+
 	if (!atomic_read(&g2d->irq_done)) {
 		dev_err(g2d->dev, "Scale failed (no IRQ)\n");
 		sunxi_g2d_hw_disable(g2d);
 		return -EIO;
 	}
-	
-	dev_dbg(g2d->dev, "✅ SCALE completed: %ux%u → %ux%u\n",
-		 src_crop_w, src_crop_h, dst_out_w, dst_out_h);
-	
+
+	dev_dbg(g2d->dev, "✅ SCALE completed: %ux%u → %ux%u\n", src_crop_w,
+		src_crop_h, dst_out_w, dst_out_h);
+
 	/* DEBUG: Dump output buffer if vaddr provided */
 	// if (dst_vaddr) {
 	// 	size_t dump_size = dst_out_h * dst_pitch;
@@ -3935,13 +4242,13 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
 	// 		 dst_out_w, dst_out_h, dst_pitch, dump_size);
 	// 	dev_dbg(g2d->dev, "   To convert: convert -size %ux%u -depth 8 BGRA:vsu-output-*.raw vsu-output.png\n",
 	// 		 dst_out_w, dst_out_h);
-		
+
 	// 	/* Log first few pixels to verify RGB data */
 	// 	u32 *pixels = (u32 *)dst_vaddr;
 	// 	int mid_offset = (dst_out_h / 2) * (dst_pitch / 4) + (dst_out_w / 2);
 	// 	dev_dbg(g2d->dev, "   VSU OUTPUT PIXELS: [0]=0x%08x [1]=0x%08x [mid=%d]=0x%08x [mid+5]=0x%08x\n",
 	// 		 pixels[0], pixels[1], mid_offset, pixels[mid_offset], pixels[mid_offset + 5]);
-		
+
 	// 	/* Detailed RGB byte analysis for first pixel (should be 0x804488EE if color preserved) */
 	// 	u32 p0 = pixels[0];
 	// 	u8 b0 = p0 & 0xFF;
@@ -3950,7 +4257,7 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
 	// 	u8 a0 = (p0 >> 24) & 0xFF;
 	// 	dev_dbg(g2d->dev, "   🔬 PIXEL[0] BYTES: B=0x%02x G=0x%02x R=0x%02x A=0x%02x (expected: B=0xEE G=0x88 R=0x44 A=0x80)\n",
 	// 		 b0, g0, r0, a0);
-		
+
 	// 	/* Check a few more pixels for pattern */
 	// 	u32 p1 = pixels[1];
 	// 	u32 pm = pixels[mid_offset];
@@ -3959,10 +4266,9 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
 	// 	dev_dbg(g2d->dev, "   🔬 PIXEL[mid=%d] = 0x%08x (B=%02x G=%02x R=%02x A=%02x)\n",
 	// 		 mid_offset, pm, (u8)(pm & 0xFF), (u8)((pm >> 8) & 0xFF), (u8)((pm >> 16) & 0xFF), (u8)((pm >> 24) & 0xFF));
 
-		
 	// 	sunxi_g2d_dump_buffer(g2d, dst_vaddr, dump_size, "vsu-output");
 	// }
-	
+
 	sunxi_g2d_hw_disable(g2d);
 	return 0;
 }
@@ -3993,144 +4299,157 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d,
  * This performs a scaled/unscaled copy from source to destination.
  * Uses V0 layer for source image and WB for destination.
  */
-static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
-			      dma_addr_t src_dma, u32 src_width, u32 src_height,
-			      u32 src_pitch, u32 src_format,
-			      u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-			      u8 src_color_space,
-			      dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
-			      u32 dst_pitch, u32 dst_format,
-			      u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
-			      u8 dst_color_space)
+static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+			     u32 src_width, u32 src_height, u32 src_pitch,
+			     u32 src_format, u32 src_x, u32 src_y,
+			     u32 src_crop_w, u32 src_crop_h, u8 src_color_space,
+			     dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
+			     u32 dst_pitch, u32 dst_format, u32 dst_x,
+			     u32 dst_y, u32 dst_w, u32 dst_h,
+			     u8 dst_color_space)
 {
 	unsigned long timeout;
 	u32 mixer_ctl;
 	u32 v0_attctl = 0;
 	dma_addr_t src_offset_dma;
-	
-	dev_dbg(g2d->dev, "BLIT: src=%ux%u@0x%llx crop=%u,%u,%ux%u -> dst=%u,%u,%ux%u@0x%llx\n",
-		src_width, src_height, (u64)src_dma, src_x, src_y, src_crop_w, src_crop_h,
-		dst_x, dst_y, dst_w, dst_h, (u64)dst_dma);
-	
+
+	dev_dbg(g2d->dev,
+		"BLIT: src=%ux%u@0x%llx crop=%u,%u,%ux%u -> dst=%u,%u,%ux%u@0x%llx\n",
+		src_width, src_height, (u64)src_dma, src_x, src_y, src_crop_w,
+		src_crop_h, dst_x, dst_y, dst_w, dst_h, (u64)dst_dma);
+
 	/* Get source format info for V0 configuration using unified format function */
 	u32 src_bpp;
 	int hw_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
 	if (hw_fmt < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", src_format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			src_format);
 		return -EINVAL;
 	}
-	v0_attctl = (u32)hw_fmt;  /* Hardware format code for V0_ATTCTL */
-	
+	v0_attctl = (u32)hw_fmt; /* Hardware format code for V0_ATTCTL */
+
 	src_offset_dma = src_dma + (src_y * src_pitch) + (src_x * src_bpp);
-	
+
 	/* 1. Reset G2D */
 	g2d_write(g2d, G2D_AHB_RESET, 0x0);
 	g2d_write(g2d, G2D_AHB_RESET, 0x3);
 	wmb();
-	
+
 	/* 2. Setup V0 layer - image mode with pixel alpha */
-	v0_attctl |= 0xff010001;  /* alpha=0xff, pixel_alpha=1, fillcolor_en=0, EN=1 */
+	v0_attctl |=
+		0xff010001; /* alpha=0xff, pixel_alpha=1, fillcolor_en=0, EN=1 */
 	g2d_write(g2d, V0_ATTCTL, v0_attctl);
-	
+
 	/* V0 memory block size = source crop size */
 	g2d_write(g2d, V0_MBSIZE, ((src_crop_h - 1) << 16) | (src_crop_w - 1));
-	
+
 	/* V0 image size = source crop size */
 	g2d_write(g2d, V0_SIZE, ((src_crop_h - 1) << 16) | (src_crop_w - 1));
-	
+
 	/* V0 coordinate in blender (0,0 since we handle offset in WB) */
 	g2d_write(g2d, V0_COOR, 0x00000000);
-	
+
 	/* V0 source pitch and address */
 	g2d_write(g2d, V0_PITCH0, src_pitch);
 	g2d_write(g2d, V0_LADD0, lower_32_bits(src_offset_dma));
 	g2d_write(g2d, V0_HADD, upper_32_bits(src_offset_dma));
-	
-	dev_dbg(g2d->dev, "BLIT V0 CONFIG: MBSIZE=%ux%u SIZE=%ux%u PITCH=%u addr=0x%llx\n",
-			src_crop_w, src_crop_h, src_crop_w, src_crop_h, src_pitch, (u64)src_offset_dma);
-	
+
+	dev_dbg(g2d->dev,
+		"BLIT V0 CONFIG: MBSIZE=%ux%u SIZE=%ux%u PITCH=%u addr=0x%llx\n",
+		src_crop_w, src_crop_h, src_crop_w, src_crop_h, src_pitch,
+		(u64)src_offset_dma);
+
 	/* V0 fillcolor not used in image mode */
 	g2d_write(g2d, V0_FILLC, 0x00000000);
-	
+
 	/* 3. Setup CSC (Color Space Conversion) for YUV formats */
 	u32 csc_ctl = 0;
-	
+
 	/* Configure CSC for destination if it's YUV */
 	if (sunxi_g2d_is_yuv_format(dst_format)) {
 		sunxi_g2d_configure_csc(g2d, 0, dst_color_space);
-		csc_ctl |= BIT(0);  /* Enable CSC0 for pipe0/UI2 */
+		csc_ctl |= BIT(0); /* Enable CSC0 for pipe0/UI2 */
 		dev_dbg(g2d->dev, "CSC0 enabled for YUV dst (color_space=%s)\n",
-				 dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+			dst_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" :
+								   "BT.601");
 	}
-	
+
 	/* Configure CSC for source if it's YUV */
 	if (sunxi_g2d_is_yuv_format(src_format)) {
 		sunxi_g2d_configure_csc(g2d, 1, src_color_space);
-		csc_ctl |= BIT(1);  /* Enable CSC1 for pipe1/V0 */
+		csc_ctl |= BIT(1); /* Enable CSC1 for pipe1/V0 */
 		dev_dbg(g2d->dev, "CSC1 enabled for YUV src (color_space=%s)\n",
-				 src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" : "BT.601");
+			src_color_space == G2D_COLOR_SPACE_BT709 ? "BT.709" :
+								   "BT.601");
 	}
-	
+
 	if (csc_ctl)
 		g2d_write(g2d, BLD_CSC_CTL, csc_ctl);
-	
+
 	/* 4. Setup BLD (blender) - output size = destination blit size */
-	g2d_write(g2d, BLD_EN_CTL, g2d_read(g2d, BLD_EN_CTL) | 0x00000100);  /* Enable pipe 0 */
+	g2d_write(g2d, BLD_EN_CTL,
+		  g2d_read(g2d, BLD_EN_CTL) | 0x00000100); /* Enable pipe 0 */
 	g2d_write(g2d, BLD_PREMUL_CTL, 0x00000000);
-	
+
 	/* BLD channel 0 input size = destination blit size (scaled if needed) */
 	g2d_write(g2d, BLD_CH_ISIZE0, ((dst_h - 1) << 16) | (dst_w - 1));
 	g2d_write(g2d, BLD_CH_OFFSET0, 0x00000000);
-	
+
 	/* BLD output size = destination blit size */
 	g2d_write(g2d, BLD_OUT_SIZE, ((dst_h - 1) << 16) | (dst_w - 1));
-	g2d_write(g2d, BLD_OUT_COLOR, g2d_read(g2d, BLD_OUT_COLOR) & ~BIT(1));  /* RGB mode */
+	g2d_write(g2d, BLD_OUT_COLOR,
+		  g2d_read(g2d, BLD_OUT_COLOR) & ~BIT(1)); /* RGB mode */
 	g2d_write(g2d, BLD_CTL, 0x00000000);
-	
+
 	/* 5. Setup ROP (copy mode) */
-	g2d_write(g2d, ROP_CTL, 0x000000f0);  /* ROP3: 0xF0 = S (source copy) */
+	g2d_write(g2d, ROP_CTL, 0x000000f0); /* ROP3: 0xF0 = S (source copy) */
 	g2d_write(g2d, ROP_INDEX0, 0x00061080);
-	
+
 	/* 6. Setup WB (writeback) with destination offset */
 	u32 dst_bpp;
 	int hw_dst_fmt = sunxi_g2d_format_to_hw(dst_format, &dst_bpp);
 	if (hw_dst_fmt < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", dst_format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			dst_format);
 		return -EINVAL;
 	}
-	u32 wb_att = (u32)hw_dst_fmt;  /* Hardware format code for WB_ATT */
-	
+	u32 wb_att = (u32)hw_dst_fmt; /* Hardware format code for WB_ATT */
+
 	/* Calculate destination address with offset */
-	dma_addr_t dst_offset_dma = dst_dma + (dst_y * dst_pitch) + (dst_x * dst_bpp);
-	
+	dma_addr_t dst_offset_dma =
+		dst_dma + (dst_y * dst_pitch) + (dst_x * dst_bpp);
+
 	g2d_write(g2d, WB_LADD0, lower_32_bits(dst_offset_dma));
 	g2d_write(g2d, WB_HADD0, upper_32_bits(dst_offset_dma));
 	g2d_write(g2d, WB_PITCH0, dst_pitch);
 
-	dev_dbg(g2d->dev, "BLIT WB CONFIG: size=%ux%u pitch=%u dst_xy=(%u,%u) addr=0x%llx (offset from base=0x%llx)\n",
-		 dst_w, dst_h, dst_pitch, dst_x, dst_y, (u64)dst_offset_dma, (u64)(dst_offset_dma - dst_dma));
+	dev_dbg(g2d->dev,
+		"BLIT WB CONFIG: size=%ux%u pitch=%u dst_xy=(%u,%u) addr=0x%llx (offset from base=0x%llx)\n",
+		dst_w, dst_h, dst_pitch, dst_x, dst_y, (u64)dst_offset_dma,
+		(u64)(dst_offset_dma - dst_dma));
 
 	/* WB size = destination blit size */
 	g2d_write(g2d, WB_SIZE, ((dst_h - 1) << 16) | (dst_w - 1));
-	g2d_write(g2d, BLD_SIZE, ((dst_h - 1) << 16) | (dst_w - 1));  /* Must match WB_SIZE */
+	g2d_write(g2d, BLD_SIZE,
+		  ((dst_h - 1) << 16) | (dst_w - 1)); /* Must match WB_SIZE */
 	g2d_write(g2d, WB_ATT, wb_att);
 	wmb();
-	
+
 	/* 6. Setup VSU (Video Scaler Unit) if scaling is needed */
 	bool needs_scaling = (src_crop_w != dst_w) || (src_crop_h != dst_h);
 	if (needs_scaling) {
 		int ret;
-		
+
 		dev_dbg(g2d->dev, "VSU: Enabling scaler for %ux%u -> %ux%u\n",
-			 src_crop_w, src_crop_h, dst_w, dst_h);
-		
+			src_crop_w, src_crop_h, dst_w, dst_h);
+
 		/* CRITICAL FIX: Pass API format (src_format), NOT hardware format (hw_src_fmt)!
 		 * VSU processes pixels byte-by-byte agnostic to ARGB/ABGR order
 		 * The ARGB↔ABGR conversion is for V0/WB overlay layers, not VSU
 		 * V0 reads from VSU output with the correct hw_src_fmt interpretation
 		 */
-		ret = sunxi_g2d_vsu_setup(g2d, src_format, src_crop_w, src_crop_h,
-					  dst_w, dst_h, 0xff);
+		ret = sunxi_g2d_vsu_setup(g2d, src_format, src_crop_w,
+					  src_crop_h, dst_w, dst_h, 0xff);
 		if (ret) {
 			dev_err(g2d->dev, "VSU setup failed: %d\n", ret);
 			return ret;
@@ -4139,34 +4458,36 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
 		/* Disable VSU for 1:1 copy */
 		g2d_write(g2d, VS_CTRL, 0);
 	}
-	
+
 	/* 7. Clear MIXER and IRQ */
 	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
 	g2d_write(g2d, G2D_MIXER_CTL, 0x00000000);
 	wmb();
-	
+
 	/* 7. Clear IRQ done flag and enable IRQ */
 	atomic_set(&g2d->irq_done, 0);
-	g2d_write(g2d, G2D_MIXER_INT, 0x00000011);  /* Clear pending, enable IRQ */
+	g2d_write(g2d, G2D_MIXER_INT,
+		  0x00000011); /* Clear pending, enable IRQ */
 	wmb();
-	
+
 	/* 8. Start MIXER */
 	mixer_ctl = g2d_read(g2d, G2D_MIXER_CTL);
-	mixer_ctl |= 0x80000000;  /* START bit */
+	mixer_ctl |= 0x80000000; /* START bit */
 	g2d_write(g2d, G2D_MIXER_CTL, mixer_ctl);
 	wmb();
-	
+
 	/* 9. Wait for IRQ completion */
 	timeout = wait_event_timeout(g2d->irq_wait,
-				      atomic_read(&g2d->irq_done) == 1,
-				      msecs_to_jiffies(1000));
-	
+				     atomic_read(&g2d->irq_done) == 1,
+				     msecs_to_jiffies(1000));
+
 	if (timeout == 0) {
 		u32 status = g2d_read(g2d, G2D_MIXER_INT);
-		dev_err(g2d->dev, "BLIT timeout (no IRQ), status=0x%08x\n", status);
+		dev_err(g2d->dev, "BLIT timeout (no IRQ), status=0x%08x\n",
+			status);
 		return -ETIMEDOUT;
 	}
-	
+
 	dev_dbg(g2d->dev, "BLIT completed via IRQ\n");
 	return 0;
 }
@@ -4183,14 +4504,14 @@ static int sunxi_g2d_do_blit(struct sunxi_g2d_dev *g2d,
  * 
  * Based on BSP g2d_rotate_set_para() implementation.
  */
-static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
-				  dma_addr_t src_dma, u32 src_width, u32 src_height,
-				  u32 src_pitch, u32 src_format,
-				  u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				  dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
-				  u32 dst_pitch, u32 dst_format,
-				  u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
-				  u32 flags)
+static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+				 u32 src_width, u32 src_height, u32 src_pitch,
+				 u32 src_format, u32 src_x, u32 src_y,
+				 u32 src_crop_w, u32 src_crop_h,
+				 dma_addr_t dst_dma, u32 dst_width,
+				 u32 dst_height, u32 dst_pitch, u32 dst_format,
+				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
+				 u32 flags)
 {
 	unsigned long timeout;
 	u32 rot_ctl = ROT_CTL_EN;
@@ -4199,9 +4520,10 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 	u32 src_bpp, dst_bpp;
 	u32 out_w, out_h;
 	bool rotated_90_270;
-	
+
 	/* Determine output dimensions based on rotation */
-	rotated_90_270 = (flags & (G2D_BLIT_FLAG_ROTATE_90 | G2D_BLIT_FLAG_ROTATE_270));
+	rotated_90_270 =
+		(flags & (G2D_BLIT_FLAG_ROTATE_90 | G2D_BLIT_FLAG_ROTATE_270));
 	if (rotated_90_270) {
 		/* 90° and 270° rotations swap width and height */
 		out_w = src_crop_h;
@@ -4211,36 +4533,39 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 		out_w = src_crop_w;
 		out_h = src_crop_h;
 	}
-	
-	dev_dbg(g2d->dev, "BLIT_ROT: src=%ux%u crop=%u,%u,%ux%u -> dst=%ux%u@(%u,%u) flags=0x%x\n",
-			 src_width, src_height, src_x, src_y, src_crop_w, src_crop_h,
-			 dst_width, dst_height, dst_x, dst_y, flags);
-	
+
+	dev_dbg(g2d->dev,
+		"BLIT_ROT: src=%ux%u crop=%u,%u,%ux%u -> dst=%ux%u@(%u,%u) flags=0x%x\n",
+		src_width, src_height, src_x, src_y, src_crop_w, src_crop_h,
+		dst_width, dst_height, dst_x, dst_y, flags);
+
 	/* Reset ROT block */
 	g2d_write(g2d, ROT_CTL, 0x0);
 	g2d_write(g2d, ROT_INT, 0x0);
 	g2d_write(g2d, ROT_TIMEOUT, 0xFFFF);
-	
+
 	/* Disable MIXER to avoid interference */
 	g2d_write(g2d, G2D_MIXER_CTL, 0x00000000);
 	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
 	wmb();
-	
+
 	/* Get ROT format codes and bpp using unified format function */
 	int hw_src_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
 	if (hw_src_fmt < 0) {
-		dev_err(g2d->dev, "Unsupported ROT source format: %u\n", src_format);
+		dev_err(g2d->dev, "Unsupported ROT source format: %u\n",
+			src_format);
 		return -EINVAL;
 	}
-	rot_fmt = (u32)hw_src_fmt;  /* Hardware format code for ROT_IFMT */
-	
+	rot_fmt = (u32)hw_src_fmt; /* Hardware format code for ROT_IFMT */
+
 	/* Destination format should match source */
 	int hw_dst_fmt = sunxi_g2d_format_to_hw(dst_format, &dst_bpp);
 	if (hw_dst_fmt < 0) {
-		dev_err(g2d->dev, "Unsupported ROT destination format: %u\n", dst_format);
+		dev_err(g2d->dev, "Unsupported ROT destination format: %u\n",
+			dst_format);
 		return -EINVAL;
 	}
-	
+
 	/* Apply rotation flags (ROT_CTL bits 4-5) */
 	if (flags & G2D_BLIT_FLAG_ROTATE_90)
 		rot_ctl |= ROT_CTL_ROT_90;
@@ -4248,24 +4573,24 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 		rot_ctl |= ROT_CTL_ROT_180;
 	else if (flags & G2D_BLIT_FLAG_ROTATE_270)
 		rot_ctl |= ROT_CTL_ROT_270;
-	
+
 	/* Apply flip flags (ROT_CTL bits 6-7) */
 	if (flags & G2D_BLIT_FLAG_FLIP_V)
 		rot_ctl |= ROT_CTL_FLIP_V;
 	if (flags & G2D_BLIT_FLAG_FLIP_H)
 		rot_ctl |= ROT_CTL_FLIP_H;
-	
+
 	/* Calculate source address with offset */
 	src_offset_dma = src_dma + (src_y * src_pitch) + (src_x * src_bpp);
-	
+
 	/* Calculate destination address with offset */
 	dst_offset_dma = dst_dma + (dst_y * dst_pitch) + (dst_x * dst_bpp);
-	
+
 	/* Configure ROT input (source) - BSP format: (height-1 << 16) | width-1 */
 	g2d_write(g2d, ROT_IFMT, rot_fmt);
 	g2d_write(g2d, ROT_ISIZE, ((src_crop_h - 1) << 16) | (src_crop_w - 1));
 	g2d_write(g2d, ROT_IPITCH0, src_pitch);
-	g2d_write(g2d, ROT_IPITCH1, 0);  /* No U/V planes for RGB */
+	g2d_write(g2d, ROT_IPITCH1, 0); /* No U/V planes for RGB */
 	g2d_write(g2d, ROT_IPITCH2, 0);
 	g2d_write(g2d, ROT_ILADD0, lower_32_bits(src_offset_dma));
 	g2d_write(g2d, ROT_IHADD0, upper_32_bits(src_offset_dma));
@@ -4273,7 +4598,7 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, ROT_IHADD1, 0);
 	g2d_write(g2d, ROT_ILADD2, 0);
 	g2d_write(g2d, ROT_IHADD2, 0);
-	
+
 	/* Configure ROT output (destination) - BSP format: (height-1 << 16) | width-1 
 	 * NOTE: ROT has no OFMT register - output format is same as input
 	 * Output dimensions are adjusted for rotation (swapped for 90°/270°) */
@@ -4288,47 +4613,51 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
 	g2d_write(g2d, ROT_OLADD2, 0);
 	g2d_write(g2d, ROT_OHADD2, 0);
 	wmb();
-	
-	dev_dbg(g2d->dev, "ROT config: FMT=0x%x CTL=0x%x (flags=0x%x)\n", rot_fmt, rot_ctl, flags);
+
+	dev_dbg(g2d->dev, "ROT config: FMT=0x%x CTL=0x%x (flags=0x%x)\n",
+		rot_fmt, rot_ctl, flags);
 	dev_dbg(g2d->dev, "ROT sizes: in=%ux%u out=%ux%u (rotated=%d)\n",
-		 src_crop_w, src_crop_h, out_w, out_h, rotated_90_270);
+		src_crop_w, src_crop_h, out_w, out_h, rotated_90_270);
 	dev_dbg(g2d->dev, "ROT addresses: src=0x%llx dst=0x%llx\n",
-		 (u64)src_offset_dma, (u64)dst_offset_dma);
-	
+		(u64)src_offset_dma, (u64)dst_offset_dma);
+
 	/* Clear and enable ROT interrupt */
-	g2d_write(g2d, ROT_INT, ROT_INT_FINISH_EN);  /* Enable finish interrupt */
+	g2d_write(g2d, ROT_INT,
+		  ROT_INT_FINISH_EN); /* Enable finish interrupt */
 	atomic_set(&g2d->irq_done, 0);
-	
+
 	/* Write ROT_CTL with enable bit (BSP: write once at the beginning) */
 	g2d_write(g2d, ROT_CTL, rot_ctl);
 	wmb();
-	
+
 	/* Start ROT by setting bit 31 (BSP: read-modify-write) */
 	rot_ctl = g2d_read(g2d, ROT_CTL);
-	rot_ctl |= (1 << 31);  /* START bit */
+	rot_ctl |= (1 << 31); /* START bit */
 	g2d_write(g2d, ROT_CTL, rot_ctl);
 	wmb();
-	
+
 	dev_dbg(g2d->dev, "ROT started: CTL=0x%08x\n", rot_ctl);
-	
-	dev_dbg(g2d->dev, "ROT started: src=%ux%u -> dst=%ux%u\n",
-		 src_crop_w, src_crop_h, dst_w, dst_h);
-	
+
+	dev_dbg(g2d->dev, "ROT started: src=%ux%u -> dst=%ux%u\n", src_crop_w,
+		src_crop_h, dst_w, dst_h);
+
 	/* Wait for completion */
-	dev_dbg(g2d->dev, "ROT waiting for IRQ... irq_done=%d\n", atomic_read(&g2d->irq_done));
+	dev_dbg(g2d->dev, "ROT waiting for IRQ... irq_done=%d\n",
+		atomic_read(&g2d->irq_done));
 	timeout = wait_event_timeout(g2d->irq_wait,
-				      atomic_read(&g2d->irq_done) == 1,
-				      msecs_to_jiffies(1000));
-	
+				     atomic_read(&g2d->irq_done) == 1,
+				     msecs_to_jiffies(1000));
+
 	dev_dbg(g2d->dev, "ROT wait returned: timeout=%lu irq_done=%d\n",
-		 timeout, atomic_read(&g2d->irq_done));
-	
+		timeout, atomic_read(&g2d->irq_done));
+
 	if (timeout == 0) {
 		u32 status = g2d_read(g2d, ROT_INT);
-		dev_err(g2d->dev, "BLIT_ROT timeout (no IRQ), status=0x%08x\n", status);
+		dev_err(g2d->dev, "BLIT_ROT timeout (no IRQ), status=0x%08x\n",
+			status);
 		return -ETIMEDOUT;
 	}
-	
+
 	dev_dbg(g2d->dev, "BLIT_ROT completed via IRQ\n");
 	return 0;
 }
@@ -4350,68 +4679,61 @@ static int sunxi_g2d_do_blit_rot(struct sunxi_g2d_dev *g2d,
  * Alpha blending is enabled when:
  * - needs_alpha=true (auto-detected from alpha_mode or formats)
  */
-static int sunxi_g2d_do_blit_unified(struct sunxi_g2d_dev *g2d,
-				     dma_addr_t src_dma_addr, u32 src_w, u32 src_h,
-				     u32 src_pitch, u32 src_format,
-				     u32 src_x, u32 src_y, u32 src_crop_w, u32 src_crop_h,
-				     u8 src_alpha, u8 src_alpha_mode, u8 src_premul, u8 src_color_space,
-				     dma_addr_t dst_dma_addr, u32 dst_w, u32 dst_h,
-				     u32 dst_pitch, u32 dst_format,
-				     u32 dst_x, u32 dst_y, u32 blend_w, u32 blend_h,
-				     u8 dst_alpha, u8 dst_alpha_mode, u8 dst_premul, u8 dst_color_space,
-				     dma_addr_t out_dma_addr,  /* Explicit output buffer (may == dst_dma_addr) */
-				     u32 out_w, u32 out_h, u32 out_pitch, u32 out_format,  /* Output dimensions */
-				     u32 flags,
-				     u32 bld_mode,  /* Porter-Duff blend mode */
-				     u32 color_key_enable, u32 color_key_mode,
-				     u32 color_key_min, u32 color_key_max,
-				     bool needs_alpha, bool needs_rotation, bool needs_scaling)
+static int sunxi_g2d_do_blit_unified(
+	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma_addr, u32 src_w,
+	u32 src_h, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
+	u32 src_crop_w, u32 src_crop_h, u8 src_alpha, u8 src_alpha_mode,
+	u8 src_premul, u8 src_color_space, dma_addr_t dst_dma_addr, u32 dst_w,
+	u32 dst_h, u32 dst_pitch, u32 dst_format, u32 dst_x, u32 dst_y,
+	u32 blend_w, u32 blend_h, u8 dst_alpha, u8 dst_alpha_mode,
+	u8 dst_premul, u8 dst_color_space,
+	dma_addr_t
+		out_dma_addr, /* Explicit output buffer (may == dst_dma_addr) */
+	u32 out_w, u32 out_h, u32 out_pitch,
+	u32 out_format, /* Output dimensions */
+	u32 flags, u32 bld_mode, /* Porter-Duff blend mode */
+	u32 color_key_enable, u32 color_key_mode, u32 color_key_min,
+	u32 color_key_max, bool needs_alpha, bool needs_rotation,
+	bool needs_scaling)
 {
 	/* For now, delegate to existing implementations based on operation type
 	 * TODO: Consolidate into single implementation that enables/disables blocks as needed
 	 */
-	
+
 	if (needs_rotation) {
 		/* Rotation path - use ROT block (no scaling, blending ignored for now) */
-		return sunxi_g2d_do_blit_rot(g2d,
-					     src_dma_addr, src_w, src_h,
-					     src_pitch, src_format,
-					     src_x, src_y, src_crop_w, src_crop_h,
-					     out_dma_addr, out_w, out_h,  /* Write to out */
-					     out_pitch, out_format,
-					     dst_x, dst_y, blend_w, blend_h,
-					     flags);
+		return sunxi_g2d_do_blit_rot(g2d, src_dma_addr, src_w, src_h,
+					     src_pitch, src_format, src_x,
+					     src_y, src_crop_w, src_crop_h,
+					     out_dma_addr, out_w,
+					     out_h, /* Write to out */
+					     out_pitch, out_format, dst_x,
+					     dst_y, blend_w, blend_h, flags);
 	} else if (needs_alpha) {
 		/* Alpha blending path - can include scaling */
 		/* For 3-buffer approach: use explicit out dimensions */
-		return sunxi_g2d_do_blit_alpha_3buf(g2d,
-						    src_dma_addr, src_w, src_h,
-						    src_pitch, src_format,
-						    src_x, src_y, src_crop_w, src_crop_h,
-						    src_alpha, src_alpha_mode, src_premul, src_color_space,
-						    dst_dma_addr, dst_dma_addr, /* dst_base same as dst */
-						    dst_w, dst_h,
-						    dst_pitch, dst_format,
-						    dst_x, dst_y, blend_w, blend_h,
-						    dst_alpha, dst_alpha_mode, dst_premul, dst_color_space,
-						    out_dma_addr, /* Write to out (may == dst for in-place) */
-						    out_w, out_h,
-						    out_pitch, out_format,
-						    0, 0,  /* out_x, out_y */
-						    bld_mode,
-						    color_key_min, color_key_max, color_key_mode,
-						    NULL);  /* fence_out */
+		return sunxi_g2d_do_blit_alpha_3buf(
+			g2d, src_dma_addr, src_w, src_h, src_pitch, src_format,
+			src_x, src_y, src_crop_w, src_crop_h, src_alpha,
+			src_alpha_mode, src_premul, src_color_space,
+			dst_dma_addr, dst_dma_addr, /* dst_base same as dst */
+			dst_w, dst_h, dst_pitch, dst_format, dst_x, dst_y,
+			blend_w, blend_h, dst_alpha, dst_alpha_mode, dst_premul,
+			dst_color_space,
+			out_dma_addr, /* Write to out (may == dst for in-place) */
+			out_w, out_h, out_pitch, out_format, 0,
+			0, /* out_x, out_y */
+			bld_mode, color_key_min, color_key_max, color_key_mode,
+			0); /* fence_out */
 	} else {
 		/* Simple copy/scale path - use MIXER with optional VSU */
-		return sunxi_g2d_do_blit(g2d,
-					 src_dma_addr, src_w, src_h,
-					 src_pitch, src_format,
-					 src_x, src_y, src_crop_w, src_crop_h,
-					 src_color_space,
-					 out_dma_addr, out_w, out_h,  /* Write to out */
-					 out_pitch, out_format,
-					 dst_x, dst_y, blend_w, blend_h,
-					 dst_color_space);
+		return sunxi_g2d_do_blit(g2d, src_dma_addr, src_w, src_h,
+					 src_pitch, src_format, src_x, src_y,
+					 src_crop_w, src_crop_h,
+					 src_color_space, out_dma_addr, out_w,
+					 out_h, /* Write to out */
+					 out_pitch, out_format, dst_x, dst_y,
+					 blend_w, blend_h, dst_color_space);
 	}
 }
 
@@ -4432,46 +4754,52 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	struct sync_file *sync_file;
 	int fence_fd;
 	struct sunxi_g2d_job *job;
-	
+
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd))) {
 		dev_err(g2d->dev, "SCALE: copy_from_user failed\n");
 		return -EFAULT;
 	}
-	
+
 	/* Validate buffer formats */
 	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			cmd.src.format);
 		return -EINVAL;
 	}
 	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			cmd.dst.format);
 		return -EINVAL;
 	}
-	
+
 	/* Import source buffer */
 	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
 	if (IS_ERR(src_dmabuf)) {
-		dev_err(g2d->dev, "SCALE: dma_buf_get(src) failed: %ld\n", PTR_ERR(src_dmabuf));
+		dev_err(g2d->dev, "SCALE: dma_buf_get(src) failed: %ld\n",
+			PTR_ERR(src_dmabuf));
 		return PTR_ERR(src_dmabuf);
 	}
-	
+
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
-		dev_err(g2d->dev, "SCALE: dma_buf_attach(src) failed: %ld\n", PTR_ERR(src_attach));
+		dev_err(g2d->dev, "SCALE: dma_buf_attach(src) failed: %ld\n",
+			PTR_ERR(src_attach));
 		ret = PTR_ERR(src_attach);
 		goto err_put_src;
 	}
-	
+
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
-		dev_err(g2d->dev, "SCALE: dma_buf_map_attachment(src) failed: %ld\n", PTR_ERR(src_sgt));
+		dev_err(g2d->dev,
+			"SCALE: dma_buf_map_attachment(src) failed: %ld\n",
+			PTR_ERR(src_sgt));
 		ret = PTR_ERR(src_sgt);
 		goto err_detach_src;
 	}
-	
+
 	src_dma_addr = sg_dma_address(src_sgt->sgl);
-	
+
 	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0 */
 	if (src_dma_addr == 0 && src_sgt->nents > 0) {
 		struct scatterlist *sg = src_sgt->sgl;
@@ -4479,36 +4807,41 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		if (page) {
 			src_dma_addr = page_to_phys(page) + sg->offset;
 		} else {
-			dev_err(g2d->dev, "SCALE: Failed to get src physical address\n");
+			dev_err(g2d->dev,
+				"SCALE: Failed to get src physical address\n");
 			ret = -EINVAL;
 			goto err_unmap_src;
 		}
 	}
-	
+
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
-		dev_err(g2d->dev, "SCALE: dma_buf_get(dst) failed: %ld\n", PTR_ERR(dst_dmabuf));
+		dev_err(g2d->dev, "SCALE: dma_buf_get(dst) failed: %ld\n",
+			PTR_ERR(dst_dmabuf));
 		ret = PTR_ERR(dst_dmabuf);
 		goto err_unmap_src;
 	}
-	
+
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
-		dev_err(g2d->dev, "SCALE: dma_buf_attach(dst) failed: %ld\n", PTR_ERR(dst_attach));
+		dev_err(g2d->dev, "SCALE: dma_buf_attach(dst) failed: %ld\n",
+			PTR_ERR(dst_attach));
 		ret = PTR_ERR(dst_attach);
 		goto err_put_dst;
 	}
-	
+
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
 	if (IS_ERR(dst_sgt)) {
-		dev_err(g2d->dev, "SCALE: dma_buf_map_attachment(dst) failed: %ld\n", PTR_ERR(dst_sgt));
+		dev_err(g2d->dev,
+			"SCALE: dma_buf_map_attachment(dst) failed: %ld\n",
+			PTR_ERR(dst_sgt));
 		ret = PTR_ERR(dst_sgt);
 		goto err_detach_dst;
 	}
-	
+
 	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-	
+
 	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0 */
 	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
 		struct scatterlist *sg = dst_sgt->sgl;
@@ -4516,12 +4849,13 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		if (page) {
 			dst_dma_addr = page_to_phys(page) + sg->offset;
 		} else {
-			dev_err(g2d->dev, "SCALE: Failed to get dst physical address\n");
+			dev_err(g2d->dev,
+				"SCALE: Failed to get dst physical address\n");
 			ret = -EINVAL;
 			goto err_unmap_dst;
 		}
 	}
-	
+
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
@@ -4529,7 +4863,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Create sync_file for userspace */
 	sync_file = sync_file_create(fence);
 	if (!sync_file) {
@@ -4538,7 +4872,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		dev_err(g2d->dev, "SCALE: get_unused_fd failed\n");
@@ -4546,7 +4880,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = fence_fd;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Create async job */
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job) {
@@ -4556,7 +4890,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
 	job->g2d = g2d;
 	job->fence = fence;
@@ -4566,12 +4900,12 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->dst_attach = dst_attach;
 	job->src_sgt = src_sgt;
 	job->dst_sgt = dst_sgt;
-	
+
 	/* Setup job parameters */
 	job->type = G2D_JOB_CMD_SCALE;
 	job->src_dma = src_dma_addr;
 	job->dst_dma = dst_dma_addr;
-	
+
 	/* Fill blit data structure */
 	job->data.blit.src_width = cmd.src.width;
 	job->data.blit.src_height = cmd.src.height;
@@ -4582,7 +4916,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.src_crop_w = cmd.src.crop_w;
 	job->data.blit.src_crop_h = cmd.src.crop_h;
 	job->data.blit.src_color_space = cmd.src.color_space;
-	
+
 	job->data.blit.dst_width = cmd.dst.width;
 	job->data.blit.dst_height = cmd.dst.height;
 	job->data.blit.dst_pitch = cmd.dst.stride[0];
@@ -4592,7 +4926,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.dst_w = cmd.dst_w;
 	job->data.blit.dst_h = cmd.dst_h;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
-	
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -4600,21 +4934,21 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		list_add_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
 	}
-	
+
 	queue_work(g2d->job_wq, &g2d->job_work);
-	
+
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
-	
+
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
 		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
 		/* Job already enqueued, can't cleanly abort */
 		return -EFAULT;
 	}
-	
+
 	return 0;
-	
+
 err_unmap_dst:
 	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
 err_detach_dst:
@@ -4637,8 +4971,10 @@ err_put_src:
 static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 {
 	struct g2d_cmd cmd;
-	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
-	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL,
+		       *out_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL,
+				  *out_attach = NULL;
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
 	u32 src_bpp, dst_bpp, out_bpp;
@@ -4647,144 +4983,152 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	struct sync_file *sync_file;
 	int fence_fd;
 	struct sunxi_g2d_job *job;
-	
+
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
-	
+
 	/* Validate buffer formats */
 	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			cmd.src.format);
 		return -EINVAL;
 	}
 	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			cmd.dst.format);
 		return -EINVAL;
 	}
 	if (sunxi_g2d_format_to_hw(cmd.out.format, &out_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported output format: %u\n", cmd.out.format);
+		dev_err(g2d->dev, "Unsupported output format: %u\n",
+			cmd.out.format);
 		return -EINVAL;
 	}
-	
+
 	/* BLEND requires output buffer */
 	if (cmd.out.dma_fd < 0) {
 		dev_err(g2d->dev, "G2D_CMD_BLEND requires valid out.dma_fd\n");
 		return -EINVAL;
 	}
-	
+
 	/* Validate blend mode */
 	if (cmd.params.blend.bld_mode > G2D_BLD_XOR) {
-		dev_err(g2d->dev, "Invalid blend mode: %u\n", cmd.params.blend.bld_mode);
+		dev_err(g2d->dev, "Invalid blend mode: %u\n",
+			cmd.params.blend.bld_mode);
 		return -EINVAL;
 	}
-	
+
 	/* G2D_CMD_BLEND does ONLY blending, NO scaling
 	 * If scaling is needed, use G2D_CMD_SCALE first, then BLEND
 	 */
 	if (cmd.src.crop_w != cmd.dst_w || cmd.src.crop_h != cmd.dst_h) {
-		dev_err(g2d->dev, "BLEND requires no scaling (use SCALE first): src_crop=%ux%u dst=%ux%u\n",
-		       cmd.src.crop_w, cmd.src.crop_h, cmd.dst_w, cmd.dst_h);
+		dev_err(g2d->dev,
+			"BLEND requires no scaling (use SCALE first): src_crop=%ux%u dst=%ux%u\n",
+			cmd.src.crop_w, cmd.src.crop_h, cmd.dst_w, cmd.dst_h);
 		return -EINVAL;
 	}
-	
+
 	/* Import source buffer */
 	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
 	if (IS_ERR(src_dmabuf))
 		return PTR_ERR(src_dmabuf);
-	
+
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
 		goto err_put_src;
 	}
-	
+
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
 		goto err_detach_src;
 	}
-	
+
 	src_dma_addr = sg_dma_address(src_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (src_dma_addr == 0 && src_sgt->nents > 0) {
 		struct page *page = sg_page(src_sgt->sgl);
 		if (page)
-			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+			src_dma_addr =
+				page_to_phys(page) + src_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_src;
 		}
 	}
-	
+
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
 		goto err_unmap_src;
 	}
-	
+
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
 		goto err_put_dst;
 	}
-	
+
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_TO_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
 		goto err_detach_dst;
 	}
-	
+
 	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
 		struct page *page = sg_page(dst_sgt->sgl);
 		if (page)
-			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+			dst_dma_addr =
+				page_to_phys(page) + dst_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_dst;
 		}
 	}
-	
+
 	/* Import output buffer */
 	out_dmabuf = dma_buf_get(cmd.out.dma_fd);
 	if (IS_ERR(out_dmabuf)) {
 		ret = PTR_ERR(out_dmabuf);
 		goto err_unmap_dst;
 	}
-	
+
 	out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
 	if (IS_ERR(out_attach)) {
 		ret = PTR_ERR(out_attach);
 		goto err_put_out;
 	}
-	
+
 	out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
 	if (IS_ERR(out_sgt)) {
 		ret = PTR_ERR(out_sgt);
 		goto err_detach_out;
 	}
-	
+
 	out_dma_addr = sg_dma_address(out_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (out_dma_addr == 0 && out_sgt->nents > 0) {
 		struct page *page = sg_page(out_sgt->sgl);
 		if (page)
-			out_dma_addr = page_to_phys(page) + out_sgt->sgl->offset;
+			out_dma_addr =
+				page_to_phys(page) + out_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_out;
 		}
 	}
-	
+
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
 		goto err_unmap_out;
 	}
-	
+
 	/* Create sync_file for userspace */
 	sync_file = sync_file_create(fence);
 	if (!sync_file) {
@@ -4792,14 +5136,14 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_out;
 	}
-	
+
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
 		goto err_unmap_out;
 	}
-	
+
 	/* Create async job */
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job) {
@@ -4808,7 +5152,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_out;
 	}
-	
+
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
 	job->g2d = g2d;
 	job->fence = fence;
@@ -4821,13 +5165,13 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->src_sgt = src_sgt;
 	job->dst_sgt = dst_sgt;
 	job->out_sgt = out_sgt;
-	
+
 	/* Setup job parameters */
 	job->type = G2D_JOB_CMD_BLEND;
 	job->src_dma = src_dma_addr;
 	job->dst_dma = dst_dma_addr;
 	job->out_dma = out_dma_addr;
-	
+
 	/* Fill blit data structure */
 	job->data.blit.src_width = cmd.src.width;
 	job->data.blit.src_height = cmd.src.height;
@@ -4841,7 +5185,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
 	job->data.blit.src_premul = cmd.src.premul_mode;
 	job->data.blit.src_color_space = cmd.src.color_space;
-	
+
 	job->data.blit.dst_width = cmd.dst.width;
 	job->data.blit.dst_height = cmd.dst.height;
 	job->data.blit.dst_pitch = cmd.dst.stride[0];
@@ -4854,14 +5198,14 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
 	job->data.blit.dst_premul = cmd.dst.premul_mode;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
-	
+
 	job->data.blit.out_width = cmd.out.width;
 	job->data.blit.out_height = cmd.out.height;
 	job->data.blit.out_pitch = cmd.out.stride[0];
 	job->data.blit.out_format = cmd.out.format;
-	
+
 	job->data.blit.bld_mode = cmd.params.blend.bld_mode;
-	
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -4869,23 +5213,24 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		list_add_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
 	}
-	
+
 	queue_work(g2d->job_wq, &g2d->job_work);
-	
+
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
-	
+
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
 		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
 		/* Job already enqueued, can't cleanly abort */
 		return -EFAULT;
 	}
-	
-	dev_dbg(g2d->dev, "G2D_CMD_BLEND: enqueued job, fence_fd=%d\n", fence_fd);
-	
+
+	dev_dbg(g2d->dev, "G2D_CMD_BLEND: enqueued job, fence_fd=%d\n",
+		fence_fd);
+
 	return 0;
-	
+
 err_unmap_out:
 	dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
 err_detach_out:
@@ -4925,21 +5270,23 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	struct sync_file *sync_file;
 	int fence_fd;
 	struct sunxi_g2d_job *job;
-	
+
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
-	
+
 	/* Validate buffer formats */
 	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			cmd.src.format);
 		return -EINVAL;
 	}
 	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			cmd.dst.format);
 		return -EINVAL;
 	}
-	
+
 	/* Validate and convert rotation angle to flags */
 	switch (cmd.params.rotate.angle) {
 	case 0:
@@ -4955,83 +5302,86 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		flags |= G2D_BLIT_FLAG_ROTATE_270;
 		break;
 	default:
-		dev_err(g2d->dev, "Invalid rotation angle: %u (must be 0, 90, 180, or 270)\n",
+		dev_err(g2d->dev,
+			"Invalid rotation angle: %u (must be 0, 90, 180, or 270)\n",
 			cmd.params.rotate.angle);
 		return -EINVAL;
 	}
-	
+
 	if (cmd.params.rotate.flip_h)
 		flags |= G2D_BLIT_FLAG_FLIP_H;
 	if (cmd.params.rotate.flip_v)
 		flags |= G2D_BLIT_FLAG_FLIP_V;
-	
+
 	/* Import source buffer */
 	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
 	if (IS_ERR(src_dmabuf))
 		return PTR_ERR(src_dmabuf);
-	
+
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
 		goto err_put_src;
 	}
-	
+
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
 		goto err_detach_src;
 	}
-	
+
 	src_dma_addr = sg_dma_address(src_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (src_dma_addr == 0 && src_sgt->nents > 0) {
 		struct page *page = sg_page(src_sgt->sgl);
 		if (page)
-			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+			src_dma_addr =
+				page_to_phys(page) + src_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_src;
 		}
 	}
-	
+
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
 		goto err_unmap_src;
 	}
-	
+
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
 		goto err_put_dst;
 	}
-	
+
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
 		goto err_detach_dst;
 	}
-	
+
 	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
 		struct page *page = sg_page(dst_sgt->sgl);
 		if (page)
-			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+			dst_dma_addr =
+				page_to_phys(page) + dst_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_dst;
 		}
 	}
-	
+
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Create sync_file for userspace */
 	sync_file = sync_file_create(fence);
 	if (!sync_file) {
@@ -5039,14 +5389,14 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Create async job */
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job) {
@@ -5055,7 +5405,7 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
 	job->g2d = g2d;
 	job->fence = fence;
@@ -5065,12 +5415,12 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->dst_attach = dst_attach;
 	job->src_sgt = src_sgt;
 	job->dst_sgt = dst_sgt;
-	
+
 	/* Setup job parameters */
 	job->type = G2D_JOB_CMD_ROTATE;
 	job->src_dma = src_dma_addr;
 	job->dst_dma = dst_dma_addr;
-	
+
 	/* Fill blit data structure */
 	job->data.blit.src_width = cmd.src.width;
 	job->data.blit.src_height = cmd.src.height;
@@ -5081,7 +5431,7 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.src_crop_w = cmd.src.crop_w;
 	job->data.blit.src_crop_h = cmd.src.crop_h;
 	job->data.blit.src_color_space = cmd.src.color_space;
-	
+
 	job->data.blit.dst_width = cmd.dst.width;
 	job->data.blit.dst_height = cmd.dst.height;
 	job->data.blit.dst_pitch = cmd.dst.stride[0];
@@ -5091,9 +5441,9 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.dst_w = cmd.dst_w;
 	job->data.blit.dst_h = cmd.dst_h;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
-	
+
 	job->data.blit.flags = flags;
-	
+
 	/* Enqueue job to worker */
 	{
 		unsigned long iflags;
@@ -5101,24 +5451,26 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		list_add_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, iflags);
 	}
-	
+
 	queue_work(g2d->job_wq, &g2d->job_work);
-	
+
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
-	
+
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
 		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
 		/* Job already enqueued, can't cleanly abort */
 		return -EFAULT;
 	}
-	
-	dev_dbg(g2d->dev, "G2D_CMD_ROTATE: enqueued job, fence_fd=%d angle=%u flip_h=%u flip_v=%u\n",
-		fence_fd, cmd.params.rotate.angle, cmd.params.rotate.flip_h, cmd.params.rotate.flip_v);
-	
+
+	dev_dbg(g2d->dev,
+		"G2D_CMD_ROTATE: enqueued job, fence_fd=%d angle=%u flip_h=%u flip_v=%u\n",
+		fence_fd, cmd.params.rotate.angle, cmd.params.rotate.flip_h,
+		cmd.params.rotate.flip_v);
+
 	return 0;
-	
+
 err_unmap_dst:
 	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
 err_detach_dst:
@@ -5141,8 +5493,10 @@ err_put_src:
 static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 {
 	struct g2d_cmd cmd;
-	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
-	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL,
+		       *out_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL,
+				  *out_attach = NULL;
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
 	u32 src_bpp, dst_bpp, out_bpp;
@@ -5152,91 +5506,97 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	int fence_fd;
 	struct sunxi_g2d_job *job;
 	bool has_out_buffer;
-	
+
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
-	
+
 	/* Validate buffer formats */
 	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			cmd.src.format);
 		return -EINVAL;
 	}
 	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			cmd.dst.format);
 		return -EINVAL;
 	}
-	
+
 	/* Check if output buffer is provided */
 	has_out_buffer = (cmd.out.dma_fd >= 0);
-	
+
 	if (has_out_buffer) {
 		if (sunxi_g2d_format_to_hw(cmd.out.format, &out_bpp) < 0) {
-			dev_err(g2d->dev, "Unsupported output format: %u\n", cmd.out.format);
+			dev_err(g2d->dev, "Unsupported output format: %u\n",
+				cmd.out.format);
 			return -EINVAL;
 		}
 	}
-	
+
 	/* Import source buffer */
 	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
 	if (IS_ERR(src_dmabuf))
 		return PTR_ERR(src_dmabuf);
-	
+
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
 		goto err_put_src;
 	}
-	
+
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
 		goto err_detach_src;
 	}
-	
+
 	src_dma_addr = sg_dma_address(src_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (src_dma_addr == 0 && src_sgt->nents > 0) {
 		struct page *page = sg_page(src_sgt->sgl);
 		if (page)
-			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+			src_dma_addr =
+				page_to_phys(page) + src_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_src;
 		}
 	}
-	
+
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
 		goto err_unmap_src;
 	}
-	
+
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
 		goto err_put_dst;
 	}
-	
-	dst_sgt = dma_buf_map_attachment(dst_attach, has_out_buffer ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+
+	dst_sgt = dma_buf_map_attachment(
+		dst_attach, has_out_buffer ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
 		goto err_detach_dst;
 	}
-	
+
 	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
 		struct page *page = sg_page(dst_sgt->sgl);
 		if (page)
-			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+			dst_dma_addr =
+				page_to_phys(page) + dst_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_dst;
 		}
 	}
-	
+
 	/* Import output buffer if provided */
 	if (has_out_buffer) {
 		out_dmabuf = dma_buf_get(cmd.out.dma_fd);
@@ -5244,25 +5604,26 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			ret = PTR_ERR(out_dmabuf);
 			goto err_unmap_dst;
 		}
-		
+
 		out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
 		if (IS_ERR(out_attach)) {
 			ret = PTR_ERR(out_attach);
 			goto err_put_out;
 		}
-		
+
 		out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
 		if (IS_ERR(out_sgt)) {
 			ret = PTR_ERR(out_sgt);
 			goto err_detach_out;
 		}
-		
+
 		out_dma_addr = sg_dma_address(out_sgt->sgl);
 		/* Workaround for T113-S3 without IOMMU */
 		if (out_dma_addr == 0 && out_sgt->nents > 0) {
 			struct page *page = sg_page(out_sgt->sgl);
 			if (page)
-				out_dma_addr = page_to_phys(page) + out_sgt->sgl->offset;
+				out_dma_addr = page_to_phys(page) +
+					       out_sgt->sgl->offset;
 			else {
 				ret = -EINVAL;
 				goto err_unmap_out;
@@ -5272,14 +5633,14 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		/* No output buffer - mask in-place (dst is both input and output) */
 		out_dma_addr = dst_dma_addr;
 	}
-	
+
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
 		goto err_unmap_out;
 	}
-	
+
 	/* Create sync_file for userspace */
 	sync_file = sync_file_create(fence);
 	if (!sync_file) {
@@ -5287,14 +5648,14 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_out;
 	}
-	
+
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
 		goto err_unmap_out;
 	}
-	
+
 	/* Create async job */
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job) {
@@ -5303,7 +5664,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_out;
 	}
-	
+
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
 	job->g2d = g2d;
 	job->fence = fence;
@@ -5313,19 +5674,19 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->dst_attach = dst_attach;
 	job->src_sgt = src_sgt;
 	job->dst_sgt = dst_sgt;
-	
+
 	if (has_out_buffer) {
 		job->out_dmabuf = out_dmabuf;
 		job->out_attach = out_attach;
 		job->out_sgt = out_sgt;
 	}
-	
+
 	/* Setup job parameters */
 	job->type = G2D_JOB_CMD_MASK;
 	job->src_dma = src_dma_addr;
 	job->dst_dma = dst_dma_addr;
 	job->out_dma = out_dma_addr;
-	
+
 	/* Fill blit data structure */
 	job->data.blit.src_width = cmd.src.width;
 	job->data.blit.src_height = cmd.src.height;
@@ -5339,7 +5700,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
 	job->data.blit.src_premul = cmd.src.premul_mode;
 	job->data.blit.src_color_space = cmd.src.color_space;
-	
+
 	job->data.blit.dst_width = cmd.dst.width;
 	job->data.blit.dst_height = cmd.dst.height;
 	job->data.blit.dst_pitch = cmd.dst.stride[0];
@@ -5352,7 +5713,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
 	job->data.blit.dst_premul = cmd.dst.premul_mode;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
-	
+
 	if (has_out_buffer) {
 		job->data.blit.out_width = cmd.out.width;
 		job->data.blit.out_height = cmd.out.height;
@@ -5365,16 +5726,16 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.out_pitch = cmd.dst.stride[0];
 		job->data.blit.out_format = cmd.dst.format;
 	}
-	
+
 	/* Color keying parameters */
 	job->data.blit.color_key_enable = 1;
 	job->data.blit.color_key_mode = cmd.params.mask.color_key_mode;
 	job->data.blit.color_key_min = cmd.params.mask.color_key_min;
 	job->data.blit.color_key_max = cmd.params.mask.color_key_max;
-	
+
 	/* Use SRCOVER blend mode for masking */
 	job->data.blit.bld_mode = G2D_BLD_SRCOVER;
-	
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -5382,23 +5743,24 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		list_add_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
 	}
-	
+
 	queue_work(g2d->job_wq, &g2d->job_work);
-	
+
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
-	
+
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
 		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
 		/* Job already enqueued, can't cleanly abort */
 		return -EFAULT;
 	}
-	
-	dev_dbg(g2d->dev, "G2D_CMD_MASK: enqueued job, fence_fd=%d\n", fence_fd);
-	
+
+	dev_dbg(g2d->dev, "G2D_CMD_MASK: enqueued job, fence_fd=%d\n",
+		fence_fd);
+
 	return 0;
-	
+
 err_unmap_out:
 	if (has_out_buffer)
 		dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
@@ -5409,7 +5771,9 @@ err_put_out:
 	if (has_out_buffer)
 		dma_buf_put(out_dmabuf);
 err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt, has_out_buffer ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+	dma_buf_unmap_attachment(dst_attach, dst_sgt,
+				 has_out_buffer ? DMA_TO_DEVICE :
+						  DMA_FROM_DEVICE);
 err_detach_dst:
 	dma_buf_detach(dst_dmabuf, dst_attach);
 err_put_dst:
@@ -5440,94 +5804,99 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	struct sync_file *sync_file;
 	int fence_fd;
 	struct sunxi_g2d_job *job;
-	
+
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
-	
+
 	/* Validate buffer formats */
 	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", cmd.src.format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			cmd.src.format);
 		return -EINVAL;
 	}
 	if (sunxi_g2d_format_to_hw(cmd.dst.format, &dst_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", cmd.dst.format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			cmd.dst.format);
 		return -EINVAL;
 	}
-	
+
 	/* Validate dimensions - for COPY, no scaling allowed */
 	if (cmd.src.crop_w != cmd.dst_w || cmd.src.crop_h != cmd.dst_h) {
-		dev_err(g2d->dev, "G2D_CMD_COPY requires src crop size == dst size (no scaling)\n");
+		dev_err(g2d->dev,
+			"G2D_CMD_COPY requires src crop size == dst size (no scaling)\n");
 		return -EINVAL;
 	}
-	
+
 	/* Import source buffer */
 	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
 	if (IS_ERR(src_dmabuf))
 		return PTR_ERR(src_dmabuf);
-	
+
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
 		goto err_put_src;
 	}
-	
+
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
 		goto err_detach_src;
 	}
-	
+
 	src_dma_addr = sg_dma_address(src_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (src_dma_addr == 0 && src_sgt->nents > 0) {
 		struct page *page = sg_page(src_sgt->sgl);
 		if (page)
-			src_dma_addr = page_to_phys(page) + src_sgt->sgl->offset;
+			src_dma_addr =
+				page_to_phys(page) + src_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_src;
 		}
 	}
-	
+
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
 		goto err_unmap_src;
 	}
-	
+
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
 		goto err_put_dst;
 	}
-	
+
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
 		goto err_detach_dst;
 	}
-	
+
 	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
 	/* Workaround for T113-S3 without IOMMU */
 	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
 		struct page *page = sg_page(dst_sgt->sgl);
 		if (page)
-			dst_dma_addr = page_to_phys(page) + dst_sgt->sgl->offset;
+			dst_dma_addr =
+				page_to_phys(page) + dst_sgt->sgl->offset;
 		else {
 			ret = -EINVAL;
 			goto err_unmap_dst;
 		}
 	}
-	
+
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Create sync_file for userspace */
 	sync_file = sync_file_create(fence);
 	if (!sync_file) {
@@ -5535,14 +5904,14 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Create async job */
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job) {
@@ -5551,7 +5920,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -ENOMEM;
 		goto err_unmap_dst;
 	}
-	
+
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
 	job->g2d = g2d;
 	job->fence = fence;
@@ -5561,12 +5930,12 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->dst_attach = dst_attach;
 	job->src_sgt = src_sgt;
 	job->dst_sgt = dst_sgt;
-	
+
 	/* Setup job parameters */
 	job->type = G2D_JOB_CMD_COPY;
 	job->src_dma = src_dma_addr;
 	job->dst_dma = dst_dma_addr;
-	
+
 	/* Fill blit data structure */
 	job->data.blit.src_width = cmd.src.width;
 	job->data.blit.src_height = cmd.src.height;
@@ -5577,7 +5946,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.src_crop_w = cmd.src.crop_w;
 	job->data.blit.src_crop_h = cmd.src.crop_h;
 	job->data.blit.src_color_space = cmd.src.color_space;
-	
+
 	job->data.blit.dst_width = cmd.dst.width;
 	job->data.blit.dst_height = cmd.dst.height;
 	job->data.blit.dst_pitch = cmd.dst.stride[0];
@@ -5587,7 +5956,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->data.blit.dst_w = cmd.dst_w;
 	job->data.blit.dst_h = cmd.dst_h;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
-	
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -5595,23 +5964,24 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		list_add_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
 	}
-	
+
 	queue_work(g2d->job_wq, &g2d->job_work);
-	
+
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
-	
+
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
 		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
 		/* Job already enqueued, can't cleanly abort */
 		return -EFAULT;
 	}
-	
-	dev_dbg(g2d->dev, "G2D_CMD_COPY: enqueued job, fence_fd=%d\n", fence_fd);
-	
+
+	dev_dbg(g2d->dev, "G2D_CMD_COPY: enqueued job, fence_fd=%d\n",
+		fence_fd);
+
 	return 0;
-	
+
 err_unmap_dst:
 	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
 err_detach_dst:
@@ -5634,16 +6004,16 @@ err_put_src:
 static long sunxi_g2d_ioctl_cmd(struct sunxi_g2d_dev *g2d, unsigned long arg)
 {
 	struct g2d_cmd cmd;
-	
+
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
-	
+
 	/* Validate command type */
 	if (cmd.cmd_type > G2D_CMD_MASK) {
 		dev_err(g2d->dev, "Invalid cmd_type: %u\n", cmd.cmd_type);
 		return -EINVAL;
 	}
-	
+
 	/* Dispatch to command-specific handler */
 	switch (cmd.cmd_type) {
 	case G2D_CMD_COPY:
@@ -5665,8 +6035,10 @@ static long sunxi_g2d_ioctl_cmd(struct sunxi_g2d_dev *g2d, unsigned long arg)
 static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 {
 	struct g2d_blit blit;
-	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL, *out_dmabuf = NULL;
-	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL, *out_attach = NULL;
+	struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL,
+		       *out_dmabuf = NULL;
+	struct dma_buf_attachment *src_attach = NULL, *dst_attach = NULL,
+				  *out_attach = NULL;
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
 	u32 src_bpp, dst_bpp;
@@ -5678,39 +6050,41 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	int fence_fd = -1;
 	unsigned long flags;
 	int ret;
-	
+
 	if (copy_from_user(&blit, (void __user *)arg, sizeof(blit)))
 		return -EFAULT;
-	
+
 	/* Validate parameters */
 	if (blit.src.width == 0 || blit.src.height == 0 ||
-	    blit.dst.width == 0 || blit.dst.height == 0 ||
-	    blit.dst_w == 0 || blit.dst_h == 0) {
+	    blit.dst.width == 0 || blit.dst.height == 0 || blit.dst_w == 0 ||
+	    blit.dst_h == 0) {
 		dev_err(g2d->dev, "Invalid dimensions\n");
 		return -EINVAL;
 	}
-	
-	if (blit.src.width > G2D_MAX_WIDTH || blit.src.height > G2D_MAX_HEIGHT ||
-	    blit.dst.width > G2D_MAX_WIDTH || blit.dst.height > G2D_MAX_HEIGHT ||
-	    blit.dst_w > G2D_MAX_WIDTH || blit.dst_h > G2D_MAX_HEIGHT) {
+
+	if (blit.src.width > G2D_MAX_WIDTH ||
+	    blit.src.height > G2D_MAX_HEIGHT ||
+	    blit.dst.width > G2D_MAX_WIDTH ||
+	    blit.dst.height > G2D_MAX_HEIGHT || blit.dst_w > G2D_MAX_WIDTH ||
+	    blit.dst_h > G2D_MAX_HEIGHT) {
 		dev_err(g2d->dev, "Dimensions exceed maximum %dx%d\n",
 			G2D_MAX_WIDTH, G2D_MAX_HEIGHT);
 		return -EINVAL;
 	}
-	
+
 	/* For now, only support DMA-BUF mode */
 	if (blit.src.dma_fd < 0 || blit.dst.dma_fd < 0) {
 		dev_err(g2d->dev, "Physical address mode not supported yet\n");
 		return -EINVAL;
 	}
-	
-	dev_dbg(g2d->dev, "BLIT: src=%ux%u fmt=%u (alpha=%u mode=%u) -> dst=%u,%u,%ux%u fmt=%u (alpha=%u mode=%u) flags=0x%x\n",
-			blit.src.width, blit.src.height, blit.src.format,
-			blit.src.alpha, blit.src.alpha_mode,
-			blit.dst_x, blit.dst_y, blit.dst_w, blit.dst_h, blit.dst.format,
-			blit.dst.alpha, blit.dst.alpha_mode,
-			blit.flags);
-	
+
+	dev_dbg(g2d->dev,
+		"BLIT: src=%ux%u fmt=%u (alpha=%u mode=%u) -> dst=%u,%u,%ux%u fmt=%u (alpha=%u mode=%u) flags=0x%x\n",
+		blit.src.width, blit.src.height, blit.src.format,
+		blit.src.alpha, blit.src.alpha_mode, blit.dst_x, blit.dst_y,
+		blit.dst_w, blit.dst_h, blit.dst.format, blit.dst.alpha,
+		blit.dst.alpha_mode, blit.flags);
+
 	/* Import source DMA-BUF */
 	src_dmabuf = dma_buf_get(blit.src.dma_fd);
 	if (IS_ERR(src_dmabuf)) {
@@ -5718,21 +6092,21 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		dev_err(g2d->dev, "Failed to get source dma_buf: %d\n", ret);
 		return ret;
 	}
-	
+
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
 		dev_err(g2d->dev, "Failed to attach source dma_buf: %d\n", ret);
 		goto err_put_src_dmabuf;
 	}
-	
+
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
 		dev_err(g2d->dev, "Failed to map source dma_buf: %d\n", ret);
 		goto err_detach_src;
 	}
-	
+
 	src_dma_addr = sg_dma_address(src_sgt->sgl);
 	if (!src_dma_addr) {
 		/* Fallback to physical address if DMA address not set */
@@ -5742,71 +6116,79 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	/* If userspace provided an input fence fd, wait on it first */
 	if (blit.fence_fd_in >= 0) {
 		dev_dbg(g2d->dev, "blit: importing input fence fd=%d pid=%d\n",
-				blit.fence_fd_in, task_tgid_nr(current));
-		struct dma_fence *in_fence = sync_file_get_fence(blit.fence_fd_in);
+			blit.fence_fd_in, task_tgid_nr(current));
+		struct dma_fence *in_fence =
+			sync_file_get_fence(blit.fence_fd_in);
 		if (!in_fence) {
 			ret = -EINVAL;
 			goto err_unmap_src;
 		}
 		dev_dbg(g2d->dev, "blit: got in_fence=%p signaled=%d\n",
-				 in_fence, dma_fence_is_signaled(in_fence));
+			in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_wait(in_fence, false);
 		dev_dbg(g2d->dev, "blit: in_fence=%p wait done signaled=%d\n",
-				 in_fence, dma_fence_is_signaled(in_fence));
+			in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_put(in_fence);
 	}
-	
+
 	/* Import destination DMA-BUF */
 	dst_dmabuf = dma_buf_get(blit.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
-		dev_err(g2d->dev, "Failed to get destination dma_buf: %d\n", ret);
+		dev_err(g2d->dev, "Failed to get destination dma_buf: %d\n",
+			ret);
 		goto err_unmap_src;
 	}
-	
+
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
-		dev_err(g2d->dev, "Failed to attach destination dma_buf: %d\n", ret);
+		dev_err(g2d->dev, "Failed to attach destination dma_buf: %d\n",
+			ret);
 		goto err_put_dst_dmabuf;
 	}
-	
+
 	/* For alpha blending, destination needs BIDIRECTIONAL since we read background and write result */
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_BIDIRECTIONAL);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
-		dev_err(g2d->dev, "Failed to map destination dma_buf: %d\n", ret);
+		dev_err(g2d->dev, "Failed to map destination dma_buf: %d\n",
+			ret);
 		goto err_detach_dst;
 	}
-	
+
 	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
 	if (!dst_dma_addr) {
 		/* Fallback to physical address if DMA address not set */
 		dst_dma_addr = sg_phys(dst_sgt->sgl);
 	}
-	
+
 	/* Calculate bytes per pixel for source using format conversion helper */
 	if (sunxi_g2d_format_to_hw(blit.src.format, &src_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported source format: %u\n", blit.src.format);
+		dev_err(g2d->dev, "Unsupported source format: %u\n",
+			blit.src.format);
 		ret = -EINVAL;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Calculate bytes per pixel for destination using format conversion helper */
 	if (sunxi_g2d_format_to_hw(blit.dst.format, &dst_bpp) < 0) {
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", blit.dst.format);
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			blit.dst.format);
 		ret = -EINVAL;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Calculate pitch (stride) */
-	src_pitch = blit.src.stride[0] ? blit.src.stride[0] : (blit.src.width * src_bpp);
-	dst_pitch = blit.dst.stride[0] ? blit.dst.stride[0] : (blit.dst.width * dst_bpp);
-	
+	src_pitch = blit.src.stride[0] ? blit.src.stride[0] :
+					 (blit.src.width * src_bpp);
+	dst_pitch = blit.dst.stride[0] ? blit.dst.stride[0] :
+					 (blit.dst.width * dst_bpp);
+
 	/* Calculate crop region (default to full source if not specified) */
 	src_crop_w = blit.src.crop_w ? blit.src.crop_w : blit.src.width;
 	src_crop_h = blit.src.crop_h ? blit.src.crop_h : blit.src.height;
-	
+
 	/* Validate crop region */
 	if (blit.src.crop_x + src_crop_w > blit.src.width ||
 	    blit.src.crop_y + src_crop_h > blit.src.height) {
@@ -5814,7 +6196,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -EINVAL;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Validate destination position */
 	if (blit.dst_x + blit.dst_w > blit.dst.width ||
 	    blit.dst_y + blit.dst_h > blit.dst.height) {
@@ -5822,51 +6204,56 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		ret = -EINVAL;
 		goto err_unmap_dst;
 	}
-	
+
 	/* Import output buffer if provided (for 3-buffer operations) */
 	if (blit.out.dma_fd >= 0) {
 		out_dmabuf = dma_buf_get(blit.out.dma_fd);
 		if (IS_ERR(out_dmabuf)) {
 			ret = PTR_ERR(out_dmabuf);
-			dev_err(g2d->dev, "Failed to get output dma_buf: %d\n", ret);
+			dev_err(g2d->dev, "Failed to get output dma_buf: %d\n",
+				ret);
 			goto err_unmap_dst;
 		}
-		
+
 		out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
 		if (IS_ERR(out_attach)) {
 			ret = PTR_ERR(out_attach);
-			dev_err(g2d->dev, "Failed to attach output dma_buf: %d\n", ret);
+			dev_err(g2d->dev,
+				"Failed to attach output dma_buf: %d\n", ret);
 			goto err_put_out_dmabuf;
 		}
-		
+
 		out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
 		if (IS_ERR(out_sgt)) {
 			ret = PTR_ERR(out_sgt);
-			dev_err(g2d->dev, "Failed to map output dma_buf: %d\n", ret);
+			dev_err(g2d->dev, "Failed to map output dma_buf: %d\n",
+				ret);
 			goto err_detach_out;
 		}
-		
+
 		out_dma_addr = sg_dma_address(out_sgt->sgl);
 		if (!out_dma_addr) {
 			/* Fallback to physical address if DMA address not set */
 			out_dma_addr = sg_phys(out_sgt->sgl);
 		}
-		
-		dev_dbg(g2d->dev, "3-buffer operation: out buffer imported (fd=%d addr=0x%llx)\n",
-			 blit.out.dma_fd, (u64)out_dma_addr);
+
+		dev_dbg(g2d->dev,
+			"3-buffer operation: out buffer imported (fd=%d addr=0x%llx)\n",
+			blit.out.dma_fd, (u64)out_dma_addr);
 	} else {
 		/* No explicit out buffer - write to dst (in-place operation) */
 		out_dma_addr = dst_dma_addr;
 	}
-	
+
 	/* Calculate output buffer pitch */
 	bool has_out_buffer = (blit.out.dma_fd >= 0);
 	if (has_out_buffer) {
-		out_pitch = blit.out.stride[0] ? blit.out.stride[0] : (blit.out.width * dst_bpp);
+		out_pitch = blit.out.stride[0] ? blit.out.stride[0] :
+						 (blit.out.width * dst_bpp);
 	} else {
 		out_pitch = dst_pitch;
 	}
-	
+
 	/* Determine operation requirements:
 	 * - Alpha blending: Auto-detected from:
 	 *   1. Presence of out buffer (3-buffer operation = blending)
@@ -5885,7 +6272,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	 * - Scaling only (no blending, no rotation)
 	 * - Rotation only (no scaling, no blending)
 	 */
-	
+
 	/* Auto-detect alpha blending need:
 	 * - 3-buffer operation (out.dma_fd >= 0) always needs blending
 	 * - ARGB format with PIXEL_ALPHA mode needs blending
@@ -5893,36 +6280,296 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	 */
 	bool src_has_alpha_format = (blit.src.format == G2D_FMT_ARGB8888 ||
 				     blit.src.format == G2D_FMT_ABGR8888);
-	bool needs_alpha = has_out_buffer ||  /* 3-buffer = blending */
-			   (src_has_alpha_format && blit.src.alpha_mode == G2D_PIXEL_ALPHA) ||
-			   (blit.src.alpha_mode == G2D_GLOBAL_ALPHA) ||
-			   (blit.src.alpha_mode == G2D_MIXER_ALPHA) ||
-			   (blit.dst.alpha_mode == G2D_GLOBAL_ALPHA) ||
-			   (blit.dst.alpha_mode == G2D_MIXER_ALPHA) ||
-			   (blit.flags & G2D_BLIT_FLAG_ALPHA_BLEND);  /* Legacy flag */
-	
-	bool needs_rotation = !!(blit.flags & (G2D_BLIT_FLAG_ROTATE_90 |
-					       G2D_BLIT_FLAG_ROTATE_180 |
-					       G2D_BLIT_FLAG_ROTATE_270 |
-					       G2D_BLIT_FLAG_FLIP_H |
-					       G2D_BLIT_FLAG_FLIP_V));
-	
-	bool needs_scaling = (blit.dst_w != src_crop_w) || (blit.dst_h != src_crop_h);
-	
-	dev_dbg(g2d->dev, "BLIT auto-detect: has_out=%d src_alpha_fmt=%d needs_alpha=%d needs_rotation=%d needs_scaling=%d\n",
-		 has_out_buffer, src_has_alpha_format, needs_alpha, needs_rotation, needs_scaling);
-	
+	bool needs_alpha =
+		has_out_buffer || /* 3-buffer = blending */
+		(src_has_alpha_format &&
+		 blit.src.alpha_mode == G2D_PIXEL_ALPHA) ||
+		(blit.src.alpha_mode == G2D_GLOBAL_ALPHA) ||
+		(blit.src.alpha_mode == G2D_MIXER_ALPHA) ||
+		(blit.dst.alpha_mode == G2D_GLOBAL_ALPHA) ||
+		(blit.dst.alpha_mode == G2D_MIXER_ALPHA) ||
+		(blit.flags & G2D_BLIT_FLAG_ALPHA_BLEND); /* Legacy flag */
+
+	bool needs_rotation =
+		!!(blit.flags &
+		   (G2D_BLIT_FLAG_ROTATE_90 | G2D_BLIT_FLAG_ROTATE_180 |
+		    G2D_BLIT_FLAG_ROTATE_270 | G2D_BLIT_FLAG_FLIP_H |
+		    G2D_BLIT_FLAG_FLIP_V));
+
+	bool needs_scaling = (blit.dst_w != src_crop_w) ||
+			     (blit.dst_h != src_crop_h);
+
+	dev_dbg(g2d->dev,
+		"BLIT auto-detect: has_out=%d src_alpha_fmt=%d needs_alpha=%d needs_rotation=%d needs_scaling=%d\n",
+		has_out_buffer, src_has_alpha_format, needs_alpha,
+		needs_rotation, needs_scaling);
+
 	/* Check for incompatible single-pass combinations */
 	if (needs_rotation && needs_scaling) {
-		/* TODO: Support alpha blending with scale+rotate (requires 3-pass) */
 		if (needs_alpha) {
-			dev_warn(g2d->dev, "Scale+rotate+alpha not yet supported (would need 3-pass)\n");
-			ret = -ENOSYS;
-			goto err_unmap_out;
+			dev_dbg(g2d->dev,
+				"Rotation + scaling + alpha requested: 3-pass async (scale -> rotate -> blend)\n");
+
+			/* 3-pass ASYNC approach:
+			 * - Allocate two temporary buffers NOW in IOCTL context
+			 * - Store temp buffers + all parameters in job
+			 * - Create fence, enqueue job, return immediately
+			 * - Worker will execute STEP 1 (scale) then STEP 2 (rotate) then STEP 3 (blend)
+			 * - Cleanup will free temp buffers after completion
+			 */
+
+			/* Calculate scaled size (before rotation) */
+			u32 temp_w = blit.dst_w;
+			u32 temp_h = blit.dst_h;
+
+			/* Choose temporary buffer bytes-per-pixel:
+			 * If source has alpha format, preserve that in the temp buffer
+			 * so alpha is not lost during scaling. Otherwise use destination bpp.
+			 */
+			u32 temp_bpp = src_has_alpha_format ? src_bpp : dst_bpp;
+
+			u32 temp_pitch = ALIGN(temp_w * temp_bpp, 32);
+			size_t temp_size = temp_pitch * temp_h;
+
+			/* Calculate rotated/intermediate size (after rotation) */
+			bool rot_90 =
+				!!(blit.flags & (G2D_BLIT_FLAG_ROTATE_90 |
+						 G2D_BLIT_FLAG_ROTATE_270));
+			u32 temp2_w = rot_90 ? temp_h : temp_w;
+			u32 temp2_h = rot_90 ? temp_w : temp_h;
+			u32 temp2_pitch = ALIGN(temp2_w * temp_bpp, 32);
+			size_t temp2_size = temp2_pitch * temp2_h;
+
+			/* Allocate temporary buffers using CMA */
+			void *temp_vaddr = NULL;
+			dma_addr_t temp_dma_addr = 0;
+			void *temp2_vaddr = NULL;
+			dma_addr_t temp2_dma_addr = 0;
+
+			temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size,
+							&temp_dma_addr,
+							GFP_KERNEL);
+			if (!temp_vaddr) {
+				dev_err(g2d->dev,
+					"Failed to allocate temp buffer 1 for 3-pass: size=%zu\n",
+					temp_size);
+				ret = -ENOMEM;
+				goto err_unmap_out;
+			}
+
+			temp2_vaddr = dma_alloc_coherent(g2d->dev, temp2_size,
+							 &temp2_dma_addr,
+							 GFP_KERNEL);
+			if (!temp2_vaddr) {
+				dev_err(g2d->dev,
+					"Failed to allocate temp buffer 2 for 3-pass: size=%zu\n",
+					temp2_size);
+				dma_free_coherent(g2d->dev, temp_size,
+						  temp_vaddr, temp_dma_addr);
+				ret = -ENOMEM;
+				goto err_unmap_out;
+			}
+
+			dev_dbg(g2d->dev,
+				"Allocated temp buffers for 3-pass: t1 vaddr=%p dma=0x%llx size=%zu t2 vaddr=%p dma=0x%llx size=%zu\n",
+				temp_vaddr, (u64)temp_dma_addr, temp_size,
+				temp2_vaddr, (u64)temp2_dma_addr, temp2_size);
+
+			/* Create job for 3-pass async execution */
+			job = kzalloc(sizeof(*job), GFP_KERNEL);
+			if (!job) {
+				dev_err(g2d->dev,
+					"Failed to allocate job for 3-pass blit\n");
+				dma_free_coherent(g2d->dev, temp_size,
+						  temp_vaddr, temp_dma_addr);
+				dma_free_coherent(g2d->dev, temp2_size,
+						  temp2_vaddr, temp2_dma_addr);
+				ret = -ENOMEM;
+				goto err_unmap_out;
+			}
+
+			job->g2d = g2d;
+			job->type = G2D_JOB_BLIT;
+			INIT_WORK(&job->cleanup_work,
+				  sunxi_g2d_job_cleanup_workfn);
+
+			/* Store all BLIT parameters in job */
+			job->data.blit.src_width = blit.src.width;
+			job->data.blit.src_height = blit.src.height;
+			job->data.blit.src_pitch = src_pitch;
+			job->data.blit.src_format = blit.src.format;
+			job->data.blit.src_crop_x = blit.src.crop_x;
+			job->data.blit.src_crop_y = blit.src.crop_y;
+			job->data.blit.src_crop_w = src_crop_w;
+			job->data.blit.src_crop_h = src_crop_h;
+			job->data.blit.src_alpha = blit.src.alpha;
+			job->data.blit.src_alpha_mode = blit.src.alpha_mode;
+			job->data.blit.src_premul = blit.src.premul_mode;
+			job->data.blit.src_color_space = blit.src.color_space;
+
+			job->data.blit.dst_width = blit.dst.width;
+			job->data.blit.dst_height = blit.dst.height;
+			job->data.blit.dst_pitch = dst_pitch;
+			job->data.blit.dst_format = blit.dst.format;
+			job->data.blit.dst_x = blit.dst_x;
+			job->data.blit.dst_y = blit.dst_y;
+			job->data.blit.dst_w = blit.dst_w;
+			job->data.blit.dst_h = blit.dst_h;
+			job->data.blit.dst_alpha = blit.dst.alpha;
+			job->data.blit.dst_alpha_mode = blit.dst.alpha_mode;
+			job->data.blit.dst_premul = blit.dst.premul_mode;
+			job->data.blit.dst_color_space = blit.dst.color_space;
+
+			job->data.blit.out_width = has_out_buffer ?
+							   blit.out.width :
+							   blit.dst.width;
+			job->data.blit.out_height = has_out_buffer ?
+							    blit.out.height :
+							    blit.dst.height;
+			job->data.blit.out_pitch = has_out_buffer ? out_pitch :
+								    dst_pitch;
+			job->data.blit.out_format = has_out_buffer ?
+							    blit.out.format :
+							    blit.dst.format;
+
+			job->data.blit.flags = blit.flags;
+			job->data.blit.bld_mode = blit.bld_mode;
+			job->data.blit.color_key_min = blit.color_key_min;
+			job->data.blit.color_key_max = blit.color_key_max;
+			job->data.blit.color_key_enable = blit.color_key_enable;
+			job->data.blit.color_key_mode = blit.color_key_mode;
+			job->data.blit.needs_alpha = needs_alpha;
+			job->data.blit.needs_rotation = needs_rotation;
+			job->data.blit.needs_scaling = needs_scaling;
+
+			/* Store DMA addresses for HW access */
+			job->src_dma = src_dma_addr;
+			job->dst_dma = dst_dma_addr;
+			job->out_dma = out_dma_addr;
+
+			/* Transfer DMA-BUF ownership to job */
+			job->src_dmabuf = src_dmabuf;
+			job->src_attach = src_attach;
+			job->src_sgt = src_sgt;
+			job->dst_dmabuf = dst_dmabuf;
+			job->dst_attach = dst_attach;
+			job->dst_sgt = dst_sgt;
+			job->out_dmabuf = out_dmabuf;
+			job->out_attach = out_attach;
+			job->out_sgt = out_sgt;
+
+			/* Store temp buffer info for 3-pass execution */
+			job->temp_vaddr = temp_vaddr;
+			job->temp_dma_addr = temp_dma_addr;
+			job->temp_size = temp_size;
+			job->temp_width = temp_w;
+			job->temp_height = temp_h;
+			job->temp_pitch = temp_pitch;
+			/* Preserve alpha in temp format when source contains alpha */
+			job->temp_format = src_has_alpha_format ?
+						   blit.src.format :
+						   blit.dst.format;
+
+			job->temp2_vaddr = temp2_vaddr;
+			job->temp2_dma_addr = temp2_dma_addr;
+			job->temp2_size = temp2_size;
+			job->temp2_width = temp2_w;
+			job->temp2_height = temp2_h;
+			job->temp2_pitch = temp2_pitch;
+			job->temp2_format = src_has_alpha_format ?
+						    blit.src.format :
+						    blit.dst.format;
+
+			/* Create fence for this job */
+			fence = sunxi_g2d_fence_create(g2d);
+			if (!fence) {
+				dev_err(g2d->dev,
+					"Failed to create fence for 3-pass blit\n");
+				dma_free_coherent(g2d->dev, temp_size,
+						  temp_vaddr, temp_dma_addr);
+				dma_free_coherent(g2d->dev, temp2_size,
+						  temp2_vaddr, temp2_dma_addr);
+				kfree(job);
+				ret = -ENOMEM;
+				goto err_no_cleanup; /* Don't cleanup DMA-BUFs, we haven't transferred ownership yet */
+			}
+			job->fence = fence;
+
+			/* Create sync_file and get FD */
+			sync_file = sync_file_create(fence);
+			if (!sync_file) {
+				dev_err(g2d->dev,
+					"Failed to create sync_file for 3-pass blit\n");
+				dma_fence_put(fence);
+				dma_free_coherent(g2d->dev, temp_size,
+						  temp_vaddr, temp_dma_addr);
+				dma_free_coherent(g2d->dev, temp2_size,
+						  temp2_vaddr, temp2_dma_addr);
+				kfree(job);
+				ret = -ENOMEM;
+				goto err_no_cleanup;
+			}
+
+			fence_fd = get_unused_fd_flags(O_CLOEXEC);
+			if (fence_fd < 0) {
+				dev_err(g2d->dev,
+					"Failed to get unused fd for 3-pass blit\n");
+				fput(sync_file->file);
+				kfree(sync_file);
+				dma_fence_put(fence);
+				dma_free_coherent(g2d->dev, temp_size,
+						  temp_vaddr, temp_dma_addr);
+				dma_free_coherent(g2d->dev, temp2_size,
+						  temp2_vaddr, temp2_dma_addr);
+				kfree(job);
+				ret = fence_fd;
+				goto err_no_cleanup;
+			}
+
+			job->fence_fd = fence_fd;
+			job->sync_file = sync_file;
+
+			/* Install FD (makes it visible to userspace) */
+			fd_install(fence_fd, sync_file->file);
+			job->sync_file = NULL; /* fd table owns the ref now */
+
+			dev_dbg(g2d->dev,
+				"3-pass blit: installing fd=%d for job=%p fence=%p pid=%d\n",
+				fence_fd, job, fence, current->pid);
+
+			/* Enqueue job to worker */
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			list_add_tail(&job->node, &g2d->job_queue);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+			queue_work(g2d->job_wq, &g2d->job_work);
+
+			dev_dbg(g2d->dev,
+				"3-pass blit: enqueued job=%p fence_fd=%d\n",
+				job, fence_fd);
+
+			/* Return fence FD to userspace */
+			blit.fence_fd_out = fence_fd;
+			if (copy_to_user((void __user *)arg, &blit,
+					 sizeof(blit))) {
+				dev_err(g2d->dev,
+					"Failed to copy blit result to userspace\n");
+				/* Job is already enqueued, can't cleanly abort */
+				ret = -EFAULT;
+				goto err_no_cleanup;
+			}
+
+			dev_dbg(g2d->dev,
+				"3-pass BLIT async: returned fence_fd=%d to userspace\n",
+				fence_fd);
+
+			/* Success - DMA-BUFs and temp buffers now owned by job, return immediately */
+			return 0;
 		}
-		
-		dev_dbg(g2d->dev, "Rotation + scaling requested: 2-pass async (scale then rotate)\n");
-		
+
+		dev_dbg(g2d->dev,
+			"Rotation + scaling requested: 2-pass async (scale then rotate)\n");
+
 		/* 2-pass ASYNC approach:
 		 * - Allocate temporary buffer NOW in IOCTL context
 		 * - Store temp buffer + all parameters in job
@@ -5930,40 +6577,48 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		 * - Worker will execute STEP 1 (scale) then STEP 2 (rotate) async
 		 * - Cleanup will free temp buffer after completion
 		 */
-		
+
 		/* Calculate scaled size (before rotation) */
 		u32 temp_w = blit.dst_w;
 		u32 temp_h = blit.dst_h;
-		u32 temp_pitch = ALIGN(temp_w * dst_bpp, 32);
+		/* Use temp_bpp that preserves alpha when source has alpha */
+		u32 temp_bpp = src_has_alpha_format ? src_bpp : dst_bpp;
+		u32 temp_pitch = ALIGN(temp_w * temp_bpp, 32);
 		size_t temp_size = temp_pitch * temp_h;
-		
+
 		/* Allocate temporary buffer using CMA */
 		void *temp_vaddr = NULL;
 		dma_addr_t temp_dma_addr = 0;
-		
-		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size, &temp_dma_addr, GFP_KERNEL);
+
+		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size,
+						&temp_dma_addr, GFP_KERNEL);
 		if (!temp_vaddr) {
-			dev_err(g2d->dev, "Failed to allocate temp buffer for scale+rotate: size=%zu\n", temp_size);
+			dev_err(g2d->dev,
+				"Failed to allocate temp buffer for scale+rotate: size=%zu\n",
+				temp_size);
 			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
-		
-		dev_dbg(g2d->dev, "Allocated temp buffer for async 2-pass: vaddr=%p dma=0x%llx size=%zu\n",
-			 temp_vaddr, (u64)temp_dma_addr, temp_size);
-		
+
+		dev_dbg(g2d->dev,
+			"Allocated temp buffer for async 2-pass: vaddr=%p dma=0x%llx size=%zu\n",
+			temp_vaddr, (u64)temp_dma_addr, temp_size);
+
 		/* Create job for 2-pass async execution */
 		job = kzalloc(sizeof(*job), GFP_KERNEL);
 		if (!job) {
-			dev_err(g2d->dev, "Failed to allocate job for 2-pass blit\n");
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			dev_err(g2d->dev,
+				"Failed to allocate job for 2-pass blit\n");
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
+					  temp_dma_addr);
 			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
-		
+
 		job->g2d = g2d;
 		job->type = G2D_JOB_BLIT;
 		INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-		
+
 		/* Store all BLIT parameters in job */
 		job->data.blit.src_width = blit.src.width;
 		job->data.blit.src_height = blit.src.height;
@@ -5977,7 +6632,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.src_alpha_mode = blit.src.alpha_mode;
 		job->data.blit.src_premul = blit.src.premul_mode;
 		job->data.blit.src_color_space = blit.src.color_space;
-		
+
 		job->data.blit.dst_width = blit.dst.width;
 		job->data.blit.dst_height = blit.dst.height;
 		job->data.blit.dst_pitch = dst_pitch;
@@ -5990,12 +6645,16 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.dst_alpha_mode = blit.dst.alpha_mode;
 		job->data.blit.dst_premul = blit.dst.premul_mode;
 		job->data.blit.dst_color_space = blit.dst.color_space;
-		
-		job->data.blit.out_width = has_out_buffer ? blit.out.width : blit.dst.width;
-		job->data.blit.out_height = has_out_buffer ? blit.out.height : blit.dst.height;
-		job->data.blit.out_pitch = has_out_buffer ? out_pitch : dst_pitch;
-		job->data.blit.out_format = has_out_buffer ? blit.out.format : blit.dst.format;
-		
+
+		job->data.blit.out_width = has_out_buffer ? blit.out.width :
+							    blit.dst.width;
+		job->data.blit.out_height = has_out_buffer ? blit.out.height :
+							     blit.dst.height;
+		job->data.blit.out_pitch = has_out_buffer ? out_pitch :
+							    dst_pitch;
+		job->data.blit.out_format = has_out_buffer ? blit.out.format :
+							     blit.dst.format;
+
 		job->data.blit.flags = blit.flags;
 		job->data.blit.bld_mode = blit.bld_mode;
 		job->data.blit.color_key_min = blit.color_key_min;
@@ -6005,12 +6664,12 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.needs_alpha = needs_alpha;
 		job->data.blit.needs_rotation = needs_rotation;
 		job->data.blit.needs_scaling = needs_scaling;
-		
+
 		/* Store DMA addresses for HW access */
 		job->src_dma = src_dma_addr;
 		job->dst_dma = dst_dma_addr;
 		job->out_dma = out_dma_addr;
-		
+
 		/* Transfer DMA-BUF ownership to job */
 		job->src_dmabuf = src_dmabuf;
 		job->src_attach = src_attach;
@@ -6021,7 +6680,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->out_dmabuf = out_dmabuf;
 		job->out_attach = out_attach;
 		job->out_sgt = out_sgt;
-		
+
 		/* Store temp buffer info for 2-pass execution */
 		job->temp_vaddr = temp_vaddr;
 		job->temp_dma_addr = temp_dma_addr;
@@ -6029,76 +6688,88 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->temp_width = temp_w;
 		job->temp_height = temp_h;
 		job->temp_pitch = temp_pitch;
-		job->temp_format = blit.dst.format;
-		
+		job->temp_format = src_has_alpha_format ? blit.src.format :
+							  blit.dst.format;
+
 		/* Create fence for this job */
 		fence = sunxi_g2d_fence_create(g2d);
 		if (!fence) {
-			dev_err(g2d->dev, "Failed to create fence for 2-pass blit\n");
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			dev_err(g2d->dev,
+				"Failed to create fence for 2-pass blit\n");
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
+					  temp_dma_addr);
 			kfree(job);
 			ret = -ENOMEM;
-			goto err_no_cleanup;  /* Don't cleanup DMA-BUFs, we haven't transferred ownership yet */
+			goto err_no_cleanup; /* Don't cleanup DMA-BUFs, we haven't transferred ownership yet */
 		}
 		job->fence = fence;
-		
+
 		/* Create sync_file and get FD */
 		sync_file = sync_file_create(fence);
 		if (!sync_file) {
-			dev_err(g2d->dev, "Failed to create sync_file for 2-pass blit\n");
+			dev_err(g2d->dev,
+				"Failed to create sync_file for 2-pass blit\n");
 			dma_fence_put(fence);
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
+					  temp_dma_addr);
 			kfree(job);
 			ret = -ENOMEM;
 			goto err_no_cleanup;
 		}
-		
+
 		fence_fd = get_unused_fd_flags(O_CLOEXEC);
 		if (fence_fd < 0) {
-			dev_err(g2d->dev, "Failed to get unused fd for 2-pass blit\n");
+			dev_err(g2d->dev,
+				"Failed to get unused fd for 2-pass blit\n");
 			fput(sync_file->file);
 			kfree(sync_file);
 			dma_fence_put(fence);
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr, temp_dma_addr);
+			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
+					  temp_dma_addr);
 			kfree(job);
 			ret = fence_fd;
 			goto err_no_cleanup;
 		}
-		
+
 		job->fence_fd = fence_fd;
 		job->sync_file = sync_file;
-		
+
 		/* Install FD (makes it visible to userspace) */
 		fd_install(fence_fd, sync_file->file);
-		job->sync_file = NULL;  /* fd table owns the ref now */
-		
-		dev_dbg(g2d->dev, "2-pass blit: installing fd=%d for job=%p fence=%p pid=%d\n",
-			 fence_fd, job, fence, current->pid);
-		
+		job->sync_file = NULL; /* fd table owns the ref now */
+
+		dev_dbg(g2d->dev,
+			"2-pass blit: installing fd=%d for job=%p fence=%p pid=%d\n",
+			fence_fd, job, fence, current->pid);
+
 		/* Enqueue job to worker */
 		spin_lock_irqsave(&g2d->job_lock, flags);
 		list_add_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
-		
+
 		queue_work(g2d->job_wq, &g2d->job_work);
-		
-		dev_dbg(g2d->dev, "2-pass blit: enqueued job=%p fence_fd=%d\n", job, fence_fd);
-		
+
+		dev_dbg(g2d->dev, "2-pass blit: enqueued job=%p fence_fd=%d\n",
+			job, fence_fd);
+
 		/* Return fence FD to userspace */
 		blit.fence_fd_out = fence_fd;
 		if (copy_to_user((void __user *)arg, &blit, sizeof(blit))) {
-			dev_err(g2d->dev, "Failed to copy blit result to userspace\n");
+			dev_err(g2d->dev,
+				"Failed to copy blit result to userspace\n");
 			/* Job is already enqueued, can't cleanly abort */
 			ret = -EFAULT;
 			goto err_no_cleanup;
 		}
-		
-		dev_dbg(g2d->dev, "2-pass BLIT async: returned fence_fd=%d to userspace\n", fence_fd);
-		
+
+		dev_dbg(g2d->dev,
+			"2-pass BLIT async: returned fence_fd=%d to userspace\n",
+			fence_fd);
+
 		/* Success - DMA-BUFs and temp buffer now owned by job, return immediately */
 		return 0;
 	}
-	
+
 	/* All other combinations are valid for single-pass:
 	 * - alpha + rotation (OK)
 	 * - alpha + no_scale (OK)  
@@ -6113,15 +6784,21 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	if (needs_alpha || needs_rotation || needs_scaling) {
 		char op_desc[128];
 		snprintf(op_desc, sizeof(op_desc), "%s%s%s",
-		 needs_scaling ? "SCALE" : "",
-		 needs_alpha ? (needs_scaling ? "+BLEND" : "BLEND") : "",
-		 needs_rotation ? (needs_scaling || needs_alpha ? "+ROT" : "ROT") : "");
-	dev_dbg(g2d->dev, "BLIT operation: %s %ux%u -> %ux%u\n",
-		 op_desc, src_crop_w, src_crop_h, blit.dst_w, blit.dst_h);
-} else {
-	dev_dbg(g2d->dev, "BLIT: simple copy %ux%u\n", src_crop_w, src_crop_h);
-}
-	
+			 needs_scaling ? "SCALE" : "",
+			 needs_alpha ? (needs_scaling ? "+BLEND" : "BLEND") :
+				       "",
+			 needs_rotation ?
+				 (needs_scaling || needs_alpha ? "+ROT" :
+								 "ROT") :
+				 "");
+		dev_dbg(g2d->dev, "BLIT operation: %s %ux%u -> %ux%u\n",
+			op_desc, src_crop_w, src_crop_h, blit.dst_w,
+			blit.dst_h);
+	} else {
+		dev_dbg(g2d->dev, "BLIT: simple copy %ux%u\n", src_crop_w,
+			src_crop_h);
+	}
+
 	/* Calculate output buffer dimensions (out_pitch already calculated above) */
 	u32 out_w, out_h, out_format;
 	if (has_out_buffer) {
@@ -6135,19 +6812,19 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		out_h = blit.dst.height;
 		out_format = blit.dst.format;
 	}
-	
+
 	/* Create async job */
 	{
 		struct sunxi_g2d_job *job;
 		unsigned long flags;
 		int out_fd;
-		
+
 		job = kzalloc(sizeof(*job), GFP_KERNEL);
 		if (!job) {
 			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
-		
+
 		/* Create fence for this job */
 		job->fence = sunxi_g2d_fence_create(g2d);
 		if (!job->fence) {
@@ -6155,7 +6832,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
-		
+
 		/* Reserve FD for fence */
 		out_fd = get_unused_fd_flags(O_CLOEXEC);
 		if (out_fd < 0) {
@@ -6164,7 +6841,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			ret = out_fd;
 			goto err_unmap_out;
 		}
-		
+
 		/* Create sync_file for fence */
 		job->sync_file = sync_file_create(job->fence);
 		if (!job->sync_file) {
@@ -6174,22 +6851,24 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
-		
-	job->fence_fd = out_fd;
-	
-	/* Install FD now (in process context) */
-	dev_dbg(g2d->dev, "blit: installing fd=%d for job=%p fence=%p pid=%d\n",
-		 out_fd, job, job->fence, task_tgid_nr(current));
-	fd_install(out_fd, job->sync_file->file);
-	job->sync_file = NULL;  /* fd table owns file now */		/* Initialize cleanup work */
+
+		job->fence_fd = out_fd;
+
+		/* Install FD now (in process context) */
+		dev_dbg(g2d->dev,
+			"blit: installing fd=%d for job=%p fence=%p pid=%d\n",
+			out_fd, job, job->fence, task_tgid_nr(current));
+		fd_install(out_fd, job->sync_file->file);
+		job->sync_file = NULL;
+		/* fd table owns file now */ /* Initialize cleanup work */
 		INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-		
+
 		/* Fill job type and DMA addresses */
 		job->type = G2D_JOB_BLIT;
 		job->src_dma = src_dma_addr;
 		job->dst_dma = dst_dma_addr;
 		job->out_dma = out_dma_addr;
-		
+
 		/* Transfer DMA-BUF ownership to job */
 		job->src_dmabuf = src_dmabuf;
 		job->src_attach = src_attach;
@@ -6200,7 +6879,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->out_dmabuf = out_dmabuf;
 		job->out_attach = out_attach;
 		job->out_sgt = out_sgt;
-		
+
 		/* Store all blit parameters (40+ fields) */
 		job->data.blit.src_width = blit.src.width;
 		job->data.blit.src_height = blit.src.height;
@@ -6210,27 +6889,28 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.src_crop_y = blit.src.crop_y;
 		job->data.blit.src_crop_w = src_crop_w;
 		job->data.blit.src_crop_h = src_crop_h;
-	job->data.blit.src_alpha = blit.src.alpha;
-	job->data.blit.src_alpha_mode = blit.src.alpha_mode;
-	job->data.blit.src_premul = blit.src.premul_mode;
-	job->data.blit.src_color_space = blit.src.color_space;
-	
-	job->data.blit.dst_width = blit.dst.width;
-	job->data.blit.dst_height = blit.dst.height;
-	job->data.blit.dst_pitch = dst_pitch;
-	job->data.blit.dst_format = blit.dst.format;
-	job->data.blit.dst_x = blit.dst_x;
-	job->data.blit.dst_y = blit.dst_y;
-	job->data.blit.dst_w = blit.dst_w;
-	job->data.blit.dst_h = blit.dst_h;
-	job->data.blit.dst_alpha = blit.dst.alpha;
-	job->data.blit.dst_alpha_mode = blit.dst.alpha_mode;
-	job->data.blit.dst_premul = blit.dst.premul_mode;
-	job->data.blit.dst_color_space = blit.dst.color_space;		job->data.blit.out_width = out_w;
+		job->data.blit.src_alpha = blit.src.alpha;
+		job->data.blit.src_alpha_mode = blit.src.alpha_mode;
+		job->data.blit.src_premul = blit.src.premul_mode;
+		job->data.blit.src_color_space = blit.src.color_space;
+
+		job->data.blit.dst_width = blit.dst.width;
+		job->data.blit.dst_height = blit.dst.height;
+		job->data.blit.dst_pitch = dst_pitch;
+		job->data.blit.dst_format = blit.dst.format;
+		job->data.blit.dst_x = blit.dst_x;
+		job->data.blit.dst_y = blit.dst_y;
+		job->data.blit.dst_w = blit.dst_w;
+		job->data.blit.dst_h = blit.dst_h;
+		job->data.blit.dst_alpha = blit.dst.alpha;
+		job->data.blit.dst_alpha_mode = blit.dst.alpha_mode;
+		job->data.blit.dst_premul = blit.dst.premul_mode;
+		job->data.blit.dst_color_space = blit.dst.color_space;
+		job->data.blit.out_width = out_w;
 		job->data.blit.out_height = out_h;
 		job->data.blit.out_pitch = out_pitch;
 		job->data.blit.out_format = out_format;
-		
+
 		job->data.blit.flags = blit.flags;
 		job->data.blit.bld_mode = blit.bld_mode;
 		job->data.blit.color_key_enable = blit.color_key_enable;
@@ -6240,31 +6920,33 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.needs_alpha = needs_alpha;
 		job->data.blit.needs_rotation = needs_rotation;
 		job->data.blit.needs_scaling = needs_scaling;
-		
+
 		/* Enqueue job */
 		spin_lock_irqsave(&g2d->job_lock, flags);
 		list_add_tail(&job->node, &g2d->job_queue);
-	spin_unlock_irqrestore(&g2d->job_lock, flags);
-	
-	dev_dbg(g2d->dev, "blit: enqueued job=%p fence_fd=%d\n", job, out_fd);
-	
-	/* Kick worker */
-	queue_work(g2d->job_wq, &g2d->job_work);		/* Return fence_fd to userspace */
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+		dev_dbg(g2d->dev, "blit: enqueued job=%p fence_fd=%d\n", job,
+			out_fd);
+
+		/* Kick worker */
+		queue_work(g2d->job_wq,
+			   &g2d->job_work); /* Return fence_fd to userspace */
 		blit.fence_fd_out = out_fd;
-		
+
 		/* DON'T cleanup DMA-BUFs - job owns them now */
 		src_dmabuf = NULL;
 		dst_dmabuf = NULL;
 		out_dmabuf = NULL;
 	}
-	
+
 	/* Copy result back to userspace */
 	if (copy_to_user((void __user *)arg, &blit, sizeof(blit))) {
 		ret = -EFAULT;
 		/* Can't rollback at this point - job already enqueued */
 		return ret;
 	}
-	
+
 	return 0;
 
 err_no_cleanup:
@@ -6303,12 +6985,12 @@ err_detach_src:
 err_put_src_dmabuf:
 	if (src_dmabuf)
 		dma_buf_put(src_dmabuf);
-	
+
 	return ret;
 }
 
 static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
-				      unsigned long arg)
+				     unsigned long arg)
 {
 	struct g2d_fillrect fill;
 	struct dma_buf *dmabuf = NULL;
@@ -6317,26 +6999,28 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 	dma_addr_t dma_addr;
 	u32 width, height, pitch;
 	int ret;
-	
+
 	if (copy_from_user(&fill, (void __user *)arg, sizeof(fill)))
 		return -EFAULT;
-	
+
 	/* Validate parameters */
-	if (fill.dst_w == 0 || fill.dst_h == 0 ||
-	    fill.dst_w > G2D_MAX_WIDTH || fill.dst_h > G2D_MAX_HEIGHT) {
-		dev_err(g2d->dev, "Invalid dimensions: %ux%u\n", fill.dst_w, fill.dst_h);
+	if (fill.dst_w == 0 || fill.dst_h == 0 || fill.dst_w > G2D_MAX_WIDTH ||
+	    fill.dst_h > G2D_MAX_HEIGHT) {
+		dev_err(g2d->dev, "Invalid dimensions: %ux%u\n", fill.dst_w,
+			fill.dst_h);
 		return -EINVAL;
 	}
-	
+
 	/* For now, only support DMA-BUF (dma_fd >= 0) */
 	if (fill.dst.dma_fd < 0) {
 		dev_err(g2d->dev, "Physical address mode not supported yet\n");
 		return -EINVAL;
 	}
-	
+
 	dev_dbg(g2d->dev, "FILLRECT: %ux%u at (%u,%u) color=0x%08x dma_fd=%d\n",
-		 fill.dst_w, fill.dst_h, fill.dst_x, fill.dst_y, fill.color, fill.dst.dma_fd);
-	
+		fill.dst_w, fill.dst_h, fill.dst_x, fill.dst_y, fill.color,
+		fill.dst.dma_fd);
+
 	/* Import DMA-BUF */
 	dmabuf = dma_buf_get(fill.dst.dma_fd);
 	if (IS_ERR(dmabuf)) {
@@ -6344,24 +7028,24 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		dev_err(g2d->dev, "Failed to get dma_buf: %d\n", ret);
 		return ret;
 	}
-	
+
 	attach = dma_buf_attach(dmabuf, g2d->dev);
 	if (IS_ERR(attach)) {
 		ret = PTR_ERR(attach);
 		dev_err(g2d->dev, "Failed to attach dma_buf: %d\n", ret);
 		goto err_put_dmabuf;
 	}
-	
+
 	sgt = dma_buf_map_attachment(attach, DMA_FROM_DEVICE);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		dev_err(g2d->dev, "Failed to map dma_buf: %d\n", ret);
 		goto err_detach;
 	}
-	
+
 	/* Get DMA address from first sg entry */
 	dma_addr = sg_dma_address(sgt->sgl);
-	
+
 	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0
 	 * In this case, use physical address directly from the page
 	 */
@@ -6370,10 +7054,12 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		struct page *page = sg_page(sg);
 		if (page) {
 			dma_addr = page_to_phys(page) + sg->offset;
-			dev_dbg(g2d->dev, "T113 workaround: fillrect using physical address 0x%llx\n",
-				 (u64)dma_addr);
+			dev_dbg(g2d->dev,
+				"T113 workaround: fillrect using physical address 0x%llx\n",
+				(u64)dma_addr);
 		} else {
-			dev_err(g2d->dev, "Failed to get physical address from page\n");
+			dev_err(g2d->dev,
+				"Failed to get physical address from page\n");
 			ret = -EINVAL;
 			goto err_unmap;
 		}
@@ -6381,66 +7067,44 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 
 	/* If userspace passed a fence_fd_in for this fill, wait on it */
 	if (fill.fence_fd_in >= 0) {
-		dev_dbg(g2d->dev, "fillrect: importing input fence fd=%d pid=%d\n",
-				fill.fence_fd_in, task_tgid_nr(current));
-		struct dma_fence *in_fence = sync_file_get_fence(fill.fence_fd_in);
+		dev_dbg(g2d->dev,
+			"fillrect: importing input fence fd=%d pid=%d\n",
+			fill.fence_fd_in, task_tgid_nr(current));
+		struct dma_fence *in_fence =
+			sync_file_get_fence(fill.fence_fd_in);
 		if (!in_fence) {
 			ret = -EINVAL;
 			goto err_unmap;
 		}
 		dev_dbg(g2d->dev, "fillrect: got in_fence=%p signaled=%d\n",
-				in_fence, dma_fence_is_signaled(in_fence));
+			in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_wait(in_fence, false);
-		dev_dbg(g2d->dev, "fillrect: in_fence=%p wait done signaled=%d\n",
-				in_fence, dma_fence_is_signaled(in_fence));
+		dev_dbg(g2d->dev,
+			"fillrect: in_fence=%p wait done signaled=%d\n",
+			in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_put(in_fence);
 	}
-	
-	/* Calculate bytes per pixel based on format */
+
+	/* Get bytes-per-pixel via canonical helper to support all mapped formats */
 	u32 bpp;
-	switch (fill.dst.format) {
-	case G2D_FMT_ARGB8888:
-	case G2D_FMT_ABGR8888:
-	case G2D_FMT_RGBA8888:
-	case G2D_FMT_BGRA8888:
-	case G2D_FMT_XRGB8888:
-	case G2D_FMT_XBGR8888:
-	case G2D_FMT_RGBX8888:
-	case G2D_FMT_BGRX8888:
-		bpp = 4;
-		break;
-	case G2D_FMT_RGB888:
-	case G2D_FMT_BGR888:
-		bpp = 3;
-		break;
-	case G2D_FMT_RGB565:
-	case G2D_FMT_BGR565:
-	case G2D_FMT_ARGB4444:
-	case G2D_FMT_ABGR4444:
-	case G2D_FMT_RGBA4444:
-	case G2D_FMT_BGRA4444:
-	case G2D_FMT_ARGB1555:
-	case G2D_FMT_ABGR1555:
-	case G2D_FMT_RGBA5551:
-	case G2D_FMT_BGRA5551:
-		bpp = 2;
-		break;
-	default:
-		dev_err(g2d->dev, "Unsupported destination format: %u\n", fill.dst.format);
+	if (sunxi_g2d_format_to_hw(fill.dst.format, &bpp) < 0) {
+		dev_err(g2d->dev, "Unsupported destination format: %u\n",
+			fill.dst.format);
 		ret = -EINVAL;
 		goto err_unmap;
 	}
-	
+
 	/* Rectangle dimensions */
 	width = fill.dst_w;
 	height = fill.dst_h;
-	
+
 	/* Pitch is the stride of the BUFFER, not the rectangle */
-	pitch = fill.dst.stride[0] ? fill.dst.stride[0] : (fill.dst.width * bpp);
-	
+	pitch = fill.dst.stride[0] ? fill.dst.stride[0] :
+				     (fill.dst.width * bpp);
+
 	/* Adjust DMA address for dst_x/dst_y offset */
 	dma_addr += (fill.dst_y * pitch) + (fill.dst_x * bpp);
-	
+
 	/* v2.9.17: ASYNC JOB QUEUE - Create job, enqueue, and return immediately
 	 * 
 	 * Instead of executing synchronously, we:
@@ -6492,9 +7156,10 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		/* Install FD in process context (CRITICAL: must be before queueing) */
 		if (job->sync_file && job->sync_file->file) {
 			fd_install(out_fd, job->sync_file->file);
-			job->sync_file = NULL;  /* fd table owns the ref now */
+			job->sync_file = NULL; /* fd table owns the ref now */
 		} else {
-			dev_err(g2d->dev, "fillrect: NULL sync_file, cannot install fd\n");
+			dev_err(g2d->dev,
+				"fillrect: NULL sync_file, cannot install fd\n");
 			put_unused_fd(out_fd);
 			dma_fence_put(job->fence);
 			kfree(job);
@@ -6511,12 +7176,12 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		job->data.fillrect.color = fill.color;
 		job->data.fillrect.color_format = fill.color_format;
 		job->data.fillrect.dst_format = fill.dst.format;
-		
+
 		/* Store DMA-BUF references for cleanup */
 		job->dst_dmabuf = dmabuf;
 		job->dst_attach = attach;
 		job->dst_sgt = sgt;
-		
+
 		/* Enqueue job (under spinlock) */
 		spin_lock_irqsave(&g2d->job_lock, flags);
 		list_add_tail(&job->node, &g2d->job_queue);
@@ -6527,11 +7192,12 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 
 		/* Return fence_fd to userspace */
 		fill.fence_fd_out = job->fence_fd;
-		
-		dev_dbg(g2d->dev, "fillrect: enqueued job=%p fence_fd=%d (async)\n",
-				job, out_fd);
+
+		dev_dbg(g2d->dev,
+			"fillrect: enqueued job=%p fence_fd=%d (async)\n", job,
+			out_fd);
 	}
-	
+
 	/* Copy result to userspace */
 	if (copy_to_user((void __user *)arg, &fill, sizeof(fill))) {
 		ret = -EFAULT;
@@ -6540,7 +7206,7 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		 */
 		goto err_abort_job;
 	}
-	
+
 	/* SUCCESS: Job enqueued, DMA-BUFs transferred to job ownership.
 	 * Return immediately WITHOUT cleanup - job_worker will use the buffers
 	 * and cleanup_work will release them after HW completion.
@@ -6552,20 +7218,21 @@ err_abort_job:
 	{
 		struct sunxi_g2d_job *job_to_abort = NULL;
 		unsigned long flags;
-		
+
 		/* Find and remove the job we just added */
 		spin_lock_irqsave(&g2d->job_lock, flags);
 		if (!list_empty(&g2d->job_queue)) {
-			struct sunxi_g2d_job *last_job = list_last_entry(&g2d->job_queue, 
-									 struct sunxi_g2d_job, node);
+			struct sunxi_g2d_job *last_job = list_last_entry(
+				&g2d->job_queue, struct sunxi_g2d_job, node);
 			/* Remove only if it matches our fence_fd */
-			if (last_job && last_job->fence_fd == fill.fence_fd_out) {
+			if (last_job &&
+			    last_job->fence_fd == fill.fence_fd_out) {
 				list_del(&last_job->node);
 				job_to_abort = last_job;
 			}
 		}
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
-		
+
 		/* Cleanup aborted job outside lock */
 		if (job_to_abort) {
 			dma_fence_set_error(job_to_abort->fence, -EFAULT);
@@ -6574,19 +7241,19 @@ err_abort_job:
 		}
 	}
 	/* Fallthrough to cleanup on error paths before job creation */
-	
+
 err_unmap:
 	dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
 err_detach:
 	dma_buf_detach(dmabuf, attach);
 err_put_dmabuf:
 	dma_buf_put(dmabuf);
-	
+
 	return ret;
 }
 
 static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
-					  unsigned long arg)
+					 unsigned long arg)
 {
 	struct g2d_alloc_buffer alloc;
 	struct g2d_dma_buffer *buf;
@@ -6611,8 +7278,9 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 	}
 
 	/* Allocate DMA coherent memory */
-	buf->vaddr = dma_alloc_coherent(g2d->dev, alloc.size, &buf->dma_addr, GFP_KERNEL);
-	
+	buf->vaddr = dma_alloc_coherent(g2d->dev, alloc.size, &buf->dma_addr,
+					GFP_KERNEL);
+
 	if (!buf->vaddr) {
 		dev_err(g2d->dev, "ALLOC_BUFFER: dma_alloc_coherent FAILED\n");
 		kfree(buf);
@@ -6630,7 +7298,8 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 
 	dmabuf = dma_buf_export(&exp_info);
 	if (IS_ERR(dmabuf)) {
-		dma_free_coherent(g2d->dev, buf->size, buf->vaddr, buf->dma_addr);
+		dma_free_coherent(g2d->dev, buf->size, buf->vaddr,
+				  buf->dma_addr);
 		kfree(buf);
 		return PTR_ERR(dmabuf);
 	}
@@ -6656,14 +7325,14 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 }
 
 static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
-			     unsigned long arg)
+			    unsigned long arg)
 {
 	struct sunxi_g2d_dev *g2d = file->private_data;
-	
+
 	switch (cmd) {
 	case G2D_IOC_GET_VERSION:
 		return sunxi_g2d_ioctl_get_version(g2d, arg);
-	case G2D_IOC_BLIT:
+	case G2D_IOC_UNIFIED:
 		return sunxi_g2d_ioctl_blit(g2d, arg);
 	case G2D_IOC_CMD:
 		return sunxi_g2d_ioctl_cmd(g2d, arg);
@@ -6672,10 +7341,7 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 	case G2D_IOC_FILLRECT_RCQ:
 		/* Deprecated: FILLRECT and FILLRECT_RCQ now use same path */
 		return sunxi_g2d_ioctl_fillrect(g2d, arg);
-	case G2D_IOC_ALPHA_BLEND:
-		/* Deprecated: ALPHA_BLEND is now handled by unified BLIT */
-		dev_dbg_once(g2d->dev, "G2D_IOC_ALPHA_BLEND is deprecated, use G2D_IOC_BLIT instead\n");
-		return sunxi_g2d_ioctl_blit(g2d, arg);
+	/* G2D_IOC_ALPHA_BLEND removed (deprecated). Use G2D_IOC_UNIFIED instead. */
 	case G2D_IOC_ALLOC_BUFFER:
 		return sunxi_g2d_ioctl_alloc_buffer(g2d, arg);
 	case G2D_IOC_SELFTEST_FENCE: {
@@ -6722,10 +7388,11 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 			return out_fd;
 		}
 
-	dev_dbg(g2d->dev, "selftest: installing fd=%d sync_file=%p file=%p fence=%p pid=%d\n",
-		out_fd, sf, sf->file, f, task_tgid_nr(current));
-	fd_install(out_fd, sf->file);
-	/* drop our sync_file reference (fd now holds a ref to file)
+		dev_dbg(g2d->dev,
+			"selftest: installing fd=%d sync_file=%p file=%p fence=%p pid=%d\n",
+			out_fd, sf, sf->file, f, task_tgid_nr(current));
+		fd_install(out_fd, sf->file);
+		/* drop our sync_file reference (fd now holds a ref to file)
 	 * keep fence ref for the scheduled work: bump it.
 	 */
 		/* sync_file struct and its file are now owned by the fd table; do
@@ -6742,7 +7409,8 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		}
 		w->fence = f;
 		INIT_DELAYED_WORK(&w->dwork, g2d_selftest_work_func);
-		queue_delayed_work(g2d->job_wq, &w->dwork, msecs_to_jiffies(timeout_ms));
+		queue_delayed_work(g2d->job_wq, &w->dwork,
+				   msecs_to_jiffies(timeout_ms));
 
 		st.fence_fd = out_fd;
 		if (copy_to_user((void __user *)arg, &st, sizeof(st))) {
@@ -6758,24 +7426,26 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		int user_fd;
 		struct dma_fence *in_fence;
 
-		if (copy_from_user(&user_fd, (void __user *)arg, sizeof(user_fd)))
+		if (copy_from_user(&user_fd, (void __user *)arg,
+				   sizeof(user_fd)))
 			return -EFAULT;
 
 		if (user_fd < 0)
 			return -EINVAL;
 
 		dev_dbg(g2d->dev, "sync ioctl: importing fence fd=%d pid=%d\n",
-			 user_fd, task_tgid_nr(current));
+			user_fd, task_tgid_nr(current));
 		in_fence = sync_file_get_fence(user_fd);
 		if (!in_fence)
 			return -EINVAL;
 		dev_dbg(g2d->dev, "sync ioctl: got in_fence=%p signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+			in_fence, dma_fence_is_signaled(in_fence));
 
 		/* Wait uninterruptibly for the fence to signal */
 		dma_fence_wait(in_fence, false);
-		dev_dbg(g2d->dev, "sync ioctl: in_fence=%p wait done signaled=%d\n",
-			 in_fence, dma_fence_is_signaled(in_fence));
+		dev_dbg(g2d->dev,
+			"sync ioctl: in_fence=%p wait done signaled=%d\n",
+			in_fence, dma_fence_is_signaled(in_fence));
 		dma_fence_put(in_fence);
 		return 0;
 	}
@@ -6791,7 +7461,8 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		dev_dbg(g2d->dev, "=== G2D_IOC_WRITE_BUFFER entered ===\n");
 
 		if (copy_from_user(&rw, (void __user *)arg, sizeof(rw))) {
-			dev_dbg(g2d->dev, "WRITE_BUFFER: copy_from_user failed\n");
+			dev_dbg(g2d->dev,
+				"WRITE_BUFFER: copy_from_user failed\n");
 			return -EFAULT;
 		}
 
@@ -6847,7 +7518,8 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 
 		vaddr = map.vaddr;
 		if (!vaddr) {
-			dev_err(g2d->dev, "WRITE_BUFFER: vmap returned NULL!\n");
+			dev_err(g2d->dev,
+				"WRITE_BUFFER: vmap returned NULL!\n");
 			dma_buf_vunmap(dmabuf, &map);
 			dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
 			dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
@@ -6856,32 +7528,42 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 			return -ENOMEM;
 		}
 
-		dev_dbg(g2d->dev, "WRITE_BUFFER: vaddr=%p offset=%llu size=%llu user_ptr=0x%llx\n",
-			 vaddr, rw.offset, rw.size, rw.user_ptr);
+		dev_dbg(g2d->dev,
+			"WRITE_BUFFER: vaddr=%p offset=%llu size=%llu user_ptr=0x%llx\n",
+			vaddr, rw.offset, rw.size, rw.user_ptr);
 
 		/* Verify what's in userspace before copying */
 		{
 			uint32_t test_words[4];
-			if (copy_from_user(test_words, (void __user *)(uintptr_t)rw.user_ptr, sizeof(test_words)) == 0) {
-				dev_dbg(g2d->dev, "WRITE_BUFFER: userspace data (first 4 words): %08x %08x %08x %08x\n",
-					 test_words[0], test_words[1], test_words[2], test_words[3]);
+			if (copy_from_user(test_words,
+					   (void __user *)(uintptr_t)rw.user_ptr,
+					   sizeof(test_words)) == 0) {
+				dev_dbg(g2d->dev,
+					"WRITE_BUFFER: userspace data (first 4 words): %08x %08x %08x %08x\n",
+					test_words[0], test_words[1],
+					test_words[2], test_words[3]);
 			}
 		}
 
 		/* Copy from userspace to device buffer */
-		if (copy_from_user(vaddr + rw.offset, (void __user *)(uintptr_t)rw.user_ptr, rw.size)) {
-			dev_err(g2d->dev, "WRITE_BUFFER: copy_from_user FAILED!\n");
+		if (copy_from_user(vaddr + rw.offset,
+				   (void __user *)(uintptr_t)rw.user_ptr,
+				   rw.size)) {
+			dev_err(g2d->dev,
+				"WRITE_BUFFER: copy_from_user FAILED!\n");
 			ret = -EFAULT;
 		} else {
 			uint32_t *check = (uint32_t *)vaddr;
-			dev_dbg(g2d->dev, "WRITE_BUFFER: buffer after copy (first 4 words): %08x %08x %08x %08x\n",
-				 check[0], check[1], check[2], check[3]);
+			dev_dbg(g2d->dev,
+				"WRITE_BUFFER: buffer after copy (first 4 words): %08x %08x %08x %08x\n",
+				check[0], check[1], check[2], check[3]);
 			ret = 0;
 		}
 
 		dev_dbg(g2d->dev, "WRITE_BUFFER: about to vunmap\n");
 		dma_buf_vunmap(dmabuf, &map);
-		dev_dbg(g2d->dev, "WRITE_BUFFER: vunmap done, about to end_cpu_access\n");
+		dev_dbg(g2d->dev,
+			"WRITE_BUFFER: vunmap done, about to end_cpu_access\n");
 		dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
 		dev_dbg(g2d->dev, "WRITE_BUFFER: about to unmap_attachment\n");
 		dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
@@ -6889,8 +7571,9 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		dma_buf_detach(dmabuf, attach);
 		dma_buf_put(dmabuf);
 
-		dev_dbg(g2d->dev, "WRITE_BUFFER: fd=%d offset=%llu size=%llu ret=%d\n",
-			 rw.dma_fd, rw.offset, rw.size, ret);
+		dev_dbg(g2d->dev,
+			"WRITE_BUFFER: fd=%d offset=%llu size=%llu ret=%d\n",
+			rw.dma_fd, rw.offset, rw.size, ret);
 
 		return ret;
 	}
@@ -6964,7 +7647,8 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		}
 
 		/* Copy to userspace from device buffer */
-		if (copy_to_user((void __user *)(uintptr_t)rw.user_ptr, vaddr + rw.offset, rw.size)) {
+		if (copy_to_user((void __user *)(uintptr_t)rw.user_ptr,
+				 vaddr + rw.offset, rw.size)) {
 			ret = -EFAULT;
 		} else {
 			ret = 0;
@@ -6976,8 +7660,9 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		dma_buf_detach(dmabuf, attach);
 		dma_buf_put(dmabuf);
 
-		dev_dbg(g2d->dev, "READ_BUFFER: fd=%d offset=%llu size=%llu ret=%d\n",
-			 rw.dma_fd, rw.offset, rw.size, ret);
+		dev_dbg(g2d->dev,
+			"READ_BUFFER: fd=%d offset=%llu size=%llu ret=%d\n",
+			rw.dma_fd, rw.offset, rw.size, ret);
 
 		return ret;
 	}
@@ -6988,11 +7673,11 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 }
 
 static const struct file_operations sunxi_g2d_fops = {
-	.owner		= THIS_MODULE,
-	.open		= sunxi_g2d_open,
-	.release	= sunxi_g2d_release,
-	.unlocked_ioctl	= sunxi_g2d_ioctl,
-	.compat_ioctl	= sunxi_g2d_ioctl,
+	.owner = THIS_MODULE,
+	.open = sunxi_g2d_open,
+	.release = sunxi_g2d_release,
+	.unlocked_ioctl = sunxi_g2d_ioctl,
+	.compat_ioctl = sunxi_g2d_ioctl,
 };
 
 /* ========== Platform driver ========== */
@@ -7002,13 +7687,13 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	struct sunxi_g2d_dev *g2d;
 	struct resource *res;
 	int ret;
-	
+
 	dev_dbg(&pdev->dev, "Probing G2D driver v%s\n", DRIVER_VERSION);
-	
+
 	g2d = devm_kzalloc(&pdev->dev, sizeof(*g2d), GFP_KERNEL);
 	if (!g2d)
 		return -ENOMEM;
-	
+
 	g2d->dev = &pdev->dev;
 	platform_set_drvdata(pdev, g2d);
 
@@ -7016,99 +7701,101 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	spin_lock_init(&g2d->fence_lock);
 	atomic64_set(&g2d->fence_seqno, 0);
 	g2d->fence_context = dma_fence_context_alloc(1);
-	
+
 	/* Initialize temporary scaling buffer fields */
 	g2d->temp_scale_buffer = NULL;
 	g2d->temp_scale_dma = 0;
 	g2d->temp_scale_size = 0;
-	
+
 	/* Get MMIO resources */
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	g2d->base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(g2d->base))
 		return PTR_ERR(g2d->base);
-	
+
 	dev_dbg(&pdev->dev, "G2D MMIO base=0x%08llx size=0x%llx\n",
-		 (u64)res->start, (u64)resource_size(res));
-	
+		(u64)res->start, (u64)resource_size(res));
+
 	/* Get CCU (clock control unit) base - use hardcoded address as in fillrect v1.0.0 */
 	g2d->ccu_base = devm_ioremap(&pdev->dev, 0x02001000, 0x1000);
 	if (!g2d->ccu_base) {
 		dev_err(&pdev->dev, "Failed to map CCU registers\n");
 		return -ENOMEM;
 	}
-	
+
 	dev_dbg(&pdev->dev, "CCU base=0x02001000 (hardcoded)\n");
-	
+
 	/* BSP sequence: reset FIRST, then clocks (critical from fillrect v1.0.0) */
 	g2d->rst = devm_reset_control_get_optional_exclusive(&pdev->dev, NULL);
 	if (!IS_ERR(g2d->rst)) {
 		ret = reset_control_deassert(g2d->rst);
 		if (ret) {
-			dev_err(&pdev->dev, "Failed to deassert reset: %d\n", ret);
+			dev_err(&pdev->dev, "Failed to deassert reset: %d\n",
+				ret);
 			return ret;
 		}
 		dev_dbg(&pdev->dev, "Reset deasserted\n");
 	} else {
 		dev_warn(&pdev->dev, "No reset control available\n");
 	}
-	
+
 	/* Configure DMA (from fillrect v1.0.0) */
 	ret = of_dma_configure(&pdev->dev, pdev->dev.of_node, true);
 	if (ret)
 		dev_warn(&pdev->dev, "of_dma_configure failed: %d\n", ret);
-	
+
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to set DMA mask: %d\n", ret);
 		return ret;
 	}
-	
+
 	/* Get clocks */
 	g2d->clk_bus = devm_clk_get(&pdev->dev, "bus_g2d");
 	if (IS_ERR(g2d->clk_bus)) {
 		dev_err(&pdev->dev, "Failed to get bus_g2d clock\n");
 		return PTR_ERR(g2d->clk_bus);
 	}
-	
+
 	g2d->clk_mod = devm_clk_get(&pdev->dev, "g2d");
 	if (IS_ERR(g2d->clk_mod)) {
 		dev_err(&pdev->dev, "Failed to get g2d clock\n");
 		return PTR_ERR(g2d->clk_mod);
 	}
-	
+
 	g2d->clk_mbus = devm_clk_get(&pdev->dev, "mbus_g2d");
 	if (IS_ERR(g2d->clk_mbus)) {
 		dev_err(&pdev->dev, "Failed to get mbus clock\n");
 		return PTR_ERR(g2d->clk_mbus);
 	}
-	
+
 	/* Get interconnect path for MBUS */
 	g2d->icc_path = devm_of_icc_get(&pdev->dev, "dma-mem");
 	if (IS_ERR(g2d->icc_path)) {
 		ret = PTR_ERR(g2d->icc_path);
 		if (ret != -ENODEV) {
-			dev_err(&pdev->dev, "Failed to get interconnect: %d\n", ret);
+			dev_err(&pdev->dev, "Failed to get interconnect: %d\n",
+				ret);
 			return ret;
 		}
 		g2d->icc_path = NULL;
 	}
-	
+
 	/* Get IRQ */
 	g2d->irq = platform_get_irq(pdev, 0);
 	if (g2d->irq < 0)
 		return g2d->irq;
-	
-	ret = devm_request_irq(&pdev->dev, g2d->irq, sunxi_g2d_irq,
-			       0, dev_name(&pdev->dev), g2d);
+
+	ret = devm_request_irq(&pdev->dev, g2d->irq, sunxi_g2d_irq, 0,
+			       dev_name(&pdev->dev), g2d);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to request IRQ %d: %d\n",
-			g2d->irq, ret);
+		dev_err(&pdev->dev, "Failed to request IRQ %d: %d\n", g2d->irq,
+			ret);
 		return ret;
 	}
-	
+
 	dev_dbg(&pdev->dev, "IRQ %d registered\n", g2d->irq);
-	
+
 	/* Initialize synchronization primitives */
 	mutex_init(&g2d->dev_mutex);
 	spin_lock_init(&g2d->job_lock);
@@ -7123,7 +7810,7 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	/* Initialize fence context/sequence for dma-fence support */
 	g2d->fence_context = dma_fence_context_alloc(1);
 	atomic64_set(&g2d->fence_seqno, 0);
-	
+
 	/* RCQ (Register Configuration Queue) - DESHABILITADO
 	 * 
 	 * RCQ no funciona en T113-S3 G2D IP 0x0110 (ver RCQ-INVESTIGATION-REPORT.md)
@@ -7132,7 +7819,7 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	 * Modo legacy (escritura directa de registros) funciona perfectamente.
 	 * RCQ queda disponible para investigación futura con mejor documentación.
 	 */
-#if 0  /* RCQ DISABLED - NO FUNCIONAL */
+#if 0 /* RCQ DISABLED - NO FUNCIONAL */
 	ret = sunxi_g2d_rcq_alloc(g2d->dev, &g2d->rcq, G2D_RCQ_MAX_SIZE);
 	if (ret) {
 		dev_warn(&pdev->dev, "Failed to allocate RCQ buffer: %d, RCQ disabled\n", ret);
@@ -7143,54 +7830,57 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	}
 #else
 	g2d->rcq_enabled = false;
-	dev_dbg(&pdev->dev, "RCQ disabled (not functional on T113-S3), using legacy mode\n");
+	dev_dbg(&pdev->dev,
+		"RCQ disabled (not functional on T113-S3), using legacy mode\n");
 #endif
-	
+
 	/* Create workqueue for job processing */
 	g2d->job_wq = alloc_workqueue("sunxi-g2d", WQ_HIGHPRI | WQ_UNBOUND, 1);
 	if (!g2d->job_wq) {
 		dev_err(&pdev->dev, "Failed to create workqueue\n");
 		return -ENOMEM;
 	}
-	
+
 	/* Initialize job worker */
 	INIT_WORK(&g2d->job_work, sunxi_g2d_job_worker);
 	dev_dbg(&pdev->dev, "Job worker initialized for async operations\n");
 
 	/* initialize delayed work for safe HW disable */
 	INIT_DELAYED_WORK(&g2d->disable_work, sunxi_g2d_disable_workfn);
-	
+
 	/* Register character device */
 	ret = alloc_chrdev_region(&g2d->dev_num, 0, 1, DRIVER_NAME);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to allocate device number: %d\n", ret);
+		dev_err(&pdev->dev, "Failed to allocate device number: %d\n",
+			ret);
 		goto err_destroy_wq;
 	}
-	
+
 	cdev_init(&g2d->cdev, &sunxi_g2d_fops);
 	g2d->cdev.owner = THIS_MODULE;
-	
+
 	ret = cdev_add(&g2d->cdev, g2d->dev_num, 1);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to add cdev: %d\n", ret);
 		goto err_unregister_chrdev;
 	}
-	
+
 	g2d->dev_class = class_create(DRIVER_NAME);
 	if (IS_ERR(g2d->dev_class)) {
 		ret = PTR_ERR(g2d->dev_class);
 		dev_err(&pdev->dev, "Failed to create device class: %d\n", ret);
 		goto err_del_cdev;
 	}
-	
+
 	device_create(g2d->dev_class, &pdev->dev, g2d->dev_num, NULL, "g2d");
-	
+
 	dev_dbg(&pdev->dev, "Character device /dev/g2d created\n");
-	dev_dbg(&pdev->dev, "G2D driver v%s loaded successfully\n", DRIVER_VERSION);
+	dev_dbg(&pdev->dev, "G2D driver v%s loaded successfully\n",
+		DRIVER_VERSION);
 	dev_info(&pdev->dev, "registered as /dev/g2d\n");
-	
+
 	return 0;
-	
+
 err_del_cdev:
 	cdev_del(&g2d->cdev);
 err_unregister_chrdev:
@@ -7203,15 +7893,15 @@ err_destroy_wq:
 static void sunxi_g2d_remove(struct platform_device *pdev)
 {
 	struct sunxi_g2d_dev *g2d = platform_get_drvdata(pdev);
-	
+
 	dev_dbg(&pdev->dev, "Removing G2D driver\n");
-	
+
 	/* Remove device node */
 	device_destroy(g2d->dev_class, g2d->dev_num);
 	class_destroy(g2d->dev_class);
 	cdev_del(&g2d->cdev);
 	unregister_chrdev_region(g2d->dev_num, 1);
-	
+
 	/* Flush and destroy workqueue */
 
 	/* Cancel pending disable work to avoid running after device removal */
@@ -7219,11 +7909,11 @@ static void sunxi_g2d_remove(struct platform_device *pdev)
 
 	flush_workqueue(g2d->job_wq);
 	destroy_workqueue(g2d->job_wq);
-	
+
 	/* Free RCQ buffer */
 	if (g2d->rcq_enabled)
 		sunxi_g2d_rcq_free(g2d->dev, &g2d->rcq);
-	
+
 	/* Disable hardware if still enabled */
 	mutex_lock(&g2d->dev_mutex);
 	if (g2d->hw_enabled)
