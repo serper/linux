@@ -28,6 +28,18 @@ El driver `sunxi-g2d` proporciona acceso hardware al acelerador gráfico 2D de A
 ✅ **Conversión de Color Space**: BT.601 (SD) y BT.709 (HD) programables para video YUV  
 ✅ **API UAPI estable** en `/dev/g2d`
 
+### Cambios recientes importantes
+
+- Se ha simplificado la lógica de blending atómico: la operación de blend en 3‑buffers ahora es estrictamente atómica y **rechaza escalado** (si src_crop != blend size). Esto evita la complejidad de buffers temporales y problemas de pitch/alineación en operaciones compuestas. Para realizar un blend con escalado, realiza primero un `G2D_IOC_SCALE` (o `G2D_IOC_BLIT` para escalar) y, cuando el fence esté señalizado, encola el `G2D_IOC_BLEND` que usará las dimensiones resultantes.
+
+- El driver usa ahora siempre la tubería V0 (video overlay) como fuente en las operaciones blend por compatibilidad en hardware (soporta RGB y YUV en la práctica). Intentos previos de usar UI1 para RGB resultaron en salidas vacías en algunas plataformas, por eso la implementación actual emplea V0 para mayor fiabilidad.
+
+- Se unificó la conversión de formatos en una única rutina `sunxi_g2d_format_to_hw()` y se eliminó la duplicación de `switch` en funciones de escala/blit. Esto asegura que el mapeo UAPI→registro hardware y el cálculo de `bpp` sean consistentes en todo el driver.
+
+- Protección contra apagado prematuro del HW: al cerrar el último descriptor el driver ya no apaga inmediatamente el hardware. Se añadió un `delayed_work` (`disable_work`) que espera a que la cola de jobs esté vacía y no haya jobs en ejecución antes de llamar a `sunxi_g2d_hw_disable()`. Esto evita condiciones donde una aplicación cierra su fd antes de que sus jobs completen y el HW se apaga mientras hay operaciones en vuelo.
+
+Estas mejoras están en la rama `sunxi-g2d-m2m` y fueron validadas con los demos incluidos (fillrect, blit, rotate, mask, bouncing-ball). Ver commits recientes en el repositorio para detalles de cambios.
+
 ### 🆕 Modo Asíncrono (v2.9.17+)
 
 **IMPORTANTE:** A partir de la versión 2.9.17, el driver opera de forma asíncrona por defecto:
@@ -235,7 +247,7 @@ int main(void)
     blit.fence_fd_in = -1;
 
     /* 5. Ejecutar BLIT */
-    if (ioctl(g2d_fd, G2D_IOC_BLIT, &blit) < 0) {
+    if (ioctl(g2d_fd, G2D_IOC_UNIFIED, &blit) < 0) {
         perror("G2D_IOC_BLIT");
         return 1;
     }
@@ -259,6 +271,35 @@ int main(void)
 ---
 
 ## API Reference
+
+### Concurrencia y uso por múltiples aplicaciones
+
+El driver soporta múltiples procesos abriendo `/dev/g2d` y encolando jobs simultáneamente. Sin embargo, hay consideraciones importantes:
+
+- El hardware G2D es una única unidad física y el driver serializa la ejecución de jobs en una cola. Esto significa que varios procesos pueden encolar jobs, pero estos se ejecutan secuencialmente.
+- Cada job devuelve un `fence_fd` (sync_file). Los procesos deben usar ese fence para sincronizar el acceso a los buffers compartidos. Recomendaciones:
+    - Esperar al `fence_fd` antes de reutilizar o liberar los DMA-BUFs usados por el job.
+    - Mantener el descriptor `/dev/g2d` abierto hasta que el job haya finalizado (o al menos hasta que el fence se haya entregado y cerrado), para evitar que el cierre del descriptor provoque intentos de apagar el hardware prematuramente.
+- El driver evita ahora el apagado del HW hasta que la cola de jobs esté vacía y no haya jobs en ejecución (ver sección "Cambios recientes importantes"). Esto mitiga casos donde una app cierra su fd inmediatamente después de encolar jobs.
+- Si varias aplicaciones comparten el mismo DMA-BUF, deberán coordinarse en userspace (esperar fences) para evitar escritura concurrente mientras el HW está leyendo.
+
+Ejemplo de patrón seguro en userspace:
+
+```c
+// 1) Encolar escala (si es necesario)
+ioctl(g2d_fd, G2D_IOC_UNIFIED, &scale_op); // devuelve scale_op.fence_fd_out
+// 2) Esperar a la finalización del escalado
+poll_or_sync_wait(scale_op.fence_fd_out);
+close(scale_op.fence_fd_out);
+
+// 3) Encolar blend usando el buffer ya escalado
+ioctl(g2d_fd, G2D_IOC_BLEND, &blend_op); // devuelve blend_op.fence_fd_out
+// 4) Esperar al fence del blend si se va a reutilizar el buffer
+poll_or_sync_wait(blend_op.fence_fd_out);
+close(blend_op.fence_fd_out);
+```
+
+Con este patrón, múltiples procesos pueden cooperar de forma segura usando fences y manteniendo la coherencia de los buffers.
 
 ### Abrir el Dispositivo
 
@@ -314,7 +355,7 @@ if (ret < 0) {
 - Retorna cuando el hardware termina (vía IRQ)
 - El buffer debe ser accesible vía DMA
 
-#### `G2D_IOC_BLIT` - Copiar/escalar imagen
+#### `G2D_IOC_UNIFIED` - Copiar/escalar/rotar/blend (unificado)
 
 Copia una región de una imagen origen a un buffer destino con soporte completo para escalado, rotación y flip.
 
@@ -347,7 +388,7 @@ struct g2d_blit blit = {
     .fence_fd_out = -1,
 };
 
-int ret = ioctl(fd, G2D_IOC_BLIT, &blit);
+int ret = ioctl(fd, G2D_IOC_UNIFIED, &blit);
 if (ret < 0) {
     perror("G2D_IOC_BLIT");
 }
@@ -361,6 +402,14 @@ if (ret < 0) {
 - ✅ **Flip**: `G2D_BLT_FLIP_HORIZONTAL/VERTICAL` (combinable con rotación)
 - ✅ **Múltiples operaciones**: Llamar ioctl varias veces consecutivas
 - ✅ **Color Space YUV**: Campo `color_space` en `src`/`dst` para seleccionar BT.601/BT.709 (solo formatos YUV)
+
+-- IMPORTANTE (Blend atómico) --
+- Las operaciones de `BLEND`/`3-BUFFER COMPOSITING` en el driver son atómicas y **no realizan escalado interno**. Si necesitas combinar escalado y blend, hazlo en dos pasos:
+
+    1. Ejecuta un `G2D_IOC_UNIFIED` o `G2D_IOC_SCALE` para escalar el `src` al tamaño objetivo. Espera al `fence_fd_out` o usa `fence_fd_in` en la siguiente operación.
+    2. Ejecuta el `G2D_IOC_BLEND` con las regiones ya a la misma resolución (1:1) para que el driver haga el blend atómico.
+
+Esto evita problemas de sincronización y alocación de buffers temporales por parte del driver.
 
 **Casos de uso:**
 - Copiar imágenes completas entre buffers
@@ -676,7 +725,8 @@ Los formatos YUV son críticos para procesamiento de video. Todos están soporta
 | YUV420_SP_UVUV | `G2D_FMT_YUV420_SP_UVUV` | Y plane + UV interleaved | 4:2:0 | **NV12** ⭐ |
 | YUV420_SP_VUVU | `G2D_FMT_YUV420_SP_VUVU` | Y plane + VU interleaved | 4:2:0 | **NV21** ⭐ |
 | **Formatos Planar 4:2:0 (I420/YV12)** |
-| YUV420_P | `G2D_FMT_YUV420_P` | Y, U, V planes separados | 4:2:0 | **I420/YV12** ⭐ |
+| YUV420_P | `G2D_FMT_YUV420_P` | Y, U, V planes separados | 4:2:0 | **I420 (UV)** ⭐ |
+| YUV420_P_VU | `G2D_FMT_YUV420_P_VU` | Y, V, U en memoria (YV12) | 4:2:0 | **YV12 (VU)** ⭐ |
 | **Formatos Semi-Planar 4:1:1** |
 | YUV411_SP_UVUV | `G2D_FMT_YUV411_SP_UVUV` | Y plane + UV interleaved | 4:1:1 | Raro |
 | YUV411_SP_VUVU | `G2D_FMT_YUV411_SP_VUVU` | Y plane + VU interleaved | 4:1:1 | Raro |
@@ -688,7 +738,11 @@ Los formatos YUV son críticos para procesamiento de video. Todos están soporta
 ⭐ **Formatos más comunes para video**:
 - **NV12** (`YUV420_SP_UVUV`): Usado por FFmpeg, GStreamer, V4L2, cámaras
 - **NV21** (`YUV420_SP_VUVU`): Usado por Android Camera API
-- **I420/YV12** (`YUV420_P`): Formato planar estándar
+- **I420** (`YUV420_P`) y **YV12** (`YUV420_P_VU`): Planar 4:2:0 con orden UV explícito por formato
+
+Nota sobre I420/YV12 en T113:
+- El driver detecta automáticamente el orden de cromas U/V según el formato: `G2D_FMT_YUV420_P` asume UV (I420) y `G2D_FMT_YUV420_P_VU` asume VU (YV12).
+- El parámetro de módulo `yuv_planar_uv_order` permanece solo como override para flujos ambiguos que usen `G2D_FMT_YUV420_P` sin declarar YV12.
 
 ### Uso de Formatos YUV
 

@@ -60,7 +60,7 @@ int sunxi_g2d_rcq_alloc(struct device *dev, struct g2d_rcq_mem *rcq, u32 size)
 	rcq->used = 0;
 	rcq->header_count = 0;
 	
-	dev_info(dev, "RCQ buffer allocated: virt=%p phys=0x%pad size=%u\n",
+	dev_dbg(dev, "RCQ buffer allocated: virt=%p phys=0x%pad size=%u\n",
 	         rcq->vir_addr, &rcq->phy_addr, aligned_size);
 	
 	return 0;
@@ -220,12 +220,12 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 	wmb();
 	
 	/* Log initial state */
-	pr_info("RCQ setup: Initial state - IRQ_CTL=0x%08x CTRL=0x%08x STATUS=0x%08x\n",
+	pr_debug("RCQ setup: Initial state - IRQ_CTL=0x%08x CTRL=0x%08x STATUS=0x%08x\n",
 	        readl(base + G2D_RCQ_IRQ_CTL),
 	        readl(base + G2D_RCQ_CTRL),
 	        readl(base + G2D_RCQ_STATUS));
 	
-	pr_info("RCQ setup: CMD_CTL=0x%08x (should be 0x00010001 for DMA)\n",
+	pr_debug("RCQ setup: CMD_CTL=0x%08x (should be 0x00010001 for DMA)\n",
 	        readl(base + G2D_CMD_CTL));
 	
 	/* v2.1.7: DON'T clear STATUS here - BSP doesn't do it!
@@ -257,7 +257,7 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 	writel(high_addr, base + G2D_RCQ_HEAD_HIGH);
 	writel(header_len_bytes, base + G2D_RCQ_HEAD_LEN);
 	
-	pr_info("RCQ setup: addr=0x%08x (high=0x%02x) headers=%u (%u bytes)\n", 
+	pr_debug("RCQ setup: addr=0x%08x (high=0x%02x) headers=%u (%u bytes)\n", 
 	        (u32)(rcq->phy_addr & 0xFFFFFFFF), high_addr, 
 	        rcq->header_count, header_len_bytes);
 	
@@ -268,7 +268,7 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 		u32 read_low = verify_hdr->low_addr;
 		u32 read_reg = verify_hdr->reg_offset;
 		
-		pr_info("RCQ CPU readback: First header low_addr=0x%08x reg_offset=0x%08x\n",
+		pr_debug("RCQ CPU readback: First header low_addr=0x%08x reg_offset=0x%08x\n",
 			read_low, read_reg);
 		
 		/* Sanity: reg_offset should be 0x28000 + MIXER offset */
@@ -280,7 +280,7 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 	}
 	
 	/* Read back to verify */
-	pr_info("RCQ regs written: HEAD_LOW=0x%08x HEAD_HIGH=0x%08x HEAD_LEN=0x%08x\n",
+	pr_debug("RCQ regs written: HEAD_LOW=0x%08x HEAD_HIGH=0x%08x HEAD_LEN=0x%08x\n",
 	        readl(base + G2D_RCQ_HEAD_LOW),
 	        readl(base + G2D_RCQ_HEAD_HIGH),
 	        readl(base + G2D_RCQ_HEAD_LEN));
@@ -343,11 +343,11 @@ void sunxi_g2d_rcq_start(void __iomem *base, bool use_en_bit, bool enable_irq)
 	if (enable_irq) {
 		irq_ctl.bits.task_end_irq_en = 1;        /* Enable for RCQ v2 (BSP pattern) */
 		irq_ctl.bits.rcq_cfg_finish_irq_en = 0;  /* Keep disabled - causes IRQ storm */
-		pr_info("RCQ IRQ enabled: task_end_irq_en=1 (BSP pattern for RCQ v2)\n");
+		pr_debug("RCQ IRQ enabled: task_end_irq_en=1 (BSP pattern for RCQ v2)\n");
 	} else {
 		irq_ctl.bits.task_end_irq_en = 0;        /* Disable - legacy behavior */
 		irq_ctl.bits.rcq_cfg_finish_irq_en = 0;  /* Disable - causes IRQ storm */
-		pr_info("RCQ IRQs disabled: using MIXER_IRQ for completion (legacy)\n");
+		pr_debug("RCQ IRQs disabled: using MIXER_IRQ for completion (legacy)\n");
 	}
 	writel(irq_ctl.dwval, base + G2D_RCQ_IRQ_CTL);
 	
@@ -356,13 +356,13 @@ void sunxi_g2d_rcq_start(void __iomem *base, bool use_en_bit, bool enable_irq)
 	if (use_en_bit)
 		ctrl.bits.en = 1;       /* Enable RCQ (T113 v2 - experimental) */
 	ctrl.bits.update = 1;   /* Trigger RCQ execution */
-	pr_info("RCQ writing CTRL=0x%08x (en=%d update=1 use_en_bit=%d)\n", 
+	pr_debug("RCQ writing CTRL=0x%08x (en=%d update=1 use_en_bit=%d)\n", 
 	        ctrl.dwval, ctrl.bits.en, use_en_bit);
 	writel(ctrl.dwval, base + G2D_RCQ_CTRL);
 	wmb();  /* Ensure all writes are committed before checking status */
 	
 	/* Read status immediately after UPDATE to see if anything happened */
-	pr_info("RCQ started: IRQ_CTL=0x%08x\n", irq_ctl.dwval);
-	pr_info("RCQ status after UPDATE: CTRL=0x%08x STATUS=0x%08x\n",
+	pr_debug("RCQ started: IRQ_CTL=0x%08x\n", irq_ctl.dwval);
+	pr_debug("RCQ status after UPDATE: CTRL=0x%08x STATUS=0x%08x\n",
 	        readl(base + G2D_RCQ_CTRL), readl(base + G2D_RCQ_STATUS));
 }
