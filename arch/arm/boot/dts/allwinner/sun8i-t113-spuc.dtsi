@@ -150,6 +150,7 @@
         de: display-engine {
                 compatible = "allwinner,sun20i-d1-display-engine";
                 allwinner,pipelines = <&mixer0>, <&mixer1>;
+                iommus = <&iommu 2>;
                 status = "disabled";
         };
 
@@ -915,7 +916,7 @@
                         reset-names = "bus";
                         interconnects = <&mbus 9>;
                         interconnect-names = "dma-mem";
-                        // iommus = <&iommu 3>;
+                        iommus = <&iommu 3>;
                 };
 
                 ve: video-codec@1c0e000 {
@@ -929,17 +930,18 @@
                         interconnect-names = "dma-mem";
                         allwinner,sram = <&ve_sram 1>;
                         // power-domains = <&ppu PD_VE>;
-                        /* iommus = <&iommu 0>; Temporarily disabled */
+                        iommus = <&iommu 0>;
                         status = "disabled";
                 };
 
-                // iommu: iommu@2010000 {
-                //         compatible = "allwinner,sun20i-d1-iommu";
-                //         reg = <0x2010000 0x10000>;
-                //         interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
-                //         clocks = <&ccu CLK_BUS_IOMMU>;
-                //         #iommu-cells = <1>;
-                // };
+                iommu: iommu@2010000 {
+                        compatible = "allwinner,sun20i-d1-iommu";
+                        reg = <0x2010000 0x10000>;
+                        interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+                        clocks = <&ccu CLK_BUS_IOMMU>;
+                        #iommu-cells = <1>;
+                        status = "okay";
+                };
 
                 // csi: csi@5800000 {
 		// 	reg = <0x5800000 0x400000>;

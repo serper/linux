@@ -87,6 +87,17 @@ module_param(g2d_alloc_use_system_heap, bool, 0644);
 MODULE_PARM_DESC(g2d_alloc_use_system_heap,
 	"Use system heap pages for driver-side allocations (true) or CMA noncontiguous (false)");
 
+/* New: allocation backend mode
+ *  0 = CMA/noncontiguous (default)
+ *  1 = system pages (vmap + sg_table + dma_map_sgtable)
+ *  2 = IOMMU coherent (dma_alloc_coherent -> contiguo en IOVA)
+ * Si g2d_alloc_mode==0 pero g2d_alloc_use_system_heap=true, se usa el modo 1 para compatibilidad.
+ */
+static int g2d_alloc_mode;
+module_param_named(g2d_alloc_mode, g2d_alloc_mode, int, 0644);
+MODULE_PARM_DESC(g2d_alloc_mode,
+	"0=CMA (default), 1=system pages (sg), 2=IOMMU coherent (contiguous IOVA)");
+
 /* Module parameters for RCQ experimentation (deprecated - RCQ not functional on T113-S3) */
 static bool rcq_enable_bit = true;
 module_param(rcq_enable_bit, bool, 0644);
@@ -398,6 +409,7 @@ struct g2d_dma_mem {
 	/* For system-backed allocation (non-CMA): keep pages array to free later */
 	struct page **pages;
 	unsigned int nents;
+	bool is_coherent; /* Allocado con dma_alloc_coherent: IOVA contigua */
 };
 
 static int g2d_dma_mem_alloc(struct device *dev, size_t size,
@@ -409,11 +421,58 @@ static int g2d_dma_mem_alloc(struct device *dev, size_t size,
 	if (!mem || !size)
 		return -EINVAL;
 
-	/* If user requested system-backed allocation, attempt to allocate
+	memset(mem, 0, sizeof(*mem));
+	mem->size = size;
+
+	/* Selección de backend: prioridad a g2d_alloc_mode; si es 0 y
+	 * g2d_alloc_use_system_heap=true, usar modo 1 por compatibilidad.
+	 */
+	{
+		int mode = g2d_alloc_mode;
+		if (mode == 0 && g2d_alloc_use_system_heap)
+			mode = 1;
+
+		if (mode == 2) {
+			/* IOMMU coherent: región IOVA contigua, evita CMA si es posible */
+			dma_addr_t dma;
+			void *va = dma_alloc_coherent(dev, size, &dma, gfp);
+			if (va) {
+				int ret_sg;
+				struct sg_table *coh_sgt = kzalloc(sizeof(*coh_sgt), GFP_KERNEL);
+				if (!coh_sgt) {
+					dma_free_coherent(dev, size, va, dma);
+					return -ENOMEM;
+				}
+				/* Construir sg_table para export/PRIME y mmap */
+				ret_sg = dma_get_sgtable_attrs(dev, coh_sgt, va, dma, size, 0);
+				if (ret_sg) {
+					kfree(coh_sgt);
+					dma_free_coherent(dev, size, va, dma);
+					return ret_sg;
+				}
+				memset(va, 0, size);
+				mem->vaddr = va;
+				mem->dma_addr = dma;
+				mem->sgt = coh_sgt;
+				mem->is_coherent = true;
+				return 0;
+			}
+			/* Si falla, continuar a otros backends */
+			dev_warn(dev, "g2d: dma_alloc_coherent failed size=%zu, fallback\n", size);
+		}
+
+		if (mode == 1) {
+			/* continuar con ruta system-backed existente */
+		} else if (mode != 0) {
+			/* modo desconocido -> seguir con CMA */
+		}
+	}
+
+	/* If user requested system-backed allocation (mode=1), attempt to allocate
 	 * individual pages, vmap them and build an sg_table which we map
 	 * for device access. This avoids consuming CMA.
 	 */
-	if (g2d_alloc_use_system_heap) {
+	if (g2d_alloc_mode == 1 || (g2d_alloc_mode == 0 && g2d_alloc_use_system_heap)) {
 		unsigned int nents = DIV_ROUND_UP(size, PAGE_SIZE);
 		struct page **pages = NULL;
 		unsigned int i;
@@ -527,7 +586,15 @@ static void g2d_dma_mem_free(struct device *dev, struct g2d_dma_mem *mem)
 	if (!mem || !mem->sgt)
 		return;
 
-	if (mem->pages) {
+	if (mem->is_coherent) {
+		/* Coherent path: free coherent and sgtable wrapper */
+		if (mem->sgt) {
+			sg_free_table(mem->sgt);
+			kfree(mem->sgt);
+		}
+		if (mem->vaddr)
+			dma_free_coherent(dev, mem->size, mem->vaddr, mem->dma_addr);
+	} else if (mem->pages) {
 		/* system-backed allocation path */
 		dma_unmap_sgtable(dev, mem->sgt, DMA_BIDIRECTIONAL, 0);
 		sg_free_table(mem->sgt);
@@ -554,6 +621,7 @@ static void g2d_dma_mem_free(struct device *dev, struct g2d_dma_mem *mem)
 	mem->vaddr = NULL;
 	mem->dma_addr = 0;
 	mem->size = 0;
+	mem->is_coherent = false;
 }
 
 static int g2d_sg_dma_address(struct device *dev, struct sg_table *sgt,
@@ -563,6 +631,20 @@ static int g2d_sg_dma_address(struct device *dev, struct sg_table *sgt,
 
 	if (!sgt || !sgt->sgl)
 		return -EINVAL;
+
+	/* Hardware limitation: T113 G2D expects a single, physically contiguous
+	 * DMA segment for linear framebuffer access. Scatter-gather lists with
+	 * more than one entry are not supported for source/destination surfaces.
+	 * If we proceed with a non-contiguous sg_table and program only the base
+	 * address, the HW will DMA past the first segment causing memory
+	 * corruption and kernel faults. Reject early and let userspace/allocator
+	 * choose a contiguous buffer (e.g., from CMA) or implement a staged copy.
+	 */
+	if (sgt->nents > 1) {
+		dev_err(dev, "%s: non-contiguous dma-buf not supported by G2D (nents=%d)\n",
+			label ? label : "buffer", sgt->nents);
+		return -EOPNOTSUPP;
+	}
 
 	addr = sg_dma_address(sgt->sgl);
 	if (!addr) {
@@ -3541,13 +3623,18 @@ static int g2d_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	dev_info(buf->dev, "g2d_dmabuf_mmap: size=%zu vma_size=%lu\n",
 			 buf->mem.size, vma->vm_end - vma->vm_start);
 
-	if (!buf->mem.sgt) {
-		dev_err(buf->dev, "g2d_dmabuf_mmap: no sgt available\n");
-		return -EINVAL;
+	if (buf->mem.is_coherent) {
+		/* Map coherent memory directly */
+		ret = dma_mmap_attrs(buf->dev, vma, buf->mem.vaddr,
+					 buf->mem.dma_addr, buf->mem.size, 0);
+	} else {
+		if (!buf->mem.sgt) {
+			dev_err(buf->dev, "g2d_dmabuf_mmap: no sgt available\n");
+			return -EINVAL;
+		}
+		ret = dma_mmap_noncontiguous(buf->dev, vma, buf->mem.size,
+						   buf->mem.sgt);
 	}
-
-	ret = dma_mmap_noncontiguous(buf->dev, vma, buf->mem.size,
-					   buf->mem.sgt);
 	dev_info(buf->dev, "g2d_dmabuf_mmap: ret=%d\n", ret);
 	return ret;
 }

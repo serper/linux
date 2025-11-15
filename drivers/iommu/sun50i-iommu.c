@@ -834,14 +834,41 @@ static struct iommu_device *sun50i_iommu_probe_device(struct device *dev)
 }
 
 static int sun50i_iommu_of_xlate(struct device *dev,
-				 const struct of_phandle_args *args)
+			 const struct of_phandle_args *args)
 {
-	struct platform_device *iommu_pdev = of_find_device_by_node(args->np);
-	unsigned id = args->args[0];
+	struct platform_device *iommu_pdev;
+	struct sun50i_iommu *iommu;
+	unsigned int id = args->args[0];
+	int ret;
 
-	dev_iommu_priv_set(dev, platform_get_drvdata(iommu_pdev));
+	iommu_pdev = of_find_device_by_node(args->np);
+	if (!iommu_pdev)
+		return -EPROBE_DEFER;
 
-	return iommu_fwspec_add_ids(dev, &id, 1);
+	if (!device_is_bound(&iommu_pdev->dev)) {
+		put_device(&iommu_pdev->dev);
+		return -EPROBE_DEFER;
+	}
+
+	iommu = platform_get_drvdata(iommu_pdev);
+	if (!iommu) {
+		put_device(&iommu_pdev->dev);
+		return -EPROBE_DEFER;
+	}
+
+/* Acquire runtime PM for the IOMMU while configuring clients */
+	ret = pm_runtime_resume_and_get(&iommu_pdev->dev);
+	if (ret) {
+		put_device(&iommu_pdev->dev);
+		return ret;
+	}
+
+	dev_iommu_priv_set(dev, iommu);
+	ret = iommu_fwspec_add_ids(dev, &id, 1);
+	put_device(&iommu_pdev->dev);
+	pm_runtime_put(&iommu_pdev->dev);
+
+	return ret;
 }
 
 static const struct iommu_ops sun50i_iommu_ops = {

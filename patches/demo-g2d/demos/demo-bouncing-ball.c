@@ -160,9 +160,9 @@ static int g2d_read_buffer(int g2d_fd, int dma_fd, void *data, size_t size,
  * Step 2b: ALPHA_BLEND ball_yuv (YUV) + temp → temp with scaling
  * Step 3: BLIT temp_buffer → framebuffer (final display)
  */
-int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
-		       int ball_ion_fd, int temp_ion_fd,
-		       int comp_ion_fd, int dmabuf_fd, int x,
+int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
+	       int ball_dma_fd, int temp_dma_fd,
+	       int comp_dma_fd, int dmabuf_fd, int x,
 		       int y, int radius, int ball_buffer_size)
 {
 	int ret;
@@ -199,7 +199,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_bg.src.height = disp->height;
 	cmd_bg.src.format = G2D_FMT_XRGB8888;
 	cmd_bg.src.stride[0] = disp->width * 4;
-	cmd_bg.src.dma_fd = bg_ion_fd;
+	cmd_bg.src.dma_fd = bg_dma_fd;
 	cmd_bg.src.crop_x = 0;
 	cmd_bg.src.crop_y = 0;
 	cmd_bg.src.crop_w = disp->width;
@@ -209,7 +209,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_bg.dst.height = disp->height;
 	cmd_bg.dst.format = G2D_FMT_XRGB8888;
 	cmd_bg.dst.stride[0] = disp->width * 4;
-	cmd_bg.dst.dma_fd = temp_ion_fd;
+	cmd_bg.dst.dma_fd = temp_dma_fd;
 
 	cmd_bg.dst_x = 0;
 	cmd_bg.dst_y = 0;
@@ -236,7 +236,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_scale_ball.src.height = ball_buffer_size;
 	cmd_scale_ball.src.format = G2D_FMT_XRGB8888;
 	cmd_scale_ball.src.stride[0] = ball_buffer_size * 4;
-	cmd_scale_ball.src.dma_fd = ball_ion_fd;
+	cmd_scale_ball.src.dma_fd = ball_dma_fd;
 	cmd_scale_ball.src.crop_x = 0;
 	cmd_scale_ball.src.crop_y = 0;
 	cmd_scale_ball.src.crop_w = ball_buffer_size;
@@ -247,7 +247,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_scale_ball.dst.height = ball_size;
 	cmd_scale_ball.dst.format = G2D_FMT_XRGB8888;
 	cmd_scale_ball.dst.stride[0] = ball_buffer_size * 4;  /* Buffer is still ball_buffer_size wide */
-	cmd_scale_ball.dst.dma_fd = comp_ion_fd;
+	cmd_scale_ball.dst.dma_fd = comp_dma_fd;
 
 	cmd_scale_ball.dst_x = 0;
 	cmd_scale_ball.dst_y = 0;
@@ -274,7 +274,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_blend.src.height = ball_size;
 	cmd_blend.src.format = G2D_FMT_ARGB8888;
 	cmd_blend.src.stride[0] = ball_buffer_size * 4;  /* Physical buffer pitch */
-	cmd_blend.src.dma_fd = comp_ion_fd;
+	cmd_blend.src.dma_fd = comp_dma_fd;
 	cmd_blend.src.crop_x = 0;
 	cmd_blend.src.crop_y = 0;
 	cmd_blend.src.crop_w = ball_size;
@@ -288,7 +288,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_blend.dst.height = disp->height;
 	cmd_blend.dst.format = G2D_FMT_XRGB8888;
 	cmd_blend.dst.stride[0] = disp->width * 4;
-	cmd_blend.dst.dma_fd = temp_ion_fd;  /* Read from temp (has bg) */
+	cmd_blend.dst.dma_fd = temp_dma_fd;  /* Read from temp (has bg) */
 	cmd_blend.dst.crop_x = x;  /* Read background region where ball will be */
 	cmd_blend.dst.crop_y = y;
 	cmd_blend.dst.crop_w = ball_size;
@@ -301,7 +301,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_blend.out.height = disp->height;
 	cmd_blend.out.format = G2D_FMT_XRGB8888;
 	cmd_blend.out.stride[0] = disp->width * 4;
-	cmd_blend.out.dma_fd = temp_ion_fd;  /* Write to temp (same buffer, different semantics) */
+	cmd_blend.out.dma_fd = temp_dma_fd;  /* Write to temp (same buffer, different semantics) */
 
 	/* Destination position (NO scaling, just positioning) */
 	cmd_blend.dst_x = x;
@@ -332,7 +332,7 @@ int g2d_blend_ball_ion(struct drm_display *disp, int g2d_fd, int bg_ion_fd,
 	cmd_copy.src.height = disp->height;
 	cmd_copy.src.format = G2D_FMT_XRGB8888;
 	cmd_copy.src.stride[0] = disp->width * 4;
-	cmd_copy.src.dma_fd = temp_ion_fd;  /* Read from temp (has bg + ball) */
+	cmd_copy.src.dma_fd = temp_dma_fd;  /* Read from temp (has bg + ball) */
 	cmd_copy.src.crop_x = 0;
 	cmd_copy.src.crop_y = 0;
 	cmd_copy.src.crop_w = disp->width;
@@ -404,10 +404,10 @@ int main(int argc, char **argv)
 	int frame_count = 0;
 	float fps = 0.0f;
 	struct timespec fps_start;
-	int ball_ion_fd = -1;
-	int bg_ion_fd = -1;
-	int temp_ion_fd = -1; /* Background copy buffer */
-	int comp_ion_fd =
+	int ball_dma_fd = -1;
+	int bg_dma_fd = -1;
+	int temp_dma_fd = -1; /* Background copy buffer */
+	int comp_dma_fd =
 		-1; /* Composition output buffer (3rd distinct buffer) */
 
 	signal(SIGINT, sigint_handler);
@@ -420,53 +420,53 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Create ION buffer for ball sprite (120x120 ARGB8888 - large enough for max scaling) */
+	/* Create DMA buffer for ball sprite (120x120 ARGB8888 - large enough for max scaling) */
 	struct g2d_alloc_buffer ball_alloc = { 0 };
 	ball_alloc.size = ball_buffer_size * ball_buffer_size *
 			  4; /* ARGB8888 = 4 bytes per pixel */
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &ball_alloc);
 	if (ret < 0) {
-		fprintf(stderr, "Failed to allocate ION buffer for ball\n");
+		fprintf(stderr, "Failed to allocate DMA buffer for ball\n");
 		perror("G2D_IOC_ALLOC_BUFFER (ball)");
 		drm_display_cleanup(&disp);
 		return 1;
 	}
-	ball_ion_fd = ball_alloc.dma_fd;
-	printf("Ball ION buffer allocated: fd=%d size=%llu bytes (%dx%d ARGB8888)\n",
-	       ball_ion_fd, ball_alloc.size, ball_buffer_size,
+	ball_dma_fd = ball_alloc.dma_fd;
+	printf("Ball DMA buffer allocated: fd=%d size=%llu bytes (%dx%d ARGB8888)\n",
+	       ball_dma_fd, ball_alloc.size, ball_buffer_size,
 	       ball_buffer_size);
 
-	/* Create ION buffer for background (800x480 XRGB8888) */
+	/* Create DMA buffer for background (800x480 XRGB8888) */
 	struct g2d_alloc_buffer bg_alloc = { 0 };
 	bg_alloc.size = disp.width * disp.height * 4;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &bg_alloc);
 	if (ret < 0) {
 		fprintf(stderr,
-			"Failed to allocate ION buffer for background\n");
+			"Failed to allocate DMA buffer for background\n");
 		perror("G2D_IOC_ALLOC_BUFFER (bg)");
-		close(ball_ion_fd);
+		close(ball_dma_fd);
 		drm_display_cleanup(&disp);
 		return 1;
 	}
-	bg_ion_fd = bg_alloc.dma_fd;
-	printf("Background ION buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
-	       bg_ion_fd, bg_alloc.size, disp.width, disp.height);
+	bg_dma_fd = bg_alloc.dma_fd;
+	printf("Background DMA buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
+	       bg_dma_fd, bg_alloc.size, disp.width, disp.height);
 
-	/* Create temporary ION buffer for composition (same size as background) */
+	/* Create temporary DMA buffer for composition (same size as background) */
 	struct g2d_alloc_buffer temp_alloc = { 0 };
 	temp_alloc.size = disp.width * disp.height * 4;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &temp_alloc);
 	if (ret < 0) {
-		fprintf(stderr, "Failed to allocate ION buffer for temp\n");
+		fprintf(stderr, "Failed to allocate DMA buffer for temp\n");
 		perror("G2D_IOC_ALLOC_BUFFER (temp)");
-		close(bg_ion_fd);
-		close(ball_ion_fd);
+		close(bg_dma_fd);
+		close(ball_dma_fd);
 		drm_display_cleanup(&disp);
 		return 1;
 	}
-	temp_ion_fd = temp_alloc.dma_fd;
-	printf("Temp ION buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
-	       temp_ion_fd, temp_alloc.size, disp.width, disp.height);
+	temp_dma_fd = temp_alloc.dma_fd;
+	printf("Temp DMA buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
+	       temp_dma_fd, temp_alloc.size, disp.width, disp.height);
 
 	/* Create composition buffer for intermediate blend result (110x110 XRGB8888)
 	 * Used in new 3-step approach: blend ball+bg → comp, then scale comp → temp
@@ -477,17 +477,17 @@ int main(int argc, char **argv)
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &comp_alloc);
 	if (ret < 0) {
 		fprintf(stderr,
-			"Failed to allocate ION buffer for composition output\n");
+			"Failed to allocate DMA buffer for composition output\n");
 		perror("G2D_IOC_ALLOC_BUFFER (comp)");
-		close(temp_ion_fd);
-		close(bg_ion_fd);
-		close(ball_ion_fd);
+		close(temp_dma_fd);
+		close(bg_dma_fd);
+		close(ball_dma_fd);
 		drm_display_cleanup(&disp);
 		return 1;
 	}
-	comp_ion_fd = comp_alloc.dma_fd;
-	printf("Composition ION buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
-	       comp_ion_fd, comp_alloc.size, ball_buffer_size,
+	comp_dma_fd = comp_alloc.dma_fd;
+	printf("Composition DMA buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
+	       comp_dma_fd, comp_alloc.size, ball_buffer_size,
 	       ball_buffer_size);
 
 	/* Create ball pattern in userspace memory then upload using G2D_IOC_WRITE_BUFFER
@@ -498,9 +498,9 @@ int main(int argc, char **argv)
 		uint32_t *ball_pattern = malloc(ball_alloc.size);
 		if (!ball_pattern) {
 			perror("malloc (ball pattern)");
-			close(temp_ion_fd);
-			close(bg_ion_fd);
-			close(ball_ion_fd);
+			close(temp_dma_fd);
+			close(bg_dma_fd);
+			close(ball_dma_fd);
 			drm_display_cleanup(&disp);
 			return 1;
 		}
@@ -570,7 +570,7 @@ int main(int argc, char **argv)
 		       center_x, center_y, center_idx,
 		       ball_pattern[center_idx]);
 
-		/* Upload pattern to ION buffer using WRITE_BUFFER ioctl */
+		/* Upload pattern to DMA buffer using WRITE_BUFFER ioctl */
 		printf("DEBUG: About to call g2d_write_buffer with ball_pattern=%p, first word=0x%08X\n",
 		       ball_pattern, ball_pattern[0]);
 
@@ -578,27 +578,27 @@ int main(int argc, char **argv)
 		__builtin___clear_cache((char *)ball_pattern,
 					(char *)ball_pattern + ball_alloc.size);
 
-		ret = g2d_write_buffer(disp.g2d_fd, ball_ion_fd, ball_pattern,
+		ret = g2d_write_buffer(disp.g2d_fd, ball_dma_fd, ball_pattern,
 				       ball_alloc.size, 0);
 		printf("DEBUG: g2d_write_buffer returned %d\n", ret);
 
 		if (ret < 0) {
 			fprintf(stderr,
-				"Failed to write ball pattern to ION buffer\n");
+				"Failed to write ball pattern to DMA buffer\n");
 			free(ball_pattern);
-			close(comp_ion_fd);
-			close(temp_ion_fd);
-			close(bg_ion_fd);
-			close(ball_ion_fd);
+			close(comp_dma_fd);
+			close(temp_dma_fd);
+			close(bg_dma_fd);
+			close(ball_dma_fd);
 			drm_display_cleanup(&disp);
 			return 1;
 		}
 
-		printf("Ball pattern uploaded to ION buffer successfully via G2D_IOC_WRITE_BUFFER\n");
+		printf("Ball pattern uploaded to DMA buffer successfully via G2D_IOC_WRITE_BUFFER\n");
 	}
 
 	/* NOTE: ball_scaled buffer is no longer needed
-	 * We use ball_ion_fd directly in the blend operation
+	 * We use ball_dma_fd directly in the blend operation
 	 * The VSU will handle scaling during the alpha blend
 	 */
 
@@ -620,25 +620,25 @@ int main(int argc, char **argv)
 	const int gradient_height = 16;
 
 	/* Allocate small gradient source buffer */
-	int gradient_ion_fd;
+	int gradient_dma_fd;
 	struct g2d_alloc_buffer gradient_alloc = { 0 };
 	gradient_alloc.size =
 		gradient_width * gradient_height * 4; /* XRGB8888 */
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &gradient_alloc);
 	if (ret < 0) {
 		fprintf(stderr,
-			"Failed to allocate ION buffer for gradient source\n");
+			"Failed to allocate DMA buffer for gradient source\n");
 		perror("G2D_IOC_ALLOC_BUFFER (gradient)");
-		close(comp_ion_fd);
-		close(temp_ion_fd);
-		close(bg_ion_fd);
-		close(ball_ion_fd);
+		close(comp_dma_fd);
+		close(temp_dma_fd);
+		close(bg_dma_fd);
+		close(ball_dma_fd);
 		drm_display_cleanup(&disp);
 		return 1;
 	}
-	gradient_ion_fd = gradient_alloc.dma_fd;
+	gradient_dma_fd = gradient_alloc.dma_fd;
 	printf("Gradient source buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
-	       gradient_ion_fd, gradient_alloc.size, gradient_width,
+	       gradient_dma_fd, gradient_alloc.size, gradient_width,
 	       gradient_height);
 
 	/* Create gradient pattern in memory (vertical gradient from top to bottom) */
@@ -646,11 +646,11 @@ int main(int argc, char **argv)
 		uint32_t *gradient_data = malloc(gradient_alloc.size);
 		if (!gradient_data) {
 			perror("malloc (gradient pattern)");
-			close(gradient_ion_fd);
-			close(comp_ion_fd);
-			close(temp_ion_fd);
-			close(bg_ion_fd);
-			close(ball_ion_fd);
+			close(gradient_dma_fd);
+			close(comp_dma_fd);
+			close(temp_dma_fd);
+			close(bg_dma_fd);
+			close(ball_dma_fd);
 			drm_display_cleanup(&disp);
 			return 1;
 		}
@@ -682,11 +682,11 @@ int main(int argc, char **argv)
 			}
 		}
 
-		/* Upload gradient pattern to ION buffer */
+		/* Upload gradient pattern to DMA buffer */
 		printf("DEBUG: About to call g2d_write_buffer for gradient\n");
 		fflush(stdout);
 		
-		ret = g2d_write_buffer(disp.g2d_fd, gradient_ion_fd,
+		ret = g2d_write_buffer(disp.g2d_fd, gradient_dma_fd,
 				       gradient_data, gradient_alloc.size, 0);
 		
 		printf("DEBUG: g2d_write_buffer returned %d, about to free gradient_data\n", ret);
@@ -699,12 +699,12 @@ int main(int argc, char **argv)
 
 		if (ret < 0) {
 			fprintf(stderr,
-				"Failed to write gradient pattern to ION buffer\n");
-			close(gradient_ion_fd);
-			close(comp_ion_fd);
-			close(temp_ion_fd);
-			close(bg_ion_fd);
-			close(ball_ion_fd);
+				"Failed to write gradient pattern to DMA buffer\n");
+			close(gradient_dma_fd);
+			close(comp_dma_fd);
+			close(temp_dma_fd);
+			close(bg_dma_fd);
+			close(ball_dma_fd);
 			drm_display_cleanup(&disp);
 			return 1;
 		}
@@ -724,7 +724,7 @@ int main(int argc, char **argv)
 	cmd_scale.src.height = gradient_height;
 	cmd_scale.src.format = G2D_FMT_XRGB8888;
 	cmd_scale.src.stride[0] = gradient_width * 4;
-	cmd_scale.src.dma_fd = gradient_ion_fd;
+	cmd_scale.src.dma_fd = gradient_dma_fd;
 	cmd_scale.src.crop_x = 0;
 	cmd_scale.src.crop_y = 0;
 	cmd_scale.src.crop_w = gradient_width;
@@ -735,7 +735,7 @@ int main(int argc, char **argv)
 	cmd_scale.dst.height = disp.height;
 	cmd_scale.dst.format = G2D_FMT_XRGB8888;
 	cmd_scale.dst.stride[0] = disp.width * 4;
-	cmd_scale.dst.dma_fd = bg_ion_fd;
+	cmd_scale.dst.dma_fd = bg_dma_fd;
 
 	cmd_scale.dst_x = 0;
 	cmd_scale.dst_y = 0;
@@ -756,11 +756,11 @@ int main(int argc, char **argv)
 	
 	if (ret < 0) {
 		perror("G2D_IOC_CMD (SCALE: gradient → background)");
-		close(gradient_ion_fd);
-		close(comp_ion_fd);
-		close(temp_ion_fd);
-		close(bg_ion_fd);
-		close(ball_ion_fd);
+		close(gradient_dma_fd);
+		close(comp_dma_fd);
+		close(temp_dma_fd);
+		close(bg_dma_fd);
+		close(ball_dma_fd);
 		drm_display_cleanup(&disp);
 		return 1;
 	}
@@ -770,7 +770,7 @@ int main(int argc, char **argv)
 	printf("DEBUG: sync_wait_and_close completed\n");
 
 	/* Clean up gradient source buffer (no longer needed) */
-	close(gradient_ion_fd);
+	close(gradient_dma_fd);
 	printf("Background filled with VSU-interpolated smooth gradient\n");
 
 	/* Removed diagnostic startup blit that populated both fb pages. The
@@ -797,10 +797,10 @@ int main(int argc, char **argv)
 	int fb_dmabuf = drm_export_dmabuf(&disp);
 	if (fb_dmabuf < 0) {
 		fprintf(stderr, "Failed to export framebuffer dmabuf\n");
-		close(comp_ion_fd);
-		close(temp_ion_fd);
-		close(bg_ion_fd);
-		close(ball_ion_fd);
+		close(comp_dma_fd);
+		close(temp_dma_fd);
+		close(bg_dma_fd);
+		close(ball_dma_fd);
 		drm_display_cleanup(&disp);
 		return 1;
 	}
@@ -825,9 +825,9 @@ int main(int argc, char **argv)
 		 * Step 2b (inside function): CMD_BLEND comp + temp → temp (blending only, NO scaling)
 		 * Step 3 (inside function): CMD_COPY temp → framebuffer (final copy)
 		 */
-		ret = g2d_blend_ball_ion(
-			&disp, disp.g2d_fd, bg_ion_fd, ball_ion_fd,
-			temp_ion_fd, comp_ion_fd,
+		ret = g2d_blend_ball_dma(
+			&disp, disp.g2d_fd, bg_dma_fd, ball_dma_fd,
+			temp_dma_fd, comp_dma_fd,
 			fb_dmabuf,
 			(int)(ball_x - ball_radius),
 			(int)(ball_y - ball_radius), ball_radius,
@@ -905,14 +905,14 @@ int main(int argc, char **argv)
 	if (fb_dmabuf >= 0)
 		close(fb_dmabuf);
 
-	if (comp_ion_fd >= 0)
-		close(comp_ion_fd);
-	if (temp_ion_fd >= 0)
-		close(temp_ion_fd);
-	if (bg_ion_fd >= 0)
-		close(bg_ion_fd);
-	if (ball_ion_fd >= 0)
-		close(ball_ion_fd);
+	if (comp_dma_fd >= 0)
+		close(comp_dma_fd);
+	if (temp_dma_fd >= 0)
+		close(temp_dma_fd);
+	if (bg_dma_fd >= 0)
+		close(bg_dma_fd);
+	if (ball_dma_fd >= 0)
+		close(ball_dma_fd);
 
 	drm_display_cleanup(&disp);
 
