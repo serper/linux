@@ -462,14 +462,40 @@ static int g2d_dma_mem_alloc(struct device *dev, size_t size,
 		}
 
 		{
-			struct scatterlist *sg = sgt->sgl;
+			/* Build sg_table coalescing physically contiguous pages
+			 * to reduce the number of segments seen by importers.
+			 */
+			struct scatterlist *sg = sgt->sgl, *last = NULL;
+			unsigned int segs = 0;
 			size_t remaining = size;
-			for (i = 0; i < nents; i++) {
+			unsigned int idx = 0;
+
+			while (idx < nents) {
+				struct page *start = pages[idx];
 				size_t len = min_t(size_t, remaining, PAGE_SIZE);
-				sg_set_page(sg, pages[i], len, 0);
+				unsigned long pfn = page_to_pfn(start);
+
+				idx++;
+				/* Extend this segment while pages are physically contiguous */
+				while (idx < nents &&
+				       page_to_pfn(pages[idx]) == (pfn + (len >> PAGE_SHIFT))) {
+					size_t add = min_t(size_t, remaining - len, PAGE_SIZE);
+					len += add;
+					idx++;
+				}
+
+				sg_set_page(sg, start, len, 0);
+				last = sg;
+				segs++;
 				remaining -= len;
-				sg = sg_next(sg);
+				if (idx < nents)
+					sg = sg_next(sg);
 			}
+
+			/* Mark the end of scatterlist and set entry count before mapping */
+			if (last)
+				sg_mark_end(last);
+			sgt->nents = segs;
 		}
 
 		ret = dma_map_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
@@ -3465,6 +3491,9 @@ static int g2d_dmabuf_attach(struct dma_buf *dmabuf,
 	a->mapped = false;
 	attach->priv = a;
 
+	dev_info(buf->dev, "g2d_dmabuf_attach: dmabuf=%p attach->dev=%p orig_nents=%u\n",
+			 dmabuf, attach->dev, buf->mem.sgt ? buf->mem.sgt->orig_nents : 0);
+
 	return 0;
 }
 
@@ -3490,11 +3519,18 @@ static struct sg_table *g2d_dmabuf_map(struct dma_buf_attachment *attach,
 	struct g2d_dmabuf_attachment *a = attach->priv;
 	int ret;
 
+	dev_info(attach->dev, "g2d_dmabuf_map: attach->dev=%p dir=%d orig_nents=%u\n",
+			 attach->dev, dir, a->sgt.orig_nents);
+
 	ret = dma_map_sgtable(attach->dev, &a->sgt, dir, 0);
-	if (ret)
+	if (ret) {
+		dev_err(attach->dev, "g2d_dmabuf_map: dma_map_sgtable failed ret=%d\n", ret);
 		return ERR_PTR(ret);
+	}
 
 	a->mapped = true;
+	dev_info(attach->dev, "g2d_dmabuf_map: mapped, first DMA addr=0x%pad\n",
+			 &sg_dma_address(a->sgt.sgl));
 	return &a->sgt;
 }
 
@@ -3523,12 +3559,17 @@ static int g2d_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	struct g2d_dma_buffer *buf = dmabuf->priv;
 	int ret;
 
-	pr_debug("g2d_dmabuf_mmap: size=%zu vma_size=%lu\n", buf->mem.size,
-		vma->vm_end - vma->vm_start);
+	dev_info(buf->dev, "g2d_dmabuf_mmap: size=%zu vma_size=%lu\n",
+			 buf->mem.size, vma->vm_end - vma->vm_start);
+
+	if (!buf->mem.sgt) {
+		dev_err(buf->dev, "g2d_dmabuf_mmap: no sgt available\n");
+		return -EINVAL;
+	}
 
 	ret = dma_mmap_noncontiguous(buf->dev, vma, buf->mem.size,
 					   buf->mem.sgt);
-	pr_debug("g2d_dmabuf_mmap: ret=%d\n", ret);
+	dev_info(buf->dev, "g2d_dmabuf_mmap: ret=%d\n", ret);
 	return ret;
 }
 
