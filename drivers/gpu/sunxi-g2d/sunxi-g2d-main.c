@@ -462,40 +462,19 @@ static int g2d_dma_mem_alloc(struct device *dev, size_t size,
 		}
 
 		{
-			/* Build sg_table coalescing physically contiguous pages
-			 * to reduce the number of segments seen by importers.
+			/* Use kernel helper to build an sg_table from pages coalescing
+			 * physically contiguous runs. This correctly sets nents and
+			 * orig_nents, avoiding inconsistencies that can crash in DMA map.
 			 */
-			struct scatterlist *sg = sgt->sgl, *last = NULL;
-			unsigned int segs = 0;
-			size_t remaining = size;
-			unsigned int idx = 0;
-
-			while (idx < nents) {
-				struct page *start = pages[idx];
-				size_t len = min_t(size_t, remaining, PAGE_SIZE);
-				unsigned long pfn = page_to_pfn(start);
-
-				idx++;
-				/* Extend this segment while pages are physically contiguous */
-				while (idx < nents &&
-				       page_to_pfn(pages[idx]) == (pfn + (len >> PAGE_SHIFT))) {
-					size_t add = min_t(size_t, remaining - len, PAGE_SIZE);
-					len += add;
-					idx++;
-				}
-
-				sg_set_page(sg, start, len, 0);
-				last = sg;
-				segs++;
-				remaining -= len;
-				if (idx < nents)
-					sg = sg_next(sg);
+			int ret2 = sg_alloc_table_from_pages(sgt, pages, nents,
+							  0, size, GFP_KERNEL);
+			if (ret2) {
+				vunmap(vaddr);
+				for (i = 0; i < nents; i++)
+					__free_page(pages[i]);
+				kfree(pages);
+				return -ENOMEM;
 			}
-
-			/* Mark the end of scatterlist and set entry count before mapping */
-			if (last)
-				sg_mark_end(last);
-			sgt->nents = segs;
 		}
 
 		ret = dma_map_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
