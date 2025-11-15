@@ -49,12 +49,14 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
+#include <linux/scatterlist.h>
 #include <linux/pm_runtime.h>
 #include <linux/interconnect.h>
 #include <linux/wait.h>
 #include <linux/mm.h>
 #include <linux/iosys-map.h>
 #include <uapi/linux/sunxi_g2d.h>
+#include <linux/vmalloc.h>
 #include "sunxi-g2d-regs.h"
 #include "sunxi-g2d-structs.h"
 #include "sunxi-g2d-rcq.h"
@@ -75,6 +77,15 @@ static unsigned long g2d_debug_flags;
 module_param(g2d_debug_flags, ulong, 0644);
 MODULE_PARM_DESC(g2d_debug_flags,
 	"Bitmask debug flags: 0x1=YUV420 remap to semi-planar, 0x2=dump U/V leading bytes");
+
+/* Allocation backend selection: when true, driver will allocate buffers using
+ * system pages (vmap + sg_table + dma_map_sgtable) instead of CMA noncontig
+ * allocations. This avoids consuming CMA at the cost of more driver work.
+ */
+static bool g2d_alloc_use_system_heap;
+module_param(g2d_alloc_use_system_heap, bool, 0644);
+MODULE_PARM_DESC(g2d_alloc_use_system_heap,
+	"Use system heap pages for driver-side allocations (true) or CMA noncontiguous (false)");
 
 /* Module parameters for RCQ experimentation (deprecated - RCQ not functional on T113-S3) */
 static bool rcq_enable_bit = true;
@@ -326,6 +337,7 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 			      dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
 			      u32 dst_pitch, u32 dst_format, u32 dst_x,
 			      u32 dst_y, u32 dst_out_w, u32 dst_out_h,
+			      u8 src_color_space, u8 dst_color_space,
 			      void *dst_vaddr);
 
 static int sunxi_g2d_do_blit_unified(
@@ -377,6 +389,186 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d, dma_addr_t dst_dma,
 				 u32 color_format, u32 dst_format);
 
 static int sunxi_g2d_format_to_hw(u32 fmt, u32 *bpp);
+
+struct g2d_dma_mem {
+	void *vaddr;
+	dma_addr_t dma_addr;
+	size_t size;
+	struct sg_table *sgt;
+	/* For system-backed allocation (non-CMA): keep pages array to free later */
+	struct page **pages;
+	unsigned int nents;
+};
+
+static int g2d_dma_mem_alloc(struct device *dev, size_t size,
+				 struct g2d_dma_mem *mem, gfp_t gfp)
+{
+	struct sg_table *sgt = NULL;
+	void *vaddr = NULL;
+
+	if (!mem || !size)
+		return -EINVAL;
+
+	/* If user requested system-backed allocation, attempt to allocate
+	 * individual pages, vmap them and build an sg_table which we map
+	 * for device access. This avoids consuming CMA.
+	 */
+	if (g2d_alloc_use_system_heap) {
+		unsigned int nents = DIV_ROUND_UP(size, PAGE_SIZE);
+		struct page **pages = NULL;
+		unsigned int i;
+		int ret;
+
+		pages = kcalloc(nents, sizeof(*pages), GFP_KERNEL);
+		if (!pages)
+			return -ENOMEM;
+
+		for (i = 0; i < nents; i++) {
+			pages[i] = alloc_page(gfp | __GFP_ZERO);
+			if (!pages[i]) {
+				int j;
+				for (j = 0; j < i; j++)
+					__free_page(pages[j]);
+				kfree(pages);
+				return -ENOMEM;
+			}
+		}
+
+		vaddr = vmap(pages, nents, VM_MAP, PAGE_KERNEL);
+		if (!vaddr) {
+			for (i = 0; i < nents; i++)
+				__free_page(pages[i]);
+			kfree(pages);
+			return -ENOMEM;
+		}
+
+		sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+		if (!sgt) {
+			vunmap(vaddr);
+			for (i = 0; i < nents; i++)
+				__free_page(pages[i]);
+			kfree(pages);
+			return -ENOMEM;
+		}
+
+		ret = sg_alloc_table(sgt, nents, GFP_KERNEL);
+		if (ret) {
+			kfree(sgt);
+			vunmap(vaddr);
+			for (i = 0; i < nents; i++)
+				__free_page(pages[i]);
+			kfree(pages);
+			return -ENOMEM;
+		}
+
+		{
+			struct scatterlist *sg = sgt->sgl;
+			size_t remaining = size;
+			for (i = 0; i < nents; i++) {
+				size_t len = min_t(size_t, remaining, PAGE_SIZE);
+				sg_set_page(sg, pages[i], len, 0);
+				remaining -= len;
+				sg = sg_next(sg);
+			}
+		}
+
+		ret = dma_map_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+		if (ret) {
+			sg_free_table(sgt);
+			kfree(sgt);
+			vunmap(vaddr);
+			for (i = 0; i < nents; i++)
+				__free_page(pages[i]);
+			kfree(pages);
+			return -EIO;
+		}
+
+		/* Success: fill mem */
+		memset(vaddr, 0, size);
+		mem->vaddr = vaddr;
+		mem->dma_addr = sg_dma_address(sgt->sgl);
+		mem->size = size;
+		mem->sgt = sgt;
+		mem->pages = pages;
+		mem->nents = nents;
+
+		return 0;
+	}
+
+	/* Default behavior: CMA/noncontiguous allocation (existing code) */
+	sgt = dma_alloc_noncontiguous(dev, size, DMA_BIDIRECTIONAL, gfp, 0);
+	if (!sgt)
+		return -ENOMEM;
+
+	vaddr = dma_vmap_noncontiguous(dev, size, sgt);
+	if (!vaddr) {
+		dma_free_noncontiguous(dev, size, sgt, DMA_BIDIRECTIONAL);
+		return -ENOMEM;
+	}
+
+	memset(vaddr, 0, size);
+	mem->vaddr = vaddr;
+	mem->dma_addr = sg_dma_address(sgt->sgl);
+	mem->size = size;
+	mem->sgt = sgt;
+
+	return 0;
+}
+
+static void g2d_dma_mem_free(struct device *dev, struct g2d_dma_mem *mem)
+{
+	unsigned int i;
+
+	if (!mem || !mem->sgt)
+		return;
+
+	if (mem->pages) {
+		/* system-backed allocation path */
+		dma_unmap_sgtable(dev, mem->sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(mem->sgt);
+		kfree(mem->sgt);
+
+		if (mem->vaddr)
+			vunmap(mem->vaddr);
+
+		for (i = 0; i < mem->nents; i++) {
+			if (mem->pages[i])
+				__free_page(mem->pages[i]);
+		}
+		kfree(mem->pages);
+		mem->pages = NULL;
+		mem->nents = 0;
+	} else {
+		/* CMA/noncontiguous path */
+		if (mem->vaddr)
+			dma_vunmap_noncontiguous(dev, mem->vaddr);
+		dma_free_noncontiguous(dev, mem->size, mem->sgt, DMA_BIDIRECTIONAL);
+	}
+
+	mem->sgt = NULL;
+	mem->vaddr = NULL;
+	mem->dma_addr = 0;
+	mem->size = 0;
+}
+
+static int g2d_sg_dma_address(struct device *dev, struct sg_table *sgt,
+				    dma_addr_t *out, const char *label)
+{
+	dma_addr_t addr;
+
+	if (!sgt || !sgt->sgl)
+		return -EINVAL;
+
+	addr = sg_dma_address(sgt->sgl);
+	if (!addr) {
+		dev_err(dev, "%s: missing DMA address (nents=%d)\n",
+			label ? label : "buffer", sgt->nents);
+		return -EINVAL;
+	}
+
+	*out = addr;
+	return 0;
+}
 
 /**
  * struct sunxi_g2d_dev - G2D device structure
@@ -459,9 +651,7 @@ struct sunxi_g2d_dev {
 	atomic64_t fence_seqno;
 
 	/* Temporary scaling buffer (allocated per-operation, freed after blend) */
-	void *temp_scale_buffer;
-	dma_addr_t temp_scale_dma;
-	size_t temp_scale_size;
+	struct g2d_dma_mem temp_scale_buf;
 
 	/* Delayed work to safely disable hardware when idle */
 	struct delayed_work disable_work;
@@ -584,18 +774,14 @@ struct sunxi_g2d_job {
 	struct sg_table *out_sgt;
 
 	/* For 2-pass scale+rotate: temporary buffer allocated by driver */
-	void *temp_vaddr; /* Virtual address of temp buffer */
-	dma_addr_t temp_dma_addr; /* DMA address of temp buffer */
-	size_t temp_size; /* Size of temp buffer */
+	struct g2d_dma_mem temp_buf;
 	u32 temp_width; /* Temp buffer dimensions */
 	u32 temp_height;
 	u32 temp_pitch;
 	u32 temp_format;
 
 	/* For 3-pass (scale -> rotate -> blend) additional temp buffer */
-	void *temp2_vaddr; /* Virtual address of second temp buffer */
-	dma_addr_t temp2_dma_addr; /* DMA address of second temp buffer */
-	size_t temp2_size;
+	struct g2d_dma_mem temp2_buf;
 	u32 temp2_width;
 	u32 temp2_height;
 	u32 temp2_pitch;
@@ -673,26 +859,24 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 		job->out_dmabuf = NULL;
 	}
 
-	/* Release temporary buffer for 2-pass scale+rotate (if any) */
-	if (job->temp_vaddr && job->g2d) {
-		pr_debug(
-			"sunxi_g2d: cleanup - freeing temp buffer vaddr=%p dma=0x%llx size=%zu\n",
-			job->temp_vaddr, (u64)job->temp_dma_addr,
-			job->temp_size);
-		dma_free_coherent(job->g2d->dev, job->temp_size,
-				  job->temp_vaddr, job->temp_dma_addr);
-		job->temp_vaddr = NULL;
-	}
-
-	/* Release second temporary buffer for 3-pass ops (if any) */
-	if (job->temp2_vaddr && job->g2d) {
-		pr_debug(
-			"sunxi_g2d: cleanup - freeing temp2 buffer vaddr=%p dma=0x%llx size=%zu\n",
-			job->temp2_vaddr, (u64)job->temp2_dma_addr,
-			job->temp2_size);
-		dma_free_coherent(job->g2d->dev, job->temp2_size,
-				  job->temp2_vaddr, job->temp2_dma_addr);
-		job->temp2_vaddr = NULL;
+	/* Release temporary buffers allocated by the driver */
+	if (job->g2d) {
+		if (job->temp_buf.sgt) {
+			pr_debug(
+				"sunxi_g2d: cleanup - freeing temp buffer vaddr=%p dma=0x%llx size=%zu\n",
+				job->temp_buf.vaddr,
+				(u64)job->temp_buf.dma_addr,
+				job->temp_buf.size);
+			g2d_dma_mem_free(job->g2d->dev, &job->temp_buf);
+		}
+		if (job->temp2_buf.sgt) {
+			pr_debug(
+				"sunxi_g2d: cleanup - freeing temp2 buffer vaddr=%p dma=0x%llx size=%zu\n",
+				job->temp2_buf.vaddr,
+				(u64)job->temp2_buf.dma_addr,
+				job->temp2_buf.size);
+			g2d_dma_mem_free(job->g2d->dev, &job->temp2_buf);
+		}
 	}
 
 	pr_debug("sunxi_g2d: cleanup - free job %p\n", job);
@@ -797,9 +981,7 @@ static void g2d_selftest_work_func(struct work_struct *work)
  * @dev: Device that owns the buffer
  */
 struct g2d_dma_buffer {
-	void *vaddr;
-	dma_addr_t dma_addr;
-	size_t size;
+	struct g2d_dma_mem mem;
 	struct device *dev;
 };
 
@@ -1197,7 +1379,7 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 
 	case G2D_JOB_BLIT:
 		/* Check if this is a 3-pass (scale -> rotate -> blend) job */
-		if (job->temp_vaddr && job->temp2_vaddr) {
+		if (job->temp_buf.vaddr && job->temp2_buf.vaddr) {
 			dev_dbg(g2d->dev,
 				"job_worker: executing 3-pass scale+rotate+blend job=%p\n",
 				job);
@@ -1208,6 +1390,10 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				job->data.blit.src_crop_w,
 				job->data.blit.src_crop_h, job->temp_width,
 				job->temp_height);
+
+			u8 temp_color_space = job->data.blit.src_color_space;
+			if (job->temp_format == job->data.blit.dst_format)
+				temp_color_space = job->data.blit.dst_color_space;
 
 			/* Use the isolated VSU scale path (same as atomic G2D_CMD_SCALE)
 			 * to ensure the scaler is configured identically to the atomic
@@ -1222,11 +1408,12 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				job->data.blit.src_crop_x,
 				job->data.blit.src_crop_y,
 				job->data.blit.src_crop_w,
-				job->data.blit.src_crop_h, job->temp_dma_addr,
+				job->data.blit.src_crop_h, job->temp_buf.dma_addr,
 				job->temp_width, job->temp_height,
 				job->temp_pitch, job->temp_format, 0, 0,
 				job->temp_width, job->temp_height,
-				job->temp_vaddr);
+				job->data.blit.src_color_space,
+				temp_color_space, job->temp_buf.vaddr);
 
 			if (ret < 0) {
 				dev_err(g2d->dev,
@@ -1256,12 +1443,12 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				job->temp2_width, job->temp2_height);
 
 			ret = sunxi_g2d_do_blit_rot(
-				g2d, job->temp_dma_addr, job->temp_width,
+				g2d, job->temp_buf.dma_addr, job->temp_width,
 				job->temp_height, job->temp_pitch,
 				job->temp_format, 0,
 				0, /* Full temp1 buffer as source */
 				job->temp_width, job->temp_height,
-				job->temp2_dma_addr, /* Write to temp2 */
+				job->temp2_buf.dma_addr, /* Write to temp2 */
 				job->temp2_width, job->temp2_height,
 				job->temp2_pitch, job->temp2_format, 0,
 				0, /* dest position in temp2 */
@@ -1295,7 +1482,7 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				job->data.blit.dst_x, job->data.blit.dst_y);
 
 			ret = sunxi_g2d_do_blit_alpha_3buf(
-				g2d, job->temp2_dma_addr, job->temp2_width,
+				g2d, job->temp2_buf.dma_addr, job->temp2_width,
 				job->temp2_height, job->temp2_pitch,
 				job->temp2_format, 0,
 				0, /* src_x, src_y in temp2 */
@@ -1350,7 +1537,7 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				"✅ 3-pass scale+rotate+blend async completed successfully\n");
 			/* IRQ will signal fence and cleanup */
 
-		} else if (job->temp_vaddr) {
+		} else if (job->temp_buf.vaddr) {
 			dev_dbg(g2d->dev,
 				"job_worker: executing 2-pass scale+rotate job=%p\n",
 				job);
@@ -1361,6 +1548,10 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				job->data.blit.src_crop_w,
 				job->data.blit.src_crop_h, job->temp_width,
 				job->temp_height);
+
+			u8 temp_color_space = job->data.blit.src_color_space;
+			if (job->temp_format == job->data.blit.dst_format)
+				temp_color_space = job->data.blit.dst_color_space;
 
 			/* Use the same VSU path as the atomic SCALE command so that
 			 * scaling behavior (including alpha handling) is identical.
@@ -1373,11 +1564,12 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				job->data.blit.src_crop_x,
 				job->data.blit.src_crop_y,
 				job->data.blit.src_crop_w,
-				job->data.blit.src_crop_h, job->temp_dma_addr,
+				job->data.blit.src_crop_h, job->temp_buf.dma_addr,
 				job->temp_width, job->temp_height,
 				job->temp_pitch, job->temp_format, 0, 0,
 				job->temp_width, job->temp_height,
-				job->temp_vaddr);
+				job->data.blit.src_color_space,
+				temp_color_space, job->temp_buf.vaddr);
 
 			if (ret < 0) {
 				dev_err(g2d->dev,
@@ -1406,8 +1598,8 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 				job->temp_width, job->temp_height,
 				job->data.blit.dst_x, job->data.blit.dst_y);
 
-			ret = sunxi_g2d_do_blit_rot(
-				g2d, job->temp_dma_addr, job->temp_width,
+		ret = sunxi_g2d_do_blit_rot(
+			g2d, job->temp_buf.dma_addr, job->temp_width,
 				job->temp_height, job->temp_pitch,
 				job->temp_format, 0,
 				0, /* Full temp buffer as source */
@@ -1506,17 +1698,18 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 		 * This ensures proper V0_ATTCTL configuration with PIXEL_ALPHA_EN=1
 		 * for preserving per-pixel alpha through VSU.
 		 */
-		ret = sunxi_g2d_do_scale(
-			g2d, job->src_dma, job->data.blit.src_width,
-			job->data.blit.src_height, job->data.blit.src_pitch,
-			job->data.blit.src_format, job->data.blit.src_crop_x,
-			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->dst_dma,
-			job->data.blit.dst_width, job->data.blit.dst_height,
-			job->data.blit.dst_pitch, job->data.blit.dst_format,
-			job->data.blit.dst_x, job->data.blit.dst_y,
-			job->data.blit.dst_w, job->data.blit.dst_h,
-			job->temp_vaddr);
+	ret = sunxi_g2d_do_scale(
+		g2d, job->src_dma, job->data.blit.src_width,
+		job->data.blit.src_height, job->data.blit.src_pitch,
+		job->data.blit.src_format, job->data.blit.src_crop_x,
+		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+		job->data.blit.src_crop_h, job->dst_dma,
+		job->data.blit.dst_width, job->data.blit.dst_height,
+		job->data.blit.dst_pitch, job->data.blit.dst_format,
+		job->data.blit.dst_x, job->data.blit.dst_y,
+		job->data.blit.dst_w, job->data.blit.dst_h,
+		job->data.blit.src_color_space,
+		job->data.blit.dst_color_space, job->temp_buf.vaddr);
 
 		if (ret < 0) {
 			dev_err(g2d->dev, "G2D_CMD_SCALE failed: %d\n", ret);
@@ -2578,6 +2771,7 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d, dma_addr_t dst_dma,
 	g2d_write(g2d, BLD_CH_ISIZE0, bld.mem_size[0].dwval);
 	g2d_write(g2d, BLD_CH_OFFSET0, bld.mem_coor[0].dwval);
 	g2d_write(g2d, BLD_OUT_SIZE, bld.out_size.dwval);
+	g2d_write(g2d, BLD_SIZE, bld.out_size.dwval); /* Match mixer window */
 	g2d_write(g2d, BLD_SIZE, bld.out_size.dwval);
 	g2d_write(g2d, BLD_OUT_COLOR, bld.out_color.dwval);
 	g2d_write(g2d, BLD_CTL, bld.bld_ctrl.dwval);
@@ -3032,25 +3226,10 @@ static long sunxi_g2d_ioctl_fillrect_rcq(struct sunxi_g2d_dev *g2d, unsigned lon
 		goto err_detach;
 	}
 
-	/* Get DMA address from first sg entry */
-	dma_addr = sg_dma_address(sgt->sgl);
-
-	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0
-		* In this case, use physical address directly from the page
-		*/
-	if (dma_addr == 0 && sgt->nents > 0) {
-		struct scatterlist *sg = sgt->sgl;
-		struct page *page = sg_page(sg);
-		if (page) {
-			dma_addr = page_to_phys(page) + sg->offset;
-			dev_dbg(g2d->dev, "T113 workaround: fillrect_rcq using physical address 0x%llx\n",
-						(u64)dma_addr);
-		} else {
-			dev_err(g2d->dev, "Failed to get physical address from page\n");
-			ret = -EINVAL;
-			goto err_unmap;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, sgt, &dma_addr,
+				     "FILLRECT_RCQ dst");
+	if (ret)
+		goto err_unmap;
 
 	/* If userspace passed a fence_fd_in for this fill, wait on it */
 	if (fill.fence_fd_in >= 0) {
@@ -3241,50 +3420,101 @@ static int sunxi_g2d_release(struct inode *inode, struct file *file)
 
 /* ========== DMA-BUF export operations ========== */
 
+struct g2d_dmabuf_attachment {
+	struct sg_table sgt;
+	bool mapped;
+};
+
+static int g2d_dup_sg_table(struct sg_table *dst, const struct sg_table *src)
+{
+	struct scatterlist *s, *d;
+	int ret, i;
+
+	ret = sg_alloc_table(dst, src->orig_nents, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	s = src->sgl;
+	d = dst->sgl;
+	for (i = 0; i < src->orig_nents; i++) {
+		sg_set_page(d, sg_page(s), s->length, s->offset);
+		s = sg_next(s);
+		d = sg_next(d);
+	}
+
+	return 0;
+}
+
 static int g2d_dmabuf_attach(struct dma_buf *dmabuf,
 			     struct dma_buf_attachment *attach)
 {
+	struct g2d_dma_buffer *buf = dmabuf->priv;
+	struct g2d_dmabuf_attachment *a;
+	int ret;
+
+	a = kzalloc(sizeof(*a), GFP_KERNEL);
+	if (!a)
+		return -ENOMEM;
+
+	ret = g2d_dup_sg_table(&a->sgt, buf->mem.sgt);
+	if (ret) {
+		kfree(a);
+		return ret;
+	}
+
+	a->mapped = false;
+	attach->priv = a;
+
 	return 0;
 }
 
 static void g2d_dmabuf_detach(struct dma_buf *dmabuf,
 			      struct dma_buf_attachment *attach)
 {
+	struct g2d_dmabuf_attachment *a = attach->priv;
+
+	if (!a)
+		return;
+
+	if (a->mapped)
+		dma_unmap_sgtable(attach->dev, &a->sgt,
+				 DMA_BIDIRECTIONAL, 0);
+
+	sg_free_table(&a->sgt);
+	kfree(a);
 }
 
 static struct sg_table *g2d_dmabuf_map(struct dma_buf_attachment *attach,
-				       enum dma_data_direction dir)
+			       enum dma_data_direction dir)
 {
-	struct g2d_dma_buffer *buf = attach->dmabuf->priv;
-	struct sg_table *sgt;
+	struct g2d_dmabuf_attachment *a = attach->priv;
 	int ret;
 
-	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
-	if (!sgt)
-		return ERR_PTR(-ENOMEM);
-
-	ret = dma_get_sgtable(buf->dev, sgt, buf->vaddr, buf->dma_addr,
-			      buf->size);
-	if (ret < 0) {
-		kfree(sgt);
+	ret = dma_map_sgtable(attach->dev, &a->sgt, dir, 0);
+	if (ret)
 		return ERR_PTR(ret);
-	}
 
-	return sgt;
+	a->mapped = true;
+	return &a->sgt;
 }
 
 static void g2d_dmabuf_unmap(struct dma_buf_attachment *attach,
 			     struct sg_table *sgt, enum dma_data_direction dir)
 {
-	sg_free_table(sgt);
-	kfree(sgt);
+	struct g2d_dmabuf_attachment *a = attach->priv;
+
+	if (!a || !a->mapped)
+		return;
+
+	dma_unmap_sgtable(attach->dev, &a->sgt, dir, 0);
+	a->mapped = false;
 }
 
 static void g2d_dmabuf_release(struct dma_buf *dmabuf)
 {
 	struct g2d_dma_buffer *buf = dmabuf->priv;
 
-	dma_free_coherent(buf->dev, buf->size, buf->vaddr, buf->dma_addr);
+	g2d_dma_mem_free(buf->dev, &buf->mem);
 	kfree(buf);
 }
 
@@ -3293,13 +3523,11 @@ static int g2d_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	struct g2d_dma_buffer *buf = dmabuf->priv;
 	int ret;
 
-	pr_debug("g2d_dmabuf_mmap: size=%zu vma_size=%lu\n", buf->size,
+	pr_debug("g2d_dmabuf_mmap: size=%zu vma_size=%lu\n", buf->mem.size,
 		vma->vm_end - vma->vm_start);
 
-	/* Let DMA framework handle the mmap */
-	ret = dma_mmap_attrs(buf->dev, vma, buf->vaddr, buf->dma_addr,
-			     buf->size, DMA_ATTR_WRITE_COMBINE);
-
+	ret = dma_mmap_noncontiguous(buf->dev, vma, buf->mem.size,
+					   buf->mem.sgt);
 	pr_debug("g2d_dmabuf_mmap: ret=%d\n", ret);
 	return ret;
 }
@@ -3308,7 +3536,10 @@ static int g2d_dmabuf_vmap(struct dma_buf *dmabuf, struct iosys_map *map)
 {
 	struct g2d_dma_buffer *buf = dmabuf->priv;
 
-	iosys_map_set_vaddr(map, buf->vaddr);
+	if (!buf->mem.vaddr)
+		return -ENOMEM;
+
+	iosys_map_set_vaddr(map, buf->mem.vaddr);
 	return 0;
 }
 
@@ -3958,11 +4189,10 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 		}
 
 		u32 temp_pitch = ALIGN(blend_w * temp_bpp,
-				       128); /* Align pitch to 128 bytes */
+			       128); /* Align pitch to 128 bytes */
 		u32 temp_size = temp_pitch *
 				blend_h; /* Use aligned pitch for buffer size */
-		void *temp_vaddr = NULL;
-		dma_addr_t temp_dma = 0;
+		struct g2d_dma_mem temp_alloc = {};
 
 		/* Use the source's pixel format for the temporary buffer. Scaling
 		 * is a raw resampling operation and must not apply blending or
@@ -3973,20 +4203,17 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 			"⚠️  Allocating internal temp buffer: %ux%u pitch=%u (%u bytes) fmt=%u\n",
 			blend_w, blend_h, temp_pitch, temp_size, temp_format);
 
-		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size, &temp_dma,
-						GFP_KERNEL);
-		if (!temp_vaddr) {
+		ret = g2d_dma_mem_alloc(g2d->dev, temp_size, &temp_alloc,
+					  GFP_KERNEL);
+		if (ret) {
 			dev_err(g2d->dev,
 				"Failed to allocate temp buffer for scaling\n");
-			return -ENOMEM;
+			return ret;
 		}
-
-		/* Clear temp buffer to avoid garbage/stale data affecting blend */
-		memset(temp_vaddr, 0, temp_size);
 
 		dev_dbg(g2d->dev,
 			"✅ Temp buffer allocated: vaddr=%p dma=0x%llx pitch=%u (aligned to 128)\n",
-			temp_vaddr, (u64)temp_dma, temp_pitch);
+			temp_alloc.vaddr, (u64)temp_alloc.dma_addr, temp_pitch);
 
 		/* 
 		* STEP 1: Scale src → temp buffer (EXACT size, no positioning)
@@ -4002,21 +4229,25 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 			src_y, src_crop_w, src_crop_h, src_pitch);
 		dev_dbg(g2d->dev,
 			"  temp: 0x%llx (%ux%u) fmt=%u pitch=%u (ALIGNED)\n",
-			(u64)temp_dma, blend_w, blend_h, temp_format,
+			(u64)temp_alloc.dma_addr, blend_w, blend_h, temp_format,
 			temp_pitch);
+
+		u8 temp_color_space = src_color_space;
+		if (temp_format == dst_format)
+			temp_color_space = dst_color_space;
 
 		ret = sunxi_g2d_do_scale(
 			g2d, src_dma_addr, src_w, src_h, src_pitch, src_format,
-			src_x, src_y, src_crop_w, src_crop_h, temp_dma, blend_w,
+			src_x, src_y, src_crop_w, src_crop_h, temp_alloc.dma_addr, blend_w,
 			blend_h, /* TEMP: exact size */
 			temp_pitch, temp_format, /* pitch = ALIGNED */
 			0, 0, blend_w, blend_h, /* Write at (0,0) */
-			temp_vaddr); /* DUMP temp buffer for debug */
+			src_color_space, temp_color_space,
+			temp_alloc.vaddr); /* DUMP temp buffer for debug */
 		if (ret) {
 			dev_err(g2d->dev, "❌ Step 1 (scale) failed: %d\n",
 				ret);
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
-					  temp_dma);
+			g2d_dma_mem_free(g2d->dev, &temp_alloc);
 			return ret;
 		}
 
@@ -4036,7 +4267,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 			(u64)src_dma_addr, src_format, src_crop_w, src_crop_h);
 
 		/* Update src parameters to point to temp buffer */
-		src_dma_addr = temp_dma; /* Read from temp buffer */
+	src_dma_addr = temp_alloc.dma_addr; /* Read from temp buffer */
 		src_w = blend_w; /* Temp buffer width */
 		src_h = blend_h; /* Temp buffer height */
 		src_pitch = temp_pitch; /* Temp buffer pitch (ALIGNED to 128) */
@@ -4063,21 +4294,15 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 		/* IMPORTANT: temp buffer will be freed after blend completes */
 
 		/* Store temp buffer info for cleanup after blend */
-		g2d->temp_scale_buffer = temp_vaddr;
-		g2d->temp_scale_dma = temp_dma;
-		g2d->temp_scale_size = temp_size;
+		g2d->temp_scale_buf = temp_alloc;
 	}
 
 	/* Enable hardware */
 	ret = sunxi_g2d_hw_enable(g2d);
 	if (ret) {
 		/* Cleanup temp buffer if allocated */
-		if (g2d->temp_scale_buffer) {
-			dma_free_coherent(g2d->dev, g2d->temp_scale_size,
-					  g2d->temp_scale_buffer,
-					  g2d->temp_scale_dma);
-			g2d->temp_scale_buffer = NULL;
-		}
+		if (g2d->temp_scale_buf.sgt)
+			g2d_dma_mem_free(g2d->dev, &g2d->temp_scale_buf);
 		return ret;
 	}
 
@@ -4583,16 +4808,13 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 	sunxi_g2d_hw_disable(g2d);
 
 	/* Free temporary scaling buffer if it was allocated */
-	if (g2d->temp_scale_buffer) {
+	if (g2d->temp_scale_buf.sgt) {
 		dev_dbg(g2d->dev,
 			"Freeing temp scale buffer: vaddr=%p dma=0x%llx size=%zu\n",
-			g2d->temp_scale_buffer, (u64)g2d->temp_scale_dma,
-			g2d->temp_scale_size);
-		dma_free_coherent(g2d->dev, g2d->temp_scale_size,
-				  g2d->temp_scale_buffer, g2d->temp_scale_dma);
-		g2d->temp_scale_buffer = NULL;
-		g2d->temp_scale_dma = 0;
-		g2d->temp_scale_size = 0;
+			g2d->temp_scale_buf.vaddr,
+			(u64)g2d->temp_scale_buf.dma_addr,
+			g2d->temp_scale_buf.size);
+		g2d_dma_mem_free(g2d->dev, &g2d->temp_scale_buf);
 	}
 
 	return 0;
@@ -4623,6 +4845,7 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 			      dma_addr_t dst_dma, u32 dst_width, u32 dst_height,
 			      u32 dst_pitch, u32 dst_format, u32 dst_x,
 			      u32 dst_y, u32 dst_out_w, u32 dst_out_h,
+			      u8 src_color_space, u8 dst_color_space,
 			      void *dst_vaddr)
 {
 	struct g2d_mixer_ovl_v_reg v0 = {
@@ -4778,6 +5001,55 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 		dst_out_h, src_pitch, (u64)src_offset_dma,
 		v0.ovl_attr.bits.lay_glbalpha);
 
+	/* Configure Color Space Conversion just like the blit paths so that
+	 * YUV sources can be converted when the destination expects RGB (and
+	 * vice versa). Without this, pure SCALE commands deadlock the hardware
+	 * as soon as the writeback format does not match the source colorspace.
+	 */
+	{
+		u32 csc_ctl_bits = 0;
+		u32 csc_ctl_before = g2d_read(g2d, BLD_CSC_CTL);
+		const u32 csc_ctl_mask = BIT(0) | BIT(1) | BIT(2);
+
+		if (sunxi_g2d_is_yuv_format(src_format)) {
+			u8 cs_in = src_color_space;
+
+			if (force_csc_color_space_in == 0)
+				cs_in = G2D_COLOR_SPACE_BT601;
+			else if (force_csc_color_space_in == 1)
+				cs_in = G2D_COLOR_SPACE_BT709;
+
+			/* SCALE uses V0/pipe0 path; enable CSC0 like blit path */
+			sunxi_g2d_configure_csc(g2d, 0, cs_in);
+			csc_ctl_bits |= BIT(0);
+			dev_dbg(g2d->dev,
+				"CSC0 enabled for SCALE src fmt=0x%02x cs=%s (override=%d)\n",
+				src_format,
+				cs_in == G2D_COLOR_SPACE_BT709 ? "BT.709" :
+								 "BT.601",
+				force_csc_color_space_in);
+		}
+
+		if (sunxi_g2d_is_yuv_format(dst_format)) {
+			sunxi_g2d_configure_csc(g2d, 2, dst_color_space);
+			csc_ctl_bits |= BIT(2);
+			dev_dbg(g2d->dev,
+				"CSC2 enabled for SCALE dst fmt=0x%02x cs=%s\n",
+				dst_format,
+				dst_color_space == G2D_COLOR_SPACE_BT709 ?
+					"BT.709" :
+					"BT.601");
+		}
+
+		u32 csc_ctl_after = (csc_ctl_before & ~csc_ctl_mask) | csc_ctl_bits;
+		if (csc_ctl_after != csc_ctl_before) {
+			g2d_write(g2d, BLD_CSC_CTL, csc_ctl_after);
+			dev_dbg(g2d->dev,
+				"SCALE CSC_CTL: 0x%08x -> 0x%08x (bits=0x%x)\n",
+				csc_ctl_before, csc_ctl_after, csc_ctl_bits);
+		}
+	}
+
 	/* === Setup VSU (Video Scaler Unit) === */
 	/* Pass API format (src_format). VSU operates on byte streams and
 	 * doesn't need the overlay HW code; V0/WB interpret pixels using
@@ -4816,7 +5088,10 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 	bld.out_size.bits.height = dst_out_h - 1;
 
 	bld.out_color.dwval = 0;
-	bld.out_color.bits.alpha_mode = 0; /* RGB mode (not YUV) */
+	if (sunxi_g2d_is_yuv_format(dst_format))
+		bld.out_color.bits.alpha_mode = 1; /* YUV output */
+	else
+		bld.out_color.bits.alpha_mode = 0; /* RGB output */
 	bld.out_color.bits.premul_en = 0; /* No premultiplication on output */
 
 	bld.bld_ctrl.dwval = 0; /* Simple passthrough */
@@ -4826,6 +5101,10 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 	bld.ch3_index0.dwval = 0x00061080;
 
 	/* Write BLD registers using struct */
+	g2d_write(g2d, MIXER_FILLCOLOR0, 0xFF000000);
+	g2d_write(g2d, MIXER_SIZE,
+		  ((dst_out_w - 1) & 0x1FFF) |
+			  (((dst_out_h - 1) & 0x1FFF) << 16));
 	g2d_write(g2d, BLD_EN_CTL, bld.bld_en_ctrl.dwval);
 	g2d_write(g2d, BLD_PREMUL_CTL, bld.premulti_ctrl.dwval);
 	g2d_write(g2d, BLD_CH_ISIZE0, bld.mem_size[0].dwval);
@@ -4874,8 +5153,36 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 
 	/* === Start Operation === */
 
-	mixer_ctl = G2D_MIXER_CTL_START;
-	g2d_write(g2d, G2D_MIXER_CTL, mixer_ctl);
+	/* Re-arm interrupt just before start to avoid stale completions */
+	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
+	wmb();
+	atomic_set(&g2d->irq_done, 0);
+	g2d_write(g2d, G2D_MIXER_INT, 0x00000011);
+	wmb();
+
+	/* Follow the same mixer reset/start sequence as the BLIT path */
+	mixer_ctl = g2d_read(g2d, G2D_MIXER_CTL);
+	dev_dbg(g2d->dev, "SCALE PRE-RESET: MIXER_CTL=0x%08x\n", mixer_ctl);
+	g2d_write(g2d, G2D_MIXER_CTL, G2D_MIXER_CTL_RESET);
+	udelay(5);
+	if (mixer_scan_order >= 0) {
+		union g2d_mixer_ctrl mctrl = { .dwval = 0 };
+		mctrl.bits.scan_order = (u32)(mixer_scan_order & 0x3);
+		g2d_write(g2d, G2D_MIXER_CTL, mctrl.dwval);
+		dev_dbg(g2d->dev, "SCALE mixer scan_order override: %d (deassert)\n",
+			mixer_scan_order);
+	} else {
+		g2d_write(g2d, G2D_MIXER_CTL, 0x00000000);
+	}
+	udelay(5);
+	if (mixer_scan_order >= 0) {
+		union g2d_mixer_ctrl mctrl = { .dwval = 0 };
+		mctrl.bits.scan_order = (u32)(mixer_scan_order & 0x3);
+		mctrl.bits.start = 1;
+		g2d_write(g2d, G2D_MIXER_CTL, mctrl.dwval);
+	} else {
+		g2d_write(g2d, G2D_MIXER_CTL, G2D_MIXER_CTL_START);
+	}
 
 	/* Extra register dumps for deep debugging: VSU, V0 and WB registers */
 	dev_dbg(
@@ -4897,6 +5204,12 @@ static int sunxi_g2d_do_scale(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 		"REG DUMP BEFORE START: WB_ATT=0x%08x WB_PITCH0=0x%08x WB_LADD0=0x%08x WB_HADD0=0x%08x\n",
 		g2d_read(g2d, WB_ATT), g2d_read(g2d, WB_PITCH0),
 		g2d_read(g2d, WB_LADD0), g2d_read(g2d, WB_HADD0));
+	dev_dbg(
+		g2d->dev,
+		"REG DUMP BEFORE START: BLD_EN_CTL=0x%08x BLD_CTL=0x%08x BLD_SIZE=0x%08x BLD_CSC_CTL=0x%08x OUT_COLOR=0x%08x\n",
+		g2d_read(g2d, BLD_EN_CTL), g2d_read(g2d, BLD_CTL),
+		g2d_read(g2d, BLD_SIZE), g2d_read(g2d, BLD_CSC_CTL),
+		g2d_read(g2d, BLD_OUT_COLOR));
 
 	/* Wait for completion */
 	timeout = wait_event_timeout(g2d->irq_wait, atomic_read(&g2d->irq_done),
@@ -5826,21 +6139,10 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	src_dma_addr = sg_dma_address(src_sgt->sgl);
-
-	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0 */
-	if (src_dma_addr == 0 && src_sgt->nents > 0) {
-		struct scatterlist *sg = src_sgt->sgl;
-		struct page *page = sg_page(sg);
-		if (page) {
-			src_dma_addr = page_to_phys(page) + sg->offset;
-		} else {
-			dev_err(g2d->dev,
-				"SCALE: Failed to get src physical address\n");
-			ret = -EINVAL;
-			goto err_unmap_src;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+				     "SCALE src");
+	if (ret)
+		goto err_unmap_src;
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -5868,21 +6170,10 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-
-	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0 */
-	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
-		struct scatterlist *sg = dst_sgt->sgl;
-		struct page *page = sg_page(sg);
-		if (page) {
-			dst_dma_addr = page_to_phys(page) + sg->offset;
-		} else {
-			dev_err(g2d->dev,
-				"SCALE: Failed to get dst physical address\n");
-			ret = -EINVAL;
-			goto err_unmap_dst;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+				     "SCALE dst");
+	if (ret)
+		goto err_unmap_dst;
 
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
@@ -6086,18 +6377,10 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	src_dma_addr = sg_dma_address(src_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (src_dma_addr == 0 && src_sgt->nents > 0) {
-		struct page *page = sg_page(src_sgt->sgl);
-		if (page)
-			src_dma_addr =
-				page_to_phys(page) + src_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_src;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+				     "CMD_BLEND src");
+	if (ret)
+		goto err_unmap_src;
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -6118,18 +6401,10 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
-		struct page *page = sg_page(dst_sgt->sgl);
-		if (page)
-			dst_dma_addr =
-				page_to_phys(page) + dst_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_dst;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+				     "CMD_BLEND dst");
+	if (ret)
+		goto err_unmap_dst;
 
 	/* Import output buffer */
 	out_dmabuf = dma_buf_get(cmd.out.dma_fd);
@@ -6150,18 +6425,10 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_out;
 	}
 
-	out_dma_addr = sg_dma_address(out_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (out_dma_addr == 0 && out_sgt->nents > 0) {
-		struct page *page = sg_page(out_sgt->sgl);
-		if (page)
-			out_dma_addr =
-				page_to_phys(page) + out_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_out;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, out_sgt, &out_dma_addr,
+				     "CMD_BLEND out");
+	if (ret)
+		goto err_unmap_out;
 
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
@@ -6383,18 +6650,10 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	src_dma_addr = sg_dma_address(src_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (src_dma_addr == 0 && src_sgt->nents > 0) {
-		struct page *page = sg_page(src_sgt->sgl);
-		if (page)
-			src_dma_addr =
-				page_to_phys(page) + src_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_src;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+				     "CMD_ROTATE src");
+	if (ret)
+		goto err_unmap_src;
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -6415,18 +6674,10 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
-		struct page *page = sg_page(dst_sgt->sgl);
-		if (page)
-			dst_dma_addr =
-				page_to_phys(page) + dst_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_dst;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+				     "CMD_ROTATE dst");
+	if (ret)
+		goto err_unmap_dst;
 
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
@@ -6613,18 +6864,10 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	src_dma_addr = sg_dma_address(src_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (src_dma_addr == 0 && src_sgt->nents > 0) {
-		struct page *page = sg_page(src_sgt->sgl);
-		if (page)
-			src_dma_addr =
-				page_to_phys(page) + src_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_src;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+				     "CMD_MASK src");
+	if (ret)
+		goto err_unmap_src;
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -6646,18 +6889,10 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
-		struct page *page = sg_page(dst_sgt->sgl);
-		if (page)
-			dst_dma_addr =
-				page_to_phys(page) + dst_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_dst;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+				     "CMD_MASK dst");
+	if (ret)
+		goto err_unmap_dst;
 
 	/* Import output buffer if provided */
 	if (has_out_buffer) {
@@ -6679,18 +6914,10 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			goto err_detach_out;
 		}
 
-		out_dma_addr = sg_dma_address(out_sgt->sgl);
-		/* Workaround for T113-S3 without IOMMU */
-		if (out_dma_addr == 0 && out_sgt->nents > 0) {
-			struct page *page = sg_page(out_sgt->sgl);
-			if (page)
-				out_dma_addr = page_to_phys(page) +
-					       out_sgt->sgl->offset;
-			else {
-				ret = -EINVAL;
-				goto err_unmap_out;
-			}
-		}
+		ret = g2d_sg_dma_address(g2d->dev, out_sgt, &out_dma_addr,
+				     "CMD_MASK out");
+		if (ret)
+			goto err_unmap_out;
 	} else {
 		/* No output buffer - mask in-place (dst is both input and output) */
 		out_dma_addr = dst_dma_addr;
@@ -6921,18 +7148,10 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	src_dma_addr = sg_dma_address(src_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (src_dma_addr == 0 && src_sgt->nents > 0) {
-		struct page *page = sg_page(src_sgt->sgl);
-		if (page)
-			src_dma_addr =
-				page_to_phys(page) + src_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_src;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+				     "CMD_COPY src");
+	if (ret)
+		goto err_unmap_src;
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -6953,18 +7172,10 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-	/* Workaround for T113-S3 without IOMMU */
-	if (dst_dma_addr == 0 && dst_sgt->nents > 0) {
-		struct page *page = sg_page(dst_sgt->sgl);
-		if (page)
-			dst_dma_addr =
-				page_to_phys(page) + dst_sgt->sgl->offset;
-		else {
-			ret = -EINVAL;
-			goto err_unmap_dst;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+				     "CMD_COPY dst");
+	if (ret)
+		goto err_unmap_dst;
 
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
@@ -7192,11 +7403,10 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	src_dma_addr = sg_dma_address(src_sgt->sgl);
-	if (!src_dma_addr) {
-		/* Fallback to physical address if DMA address not set */
-		src_dma_addr = sg_phys(src_sgt->sgl);
-	}
+	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+				     "BLIT src");
+	if (ret)
+		goto err_unmap_src;
 
 	/* If userspace provided an input fence fd, wait on it first */
 	if (blit.fence_fd_in >= 0) {
@@ -7242,11 +7452,10 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	dst_dma_addr = sg_dma_address(dst_sgt->sgl);
-	if (!dst_dma_addr) {
-		/* Fallback to physical address if DMA address not set */
-		dst_dma_addr = sg_phys(dst_sgt->sgl);
-	}
+	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+				     "BLIT dst");
+	if (ret)
+		goto err_unmap_dst;
 
 	/* Calculate bytes per pixel for source using format conversion helper */
 	if (sunxi_g2d_format_to_hw(blit.src.format, &src_bpp) < 0) {
@@ -7334,11 +7543,10 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			goto err_detach_out;
 		}
 
-		out_dma_addr = sg_dma_address(out_sgt->sgl);
-		if (!out_dma_addr) {
-			/* Fallback to physical address if DMA address not set */
-			out_dma_addr = sg_phys(out_sgt->sgl);
-		}
+		ret = g2d_sg_dma_address(g2d->dev, out_sgt, &out_dma_addr,
+				     "BLIT out");
+		if (ret)
+			goto err_unmap_out;
 
 		dev_dbg(g2d->dev,
 			"3-buffer operation: out buffer imported (fd=%d addr=0x%llx)\n",
@@ -7443,53 +7651,44 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			u32 temp2_pitch = ALIGN(temp2_w * temp_bpp, 32);
 			size_t temp2_size = temp2_pitch * temp2_h;
 
-			/* Allocate temporary buffers using CMA */
-			void *temp_vaddr = NULL;
-			dma_addr_t temp_dma_addr = 0;
-			void *temp2_vaddr = NULL;
-			dma_addr_t temp2_dma_addr = 0;
+		/* Allocate temporary buffers using IOMMU-backed pages */
+		struct g2d_dma_mem temp_alloc = {};
+		struct g2d_dma_mem temp2_alloc = {};
 
-			temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size,
-							&temp_dma_addr,
-							GFP_KERNEL);
-			if (!temp_vaddr) {
-				dev_err(g2d->dev,
-					"Failed to allocate temp buffer 1 for 3-pass: size=%zu\n",
-					temp_size);
-				ret = -ENOMEM;
-				goto err_unmap_out;
-			}
+		ret = g2d_dma_mem_alloc(g2d->dev, temp_size, &temp_alloc,
+					   GFP_KERNEL);
+		if (ret) {
+			dev_err(g2d->dev,
+				"Failed to allocate temp buffer 1 for 3-pass: size=%zu\n",
+				temp_size);
+			goto err_unmap_out;
+		}
 
-			temp2_vaddr = dma_alloc_coherent(g2d->dev, temp2_size,
-							 &temp2_dma_addr,
-							 GFP_KERNEL);
-			if (!temp2_vaddr) {
-				dev_err(g2d->dev,
-					"Failed to allocate temp buffer 2 for 3-pass: size=%zu\n",
-					temp2_size);
-				dma_free_coherent(g2d->dev, temp_size,
-						  temp_vaddr, temp_dma_addr);
-				ret = -ENOMEM;
-				goto err_unmap_out;
-			}
+		ret = g2d_dma_mem_alloc(g2d->dev, temp2_size, &temp2_alloc,
+					   GFP_KERNEL);
+		if (ret) {
+			dev_err(g2d->dev,
+				"Failed to allocate temp buffer 2 for 3-pass: size=%zu\n",
+				temp2_size);
+			g2d_dma_mem_free(g2d->dev, &temp_alloc);
+			goto err_unmap_out;
+		}
 
-			dev_dbg(g2d->dev,
-				"Allocated temp buffers for 3-pass: t1 vaddr=%p dma=0x%llx size=%zu t2 vaddr=%p dma=0x%llx size=%zu\n",
-				temp_vaddr, (u64)temp_dma_addr, temp_size,
-				temp2_vaddr, (u64)temp2_dma_addr, temp2_size);
+		dev_dbg(g2d->dev,
+			"Allocated temp buffers for 3-pass: t1 vaddr=%p dma=0x%llx size=%zu t2 vaddr=%p dma=0x%llx size=%zu\n",
+			temp_alloc.vaddr, (u64)temp_alloc.dma_addr, temp_size,
+			temp2_alloc.vaddr, (u64)temp2_alloc.dma_addr, temp2_size);
 
 			/* Create job for 3-pass async execution */
 			job = kzalloc(sizeof(*job), GFP_KERNEL);
-			if (!job) {
-				dev_err(g2d->dev,
-					"Failed to allocate job for 3-pass blit\n");
-				dma_free_coherent(g2d->dev, temp_size,
-						  temp_vaddr, temp_dma_addr);
-				dma_free_coherent(g2d->dev, temp2_size,
-						  temp2_vaddr, temp2_dma_addr);
-				ret = -ENOMEM;
-				goto err_unmap_out;
-			}
+		if (!job) {
+			dev_err(g2d->dev,
+				"Failed to allocate job for 3-pass blit\n");
+			g2d_dma_mem_free(g2d->dev, &temp_alloc);
+			g2d_dma_mem_free(g2d->dev, &temp2_alloc);
+			ret = -ENOMEM;
+			goto err_unmap_out;
+		}
 
 			job->g2d = g2d;
 			job->type = G2D_JOB_BLIT;
@@ -7561,24 +7760,20 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			job->out_attach = out_attach;
 			job->out_sgt = out_sgt;
 
-			/* Store temp buffer info for 3-pass execution */
-			job->temp_vaddr = temp_vaddr;
-			job->temp_dma_addr = temp_dma_addr;
-			job->temp_size = temp_size;
-			job->temp_width = temp_w;
-			job->temp_height = temp_h;
-			job->temp_pitch = temp_pitch;
-			/* Preserve alpha in temp format when source contains alpha */
-			job->temp_format = src_has_alpha_format ?
-						   blit.src.format :
-						   blit.dst.format;
+		/* Store temp buffer info for 3-pass execution */
+		job->temp_buf = temp_alloc;
+		job->temp_width = temp_w;
+		job->temp_height = temp_h;
+		job->temp_pitch = temp_pitch;
+		/* Preserve alpha in temp format when source contains alpha */
+		job->temp_format = src_has_alpha_format ?
+				   blit.src.format :
+				   blit.dst.format;
 
-			job->temp2_vaddr = temp2_vaddr;
-			job->temp2_dma_addr = temp2_dma_addr;
-			job->temp2_size = temp2_size;
-			job->temp2_width = temp2_w;
-			job->temp2_height = temp2_h;
-			job->temp2_pitch = temp2_pitch;
+		job->temp2_buf = temp2_alloc;
+		job->temp2_width = temp2_w;
+		job->temp2_height = temp2_h;
+		job->temp2_pitch = temp2_pitch;
 			job->temp2_format = src_has_alpha_format ?
 						    blit.src.format :
 						    blit.dst.format;
@@ -7588,10 +7783,8 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			if (!fence) {
 				dev_err(g2d->dev,
 					"Failed to create fence for 3-pass blit\n");
-				dma_free_coherent(g2d->dev, temp_size,
-						  temp_vaddr, temp_dma_addr);
-				dma_free_coherent(g2d->dev, temp2_size,
-						  temp2_vaddr, temp2_dma_addr);
+				g2d_dma_mem_free(g2d->dev, &job->temp_buf);
+				g2d_dma_mem_free(g2d->dev, &job->temp2_buf);
 				kfree(job);
 				ret = -ENOMEM;
 				goto err_no_cleanup; /* Don't cleanup DMA-BUFs, we haven't transferred ownership yet */
@@ -7604,10 +7797,8 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 				dev_err(g2d->dev,
 					"Failed to create sync_file for 3-pass blit\n");
 				dma_fence_put(fence);
-				dma_free_coherent(g2d->dev, temp_size,
-						  temp_vaddr, temp_dma_addr);
-				dma_free_coherent(g2d->dev, temp2_size,
-						  temp2_vaddr, temp2_dma_addr);
+				g2d_dma_mem_free(g2d->dev, &job->temp_buf);
+				g2d_dma_mem_free(g2d->dev, &job->temp2_buf);
 				kfree(job);
 				ret = -ENOMEM;
 				goto err_no_cleanup;
@@ -7620,10 +7811,8 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 				fput(sync_file->file);
 				kfree(sync_file);
 				dma_fence_put(fence);
-				dma_free_coherent(g2d->dev, temp_size,
-						  temp_vaddr, temp_dma_addr);
-				dma_free_coherent(g2d->dev, temp2_size,
-						  temp2_vaddr, temp2_dma_addr);
+				g2d_dma_mem_free(g2d->dev, &job->temp_buf);
+				g2d_dma_mem_free(g2d->dev, &job->temp2_buf);
 				kfree(job);
 				ret = fence_fd;
 				goto err_no_cleanup;
@@ -7689,31 +7878,28 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		u32 temp_pitch = ALIGN(temp_w * temp_bpp, 32);
 		size_t temp_size = temp_pitch * temp_h;
 
-		/* Allocate temporary buffer using CMA */
-		void *temp_vaddr = NULL;
-		dma_addr_t temp_dma_addr = 0;
+		/* Allocate temporary buffer using IOMMU-backed pages */
+		struct g2d_dma_mem temp_alloc = {};
 
-		temp_vaddr = dma_alloc_coherent(g2d->dev, temp_size,
-						&temp_dma_addr, GFP_KERNEL);
-		if (!temp_vaddr) {
+		ret = g2d_dma_mem_alloc(g2d->dev, temp_size, &temp_alloc,
+					  GFP_KERNEL);
+		if (ret) {
 			dev_err(g2d->dev,
 				"Failed to allocate temp buffer for scale+rotate: size=%zu\n",
 				temp_size);
-			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
 
 		dev_dbg(g2d->dev,
 			"Allocated temp buffer for async 2-pass: vaddr=%p dma=0x%llx size=%zu\n",
-			temp_vaddr, (u64)temp_dma_addr, temp_size);
+			temp_alloc.vaddr, (u64)temp_alloc.dma_addr, temp_size);
 
 		/* Create job for 2-pass async execution */
 		job = kzalloc(sizeof(*job), GFP_KERNEL);
 		if (!job) {
 			dev_err(g2d->dev,
 				"Failed to allocate job for 2-pass blit\n");
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
-					  temp_dma_addr);
+			g2d_dma_mem_free(g2d->dev, &temp_alloc);
 			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
@@ -7785,22 +7971,19 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->out_sgt = out_sgt;
 
 		/* Store temp buffer info for 2-pass execution */
-		job->temp_vaddr = temp_vaddr;
-		job->temp_dma_addr = temp_dma_addr;
-		job->temp_size = temp_size;
+		job->temp_buf = temp_alloc;
 		job->temp_width = temp_w;
 		job->temp_height = temp_h;
 		job->temp_pitch = temp_pitch;
 		job->temp_format = src_has_alpha_format ? blit.src.format :
-							  blit.dst.format;
+					  blit.dst.format;
 
 		/* Create fence for this job */
 		fence = sunxi_g2d_fence_create(g2d);
 		if (!fence) {
 			dev_err(g2d->dev,
 				"Failed to create fence for 2-pass blit\n");
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
-					  temp_dma_addr);
+			g2d_dma_mem_free(g2d->dev, &job->temp_buf);
 			kfree(job);
 			ret = -ENOMEM;
 			goto err_no_cleanup; /* Don't cleanup DMA-BUFs, we haven't transferred ownership yet */
@@ -7813,8 +7996,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			dev_err(g2d->dev,
 				"Failed to create sync_file for 2-pass blit\n");
 			dma_fence_put(fence);
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
-					  temp_dma_addr);
+			g2d_dma_mem_free(g2d->dev, &job->temp_buf);
 			kfree(job);
 			ret = -ENOMEM;
 			goto err_no_cleanup;
@@ -7827,8 +8009,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			fput(sync_file->file);
 			kfree(sync_file);
 			dma_fence_put(fence);
-			dma_free_coherent(g2d->dev, temp_size, temp_vaddr,
-					  temp_dma_addr);
+			g2d_dma_mem_free(g2d->dev, &job->temp_buf);
 			kfree(job);
 			ret = fence_fd;
 			goto err_no_cleanup;
@@ -8146,27 +8327,9 @@ static long sunxi_g2d_ioctl_fillrect(struct sunxi_g2d_dev *g2d,
 		goto err_detach;
 	}
 
-	/* Get DMA address from first sg entry */
-	dma_addr = sg_dma_address(sgt->sgl);
-
-	/* Workaround for T113-S3 without IOMMU: sg_dma_address() may return 0x0
-	 * In this case, use physical address directly from the page
-	 */
-	if (dma_addr == 0 && sgt->nents > 0) {
-		struct scatterlist *sg = sgt->sgl;
-		struct page *page = sg_page(sg);
-		if (page) {
-			dma_addr = page_to_phys(page) + sg->offset;
-			dev_dbg(g2d->dev,
-				"T113 workaround: fillrect using physical address 0x%llx\n",
-				(u64)dma_addr);
-		} else {
-			dev_err(g2d->dev,
-				"Failed to get physical address from page\n");
-			ret = -EINVAL;
-			goto err_unmap;
-		}
-	}
+	ret = g2d_sg_dma_address(g2d->dev, sgt, &dma_addr, "FILLRECT dst");
+	if (ret)
+		goto err_unmap;
 
 	/* If userspace passed a fence_fd_in for this fill, wait on it */
 	if (fill.fence_fd_in >= 0) {
@@ -8362,7 +8525,7 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 	struct g2d_dma_buffer *buf;
 	struct dma_buf *dmabuf;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
-	int fd;
+	int fd, ret;
 
 	if (copy_from_user(&alloc, (void __user *)arg, sizeof(alloc))) {
 		dev_err(g2d->dev, "ALLOC_BUFFER: copy_from_user failed\n");
@@ -8380,29 +8543,29 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 		return -ENOMEM;
 	}
 
-	/* Allocate DMA coherent memory */
-	buf->vaddr = dma_alloc_coherent(g2d->dev, alloc.size, &buf->dma_addr,
-					GFP_KERNEL);
-
-	if (!buf->vaddr) {
-		dev_err(g2d->dev, "ALLOC_BUFFER: dma_alloc_coherent FAILED\n");
-		kfree(buf);
-		return -ENOMEM;
-	}
-
-	buf->size = alloc.size;
 	buf->dev = g2d->dev;
+	ret = g2d_dma_mem_alloc(buf->dev, alloc.size, &buf->mem,
+				     GFP_KERNEL);
+	if (ret) {
+		dev_err(g2d->dev, "ALLOC_BUFFER: dma_alloc_noncontiguous FAILED\n");
+		kfree(buf);
+		return ret;
+	}
 
 	/* Export as DMA-BUF */
 	exp_info.ops = &g2d_dmabuf_ops;
 	exp_info.size = alloc.size;
-	exp_info.flags = O_RDWR | O_CLOEXEC;
+	/* export flags: leave zero (default). File descriptor flags are set
+	 * when calling dma_buf_fd(). Passing O_* flags here is incorrect
+	 * (these are file descriptor flags, not export flags). Using 0
+	 * ensures the dma-buf is exported as a normal PRIME-capable buffer.
+	 */
+	exp_info.flags = 0;
 	exp_info.priv = buf;
 
 	dmabuf = dma_buf_export(&exp_info);
 	if (IS_ERR(dmabuf)) {
-		dma_free_coherent(g2d->dev, buf->size, buf->vaddr,
-				  buf->dma_addr);
+		g2d_dma_mem_free(g2d->dev, &buf->mem);
 		kfree(buf);
 		return PTR_ERR(dmabuf);
 	}
@@ -8422,7 +8585,7 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 		return -EFAULT;
 	}
 	dev_dbg(g2d->dev, "Allocated buffer: size=%llu fd=%d dma_addr=0x%llx\n",
-		alloc.size, fd, (u64)buf->dma_addr);
+		alloc.size, fd, (u64)buf->mem.dma_addr);
 
 	return 0;
 }
@@ -8806,11 +8969,13 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	g2d->fence_context = dma_fence_context_alloc(1);
 
 	/* Initialize temporary scaling buffer fields */
-	g2d->temp_scale_buffer = NULL;
-	g2d->temp_scale_dma = 0;
-	g2d->temp_scale_size = 0;
+	g2d->temp_scale_buf.vaddr = NULL;
+	g2d->temp_scale_buf.dma_addr = 0;
+	g2d->temp_scale_buf.size = 0;
+	g2d->temp_scale_buf.sgt = NULL;
 
 	/* Get MMIO resources */
+	dev_dbg(&pdev->dev, "Getting MMIO resources\n");
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	g2d->base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(g2d->base))
@@ -8844,9 +9009,13 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 
 	/* Configure DMA (from fillrect v1.0.0) */
 	ret = of_dma_configure(&pdev->dev, pdev->dev.of_node, true);
-	if (ret)
+	if (ret) {
+		if (ret == -EPROBE_DEFER)
+			return ret;
 		dev_warn(&pdev->dev, "of_dma_configure failed: %d\n", ret);
+	}
 
+	dev_dbg(&pdev->dev, "Setting DMA mask to 32 bits\n");
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to set DMA mask: %d\n", ret);
@@ -8854,18 +9023,21 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	}
 
 	/* Get clocks */
+	dev_dbg(&pdev->dev, "Getting clocks\n");
 	g2d->clk_bus = devm_clk_get(&pdev->dev, "bus_g2d");
 	if (IS_ERR(g2d->clk_bus)) {
 		dev_err(&pdev->dev, "Failed to get bus_g2d clock\n");
 		return PTR_ERR(g2d->clk_bus);
 	}
 
+	dev_dbg(&pdev->dev, "Getting g2d clock\n");
 	g2d->clk_mod = devm_clk_get(&pdev->dev, "g2d");
 	if (IS_ERR(g2d->clk_mod)) {
 		dev_err(&pdev->dev, "Failed to get g2d clock\n");
 		return PTR_ERR(g2d->clk_mod);
 	}
 
+	dev_dbg(&pdev->dev, "Getting mbus clock\n");
 	g2d->clk_mbus = devm_clk_get(&pdev->dev, "mbus_g2d");
 	if (IS_ERR(g2d->clk_mbus)) {
 		dev_err(&pdev->dev, "Failed to get mbus clock\n");
@@ -8873,6 +9045,7 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	}
 
 	/* Get interconnect path for MBUS */
+	dev_dbg(&pdev->dev, "Getting interconnect path for MBUS\n");
 	g2d->icc_path = devm_of_icc_get(&pdev->dev, "dma-mem");
 	if (IS_ERR(g2d->icc_path)) {
 		ret = PTR_ERR(g2d->icc_path);
@@ -8885,6 +9058,7 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	}
 
 	/* Get IRQ */
+	dev_dbg(&pdev->dev, "Getting IRQ\n");
 	g2d->irq = platform_get_irq(pdev, 0);
 	if (g2d->irq < 0)
 		return g2d->irq;
