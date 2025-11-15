@@ -55,15 +55,13 @@ static const struct drm_driver sun4i_drv_driver = {
 	.minor			= 0,
 
 	/* GEM Operations */
+	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(drm_sun4i_gem_dumb_create),
 #ifdef CONFIG_DRM_GEM_SHMEM_HELPER
-	.dumb_create = drm_sun4i_gem_dumb_create,
-	/* Use shmem import to accept non-contiguous dma-buf SG tables exported
-	 * by other drivers (like sunxi-g2d). The default dma helper expects
-	 * physically contiguous SG tables which many exporters do not provide.
+	/* Prefer shmem PRIME import to accept non-contiguous SG tables from
+	 * exporters like sunxi-g2d. The macro above sets the default DMA helper;
+	 * this overrides only the import hook when available.
 	 */
 	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table,
-#else
-	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(drm_sun4i_gem_dumb_create),
 #endif
 	DRM_FBDEV_DMA_DRIVER_OPS,
 };
