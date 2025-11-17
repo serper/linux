@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Allwinner G2D Hardware Accelerator Driver
- * 
  * Copyright (C) 2025 Sergio Perez
- *
  * Version: v2.9.48 - STABLE VSU SCALING WORKING
  * 
  * CRITICAL FIX: T113-S3 VSU Hardware Quirk
@@ -40,6 +37,7 @@
 #include <linux/io.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-fence.h>
 #include <linux/sync_file.h>
@@ -82,21 +80,47 @@ MODULE_PARM_DESC(g2d_debug_flags,
  * system pages (vmap + sg_table + dma_map_sgtable) instead of CMA noncontig
  * allocations. This avoids consuming CMA at the cost of more driver work.
  */
-static bool g2d_alloc_use_system_heap;
+/* Por defecto habilitamos el backend de páginas del sistema para asignaciones
+ * del driver (evita consumir CMA cuando no es necesario para scanout).
+ */
+static bool g2d_alloc_use_system_heap = true;
 module_param(g2d_alloc_use_system_heap, bool, 0644);
 MODULE_PARM_DESC(g2d_alloc_use_system_heap,
 	"Use system heap pages for driver-side allocations (true) or CMA noncontiguous (false)");
 
 /* New: allocation backend mode
- *  0 = CMA/noncontiguous (default)
+ *  0 = CMA/noncontiguous
  *  1 = system pages (vmap + sg_table + dma_map_sgtable)
  *  2 = IOMMU coherent (dma_alloc_coherent -> contiguo en IOVA)
  * Si g2d_alloc_mode==0 pero g2d_alloc_use_system_heap=true, se usa el modo 1 para compatibilidad.
  */
-static int g2d_alloc_mode;
+/* Por defecto usamos 2 (coherent/IOMMU) para buffers G2D internos, ya que
+ * no se usan para scanout directo. Para buffers de scanout, la app debe
+ * usar dumb buffer (CMA) desde DRM.
+ */
+static int g2d_alloc_mode = 2;
 module_param_named(g2d_alloc_mode, g2d_alloc_mode, int, 0644);
 MODULE_PARM_DESC(g2d_alloc_mode,
-	"0=CMA (default), 1=system pages (sg), 2=IOMMU coherent (contiguous IOVA)");
+	"0=CMA, 1=system pages (sg), 2=IOMMU coherent (contiguous IOVA) [default=2]");
+
+/* Optional: permitir copia de staging cuando el mapeo DMA de un buffer lineal
+ * no consigue IOVA contigua. Útil para aceptar dmabuf fragmentados como fuente
+ * (copiando a un buffer coherente interno). Por defecto desactivado. */
+static bool g2d_allow_staging_fallback;
+module_param(g2d_allow_staging_fallback, bool, 0644);
+MODULE_PARM_DESC(g2d_allow_staging_fallback,
+	"Allow staging copy fallback for non-contiguous IOVA sources (default=false)");
+
+/* Writeback cache: reuse a single small staging buffer to reduce vmap churn */
+static bool g2d_wb_cache_enable = true;
+module_param(g2d_wb_cache_enable, bool, 0644);
+MODULE_PARM_DESC(g2d_wb_cache_enable,
+	"Enable small writeback staging buffer cache (default=true)");
+
+static unsigned int g2d_wb_cache_max_kb = 128; /* Max size eligible for cache reuse */
+module_param(g2d_wb_cache_max_kb, uint, 0644);
+MODULE_PARM_DESC(g2d_wb_cache_max_kb,
+	"Maximum writeback buffer size (KB) eligible for cache reuse (default=128KB)");
 
 /* Module parameters for RCQ experimentation (deprecated - RCQ not functional on T113-S3) */
 static bool rcq_enable_bit = true;
@@ -176,6 +200,17 @@ static int force_csc_color_space_in = -1;
 module_param(force_csc_color_space_in, int, 0644);
 MODULE_PARM_DESC(force_csc_color_space_in,
 	"Force CSC0 input color space: -1=auto, 0=BT.601, 1=BT.709");
+
+/* Testing/diagnostics: force staging paths even if sg is IOVA-contiguous.
+ * When enabled, the driver will:
+ *  - Force source staging (CPU copy from src dma-buf into coherent temp)
+ *  - Force writeback staging (HW writes into temp and CPU copies back to dst/out)
+ * This helps exercise vmap/vmalloc paths and validate counters/cleanup.
+ */
+static bool g2d_force_staging;
+module_param(g2d_force_staging, bool, 0644);
+MODULE_PARM_DESC(g2d_force_staging,
+	"Force staging of src and writeback paths for diagnostics (default=false)");
 
 /* VSU scaling filter coefficients - from BSP g2d_scal.c */
 static const s32 linearcoefftab32[32] = {
@@ -401,6 +436,15 @@ static int sunxi_g2d_do_fillrect(struct sunxi_g2d_dev *g2d, dma_addr_t dst_dma,
 
 static int sunxi_g2d_format_to_hw(u32 fmt, u32 *bpp);
 
+/* YUV helpers used early (cleanup copy-back) */
+static inline bool sunxi_g2d_is_yuv_planar(u32 fmt);
+static inline bool sunxi_g2d_is_yuv_semiplanar(u32 fmt);
+static void sunxi_g2d_get_yuv_plane_info(u32 fmt, u32 width, u32 height,
+                     const u32 *user_stride,
+                     u32 stride[3], u32 plane_offset[3]);
+
+/* g2d_dma_mem_free defined below */
+
 struct g2d_dma_mem {
 	void *vaddr;
 	dma_addr_t dma_addr;
@@ -412,11 +456,15 @@ struct g2d_dma_mem {
 	bool is_coherent; /* Allocado con dma_alloc_coherent: IOVA contigua */
 };
 
-static int g2d_dma_mem_alloc(struct device *dev, size_t size,
-				 struct g2d_dma_mem *mem, gfp_t gfp)
+/* Internal helper honoring an explicit allocation mode override.
+ * mode values: 0=CMA/noncontig, 1=system pages (vmap+sgtable), 2=coherent/IOMMU.
+ */
+static int __g2d_dma_mem_alloc_mode(struct device *dev, size_t size,
+				 struct g2d_dma_mem *mem, gfp_t gfp, int mode)
 {
 	struct sg_table *sgt = NULL;
 	void *vaddr = NULL;
+	int eff_mode;
 
 	if (!mem || !size)
 		return -EINVAL;
@@ -424,55 +472,44 @@ static int g2d_dma_mem_alloc(struct device *dev, size_t size,
 	memset(mem, 0, sizeof(*mem));
 	mem->size = size;
 
-	/* Selección de backend: prioridad a g2d_alloc_mode; si es 0 y
-	 * g2d_alloc_use_system_heap=true, usar modo 1 por compatibilidad.
-	 */
-	{
-		int mode = g2d_alloc_mode;
-		if (mode == 0 && g2d_alloc_use_system_heap)
-			mode = 1;
+	/* Decide effective allocation mode: explicit override or module default */
+	eff_mode = (mode >= 0) ? mode : g2d_alloc_mode;
+	if (eff_mode == 0 && g2d_alloc_use_system_heap)
+		eff_mode = 1;
 
-		if (mode == 2) {
-			/* IOMMU coherent: región IOVA contigua, evita CMA si es posible */
-			dma_addr_t dma;
-			void *va = dma_alloc_coherent(dev, size, &dma, gfp);
-			if (va) {
-				int ret_sg;
-				struct sg_table *coh_sgt = kzalloc(sizeof(*coh_sgt), GFP_KERNEL);
-				if (!coh_sgt) {
-					dma_free_coherent(dev, size, va, dma);
-					return -ENOMEM;
-				}
-				/* Construir sg_table para export/PRIME y mmap */
-				ret_sg = dma_get_sgtable_attrs(dev, coh_sgt, va, dma, size, 0);
-				if (ret_sg) {
-					kfree(coh_sgt);
-					dma_free_coherent(dev, size, va, dma);
-					return ret_sg;
-				}
-				memset(va, 0, size);
-				mem->vaddr = va;
-				mem->dma_addr = dma;
-				mem->sgt = coh_sgt;
-				mem->is_coherent = true;
-				return 0;
-			}
-			/* Si falla, continuar a otros backends */
-			dev_warn(dev, "g2d: dma_alloc_coherent failed size=%zu, fallback\n", size);
+	/* Mode 2: coherent/IOMMU contiguous IOVA region with sgtable wrapper */
+	if (eff_mode == 2) {
+		dma_addr_t dma;
+		void *va = dma_alloc_coherent(dev, size, &dma, gfp);
+		struct sg_table *coh_sgt;
+		int ret_sg;
+
+		if (!va)
+			return -ENOMEM;
+
+		coh_sgt = kzalloc(sizeof(*coh_sgt), GFP_KERNEL);
+		if (!coh_sgt) {
+			dma_free_coherent(dev, size, va, dma);
+			return -ENOMEM;
 		}
 
-		if (mode == 1) {
-			/* continuar con ruta system-backed existente */
-		} else if (mode != 0) {
-			/* modo desconocido -> seguir con CMA */
+		ret_sg = dma_get_sgtable_attrs(dev, coh_sgt, va, dma, size, 0);
+		if (ret_sg) {
+			kfree(coh_sgt);
+			dma_free_coherent(dev, size, va, dma);
+			return ret_sg;
 		}
+
+		mem->vaddr = va;
+		mem->dma_addr = dma;
+		mem->size = size;
+		mem->sgt = coh_sgt;
+		mem->is_coherent = true;
+		return 0;
 	}
 
-	/* If user requested system-backed allocation (mode=1), attempt to allocate
-	 * individual pages, vmap them and build an sg_table which we map
-	 * for device access. This avoids consuming CMA.
-	 */
-	if (g2d_alloc_mode == 1 || (g2d_alloc_mode == 0 && g2d_alloc_use_system_heap)) {
+	/* Mode 1: system-backed (vmap + sgtable built from pages) */
+	if (eff_mode == 1) {
 		unsigned int nents = DIV_ROUND_UP(size, PAGE_SIZE);
 		struct page **pages = NULL;
 		unsigned int i;
@@ -559,7 +596,7 @@ static int g2d_dma_mem_alloc(struct device *dev, size_t size,
 		return 0;
 	}
 
-	/* Default behavior: CMA/noncontiguous allocation (existing code) */
+	/* Default behavior: CMA/noncontiguous allocation */
 	sgt = dma_alloc_noncontiguous(dev, size, DMA_BIDIRECTIONAL, gfp, 0);
 	if (!sgt)
 		return -ENOMEM;
@@ -577,6 +614,13 @@ static int g2d_dma_mem_alloc(struct device *dev, size_t size,
 	mem->sgt = sgt;
 
 	return 0;
+}
+
+static int g2d_dma_mem_alloc(struct device *dev, size_t size,
+				 struct g2d_dma_mem *mem, gfp_t gfp)
+{
+	/* Wrapper that uses the module's default allocation mode */
+	return __g2d_dma_mem_alloc_mode(dev, size, mem, gfp, -1);
 }
 
 static void g2d_dma_mem_free(struct device *dev, struct g2d_dma_mem *mem)
@@ -624,6 +668,84 @@ static void g2d_dma_mem_free(struct device *dev, struct g2d_dma_mem *mem)
 	mem->is_coherent = false;
 }
 
+/* Generic ensure-capacity helper for a given temp buffer */
+static int g2d_ensure_capacity(struct device *dev,
+							   struct g2d_dma_mem *buf, size_t needed)
+{
+	if (buf->sgt && buf->size >= needed)
+		return 0;
+	if (buf->sgt)
+		g2d_dma_mem_free(dev, buf);
+	return g2d_dma_mem_alloc(dev, needed, buf, GFP_KERNEL);
+}
+
+/* Check if DMA addresses in a mapped sg_table are laid out contiguously */
+static bool g2d_sgt_dma_is_contiguous(struct sg_table *table)
+{
+	struct scatterlist *sg;
+	int i;
+	dma_addr_t prev_end = 0;
+
+	if (!table || !table->sgl || table->nents <= 0)
+		return false;
+
+	for_each_sg(table->sgl, sg, table->nents, i) {
+		dma_addr_t a = sg_dma_address(sg);
+		unsigned int l = sg_dma_len(sg);
+		if (i == 0) {
+			prev_end = a + (dma_addr_t)l;
+			continue;
+		}
+		if (a != prev_end)
+			return false;
+		prev_end = a + (dma_addr_t)l;
+	}
+	return true;
+}
+
+/* Forward decls for format helpers used below */
+static inline bool sunxi_g2d_is_yuv_planar(u32 fmt);
+static inline bool sunxi_g2d_is_yuv_semiplanar(u32 fmt);
+
+/* Calculate total byte size for a linear buffer given format and per-plane strides */
+static size_t g2d_calc_total_linear_size(u32 fmt, u32 width, u32 height,
+										const u32 stride[3],
+										const u32 plane_offset[3])
+{
+	size_t total = 0;
+
+	if (sunxi_g2d_is_yuv_planar(fmt)) {
+		/* Planar: 3 planes Y, U, V */
+		u32 hY = height;
+		u32 hUV;
+		if (fmt == G2D_FMT_YUV420_P || fmt == G2D_FMT_YUV420_P_VU)
+			hUV = height / 2; /* 4:2:0 */
+		else if (fmt == G2D_FMT_YUV422_P)
+			hUV = height;     /* 4:2:2 */
+		else /* YUV411_P */
+			hUV = height;     /* 4:1:1: stride already accounts for width subsampling */
+
+		total = max_t(size_t, total, (size_t)plane_offset[0] + (size_t)stride[0] * hY);
+		total = max_t(size_t, total, (size_t)plane_offset[1] + (size_t)stride[1] * hUV);
+		total = max_t(size_t, total, (size_t)plane_offset[2] + (size_t)stride[2] * hUV);
+	} else if (sunxi_g2d_is_yuv_semiplanar(fmt)) {
+		/* Semi-planar: 2 planes Y + UV */
+		u32 hY = height;
+		u32 hUV;
+		if (fmt >= G2D_FMT_YUV420_SP_UVUV && fmt <= G2D_FMT_YUV420_SP_VUVU)
+			hUV = height / 2;
+		else /* 422 or 411 SP */
+			hUV = height;
+		total = max_t(size_t, total, (size_t)plane_offset[0] + (size_t)stride[0] * hY);
+		total = max_t(size_t, total, (size_t)plane_offset[1] + (size_t)stride[1] * hUV);
+	} else {
+		/* Packed RGB or packed YUV: single plane */
+		total = (size_t)stride[0] * height;
+	}
+
+	return total;
+	}
+
 static int g2d_sg_dma_address(struct device *dev, struct sg_table *sgt,
 				    dma_addr_t *out, const char *label)
 {
@@ -632,18 +754,19 @@ static int g2d_sg_dma_address(struct device *dev, struct sg_table *sgt,
 	if (!sgt || !sgt->sgl)
 		return -EINVAL;
 
-	/* Hardware limitation: T113 G2D expects a single, physically contiguous
-	 * DMA segment for linear framebuffer access. Scatter-gather lists with
-	 * more than one entry are not supported for source/destination surfaces.
-	 * If we proceed with a non-contiguous sg_table and program only the base
-	 * address, the HW will DMA past the first segment causing memory
-	 * corruption and kernel faults. Reject early and let userspace/allocator
-	 * choose a contiguous buffer (e.g., from CMA) or implement a staged copy.
+	/* Hardware limitation: T113 G2D expects a contiguous address range in the
+	 * device-visible address space (IOVA) for linear surfaces. With IOMMU
+	 * present, a multi-entry sg may still represent a fully contiguous IOVA.
+	 * Accept such cases; otherwise, reject to avoid DMA overruns.
 	 */
 	if (sgt->nents > 1) {
-		dev_err(dev, "%s: non-contiguous dma-buf not supported by G2D (nents=%d)\n",
-			label ? label : "buffer", sgt->nents);
-		return -EOPNOTSUPP;
+		struct iommu_domain *dom = iommu_get_domain_for_dev(dev);
+		if (!dom || !g2d_sgt_dma_is_contiguous(sgt)) {
+			dev_err(dev,
+				"%s: non-contiguous IOVA for linear surface (nents=%d)\n",
+				label ? label : "buffer", sgt->nents);
+			return -EOPNOTSUPP;
+		}
 	}
 
 	addr = sg_dma_address(sgt->sgl);
@@ -737,8 +860,20 @@ struct sunxi_g2d_dev {
 	u64 fence_context;
 	atomic64_t fence_seqno;
 
-	/* Temporary scaling buffer (allocated per-operation, freed after blend) */
+	/* Persistent temporary buffer used for intermediate SCALE results.
+	 * Allocated on-demand (grown as needed) and reused across jobs to
+	 * avoid repeated allocate/free cycles that fragment memory. Freed
+	 * only at driver remove. Safe because jobs execute serially. */
 	struct g2d_dma_mem temp_scale_buf;
+	/* Persistent secondary temp buffer used for rotate stage in 3-pass
+	 * workflows. Allocated on-demand and reused to avoid fragmentation. */
+	struct g2d_dma_mem temp_rot_buf;
+	/* Persistent writeback staging buffer to avoid vmalloc churn for large
+	 * outputs. Sized on demand and reused across jobs. This drastically
+	 * reduces frequent vmap/vunmap and fragmentation when dst/out requires
+	 * CPU copy-back.
+	 */
+	struct g2d_dma_mem temp_wb_buf;
 
 	/* Delayed work to safely disable hardware when idle */
 	struct delayed_work disable_work;
@@ -748,7 +883,107 @@ struct sunxi_g2d_dev {
 	atomic64_t jobs_submitted;
 	atomic64_t jobs_done;
 	atomic64_t jobs_failed;
+
+	/* Staging telemetry */
+	atomic64_t stage_src_count;        /* Source staging (read) used */
+	atomic64_t stage_wb_out_count;     /* Writeback staging for explicit OUT */
+	atomic64_t stage_wb_inplace_count; /* Writeback staging for in-place DST */
+	atomic64_t stage_wb_bytes_copied;  /* Bytes copied back during writeback */
+	/* Live writeback telemetry (helps detect leaks/pressure under load) */
+	atomic64_t stage_wb_active_jobs;   /* In-flight jobs using writeback staging */
+	atomic64_t stage_wb_active_bytes;  /* Total bytes of temp writeback buffers currently allocated */
+	/* NEW telemetry for vmalloc/vmap fragmentation diagnostics */
+	atomic64_t vmap_attempts;          /* Total vmap (or dma_buf_vmap) attempts */
+	atomic64_t vmap_failures;          /* Number of vmap failures (alloc_vmap_area failures) */
+	/* Writeback cache (small buffer reuse) */
+	struct g2d_dma_mem wb_small_cache; /* Reusable staging buffer for small writeback sizes */
+	bool wb_small_cache_in_use;        /* True if currently handed to an in-flight job */
+	atomic64_t wb_cache_hits;          /* Times a job reused the cache */
+	atomic64_t wb_cache_misses;        /* Times a job needed a fresh alloc */
+	atomic64_t stage_wb_req_bytes;     /* Cumulative requested writeback bytes (logical) */
+
+	/* Job pool to reduce alloc/free churn (avoids fragmentation/pressure) */
+	spinlock_t job_pool_lock;
+	struct list_head job_pool_free;    /* Free-list of reusable job structs */
+	int job_pool_free_count;           /* Number of jobs currently in free-list */
+	int job_pool_min;                  /* Minimum pool size to keep */
+	int job_pool_max;                  /* Maximum pool size (beyond this: free) */
+	struct kmem_cache *job_cache;      /* Slab cache for job structs */
+	/* Pool telemetry */
+	atomic64_t job_pool_hits;          /* Reused from pool */
+	atomic64_t job_pool_misses;        /* Needed fresh alloc */
 };
+
+/* Ensure a reusable temp buffer exists and is large enough for (w,h,bpp).
+ * Returns computed pitch via pitch_out (aligned to 'align' bytes).
+ * If buffer is too small, it is reallocated with the new size. */
+static int g2d_ensure_temp_buffer(struct sunxi_g2d_dev *g2d,
+								  struct g2d_dma_mem *buf,
+								  u32 req_w, u32 req_h,
+								  u32 bpp, u32 align, u32 *pitch_out)
+{
+	size_t needed_pitch = ALIGN((size_t)req_w * (size_t)bpp, align);
+	size_t needed_size = needed_pitch * (size_t)req_h;
+
+	if (pitch_out)
+		*pitch_out = (u32)needed_pitch;
+
+	if (buf->sgt && buf->size >= needed_size)
+		return 0; /* Existing buffer is large enough */
+
+	dev_dbg(g2d->dev, "g2d: realloc temp buffer: %zu -> %zu bytes\n",
+			buf->size, needed_size);
+
+	/* Reallocate */
+	if (buf->sgt)
+		g2d_dma_mem_free(g2d->dev, buf);
+
+	return g2d_dma_mem_alloc(g2d->dev, needed_size, buf, GFP_KERNEL);
+}
+
+/* Ensure temp_scale_buf has at least 'needed' bytes */
+static int g2d_ensure_temp_capacity(struct sunxi_g2d_dev *g2d, size_t needed)
+{
+	if (g2d->temp_scale_buf.sgt && g2d->temp_scale_buf.size >= needed)
+		return 0;
+	if (g2d->temp_scale_buf.sgt)
+		g2d_dma_mem_free(g2d->dev, &g2d->temp_scale_buf);
+	return g2d_dma_mem_alloc(g2d->dev, needed, &g2d->temp_scale_buf, GFP_KERNEL);
+}
+
+
+/* Stage a linear source dmabuf into coherent temp buffer for HW consumption */
+static int g2d_stage_src_dmabuf(struct sunxi_g2d_dev *g2d, struct dma_buf *dmabuf,
+								size_t copy_size, dma_addr_t *dma_out)
+{
+	struct iosys_map map;
+	int ret;
+	atomic64_inc(&g2d->vmap_attempts); /* Telemetry: attempt */
+	/* Allow staging when force_staging is active even if fallback is disabled */
+	if (!g2d_allow_staging_fallback && !g2d_force_staging)
+		return -EOPNOTSUPP;
+	ret = dma_buf_begin_cpu_access(dmabuf, DMA_TO_DEVICE);
+	if (ret)
+		return ret;
+	ret = dma_buf_vmap(dmabuf, &map);
+	if (ret) {
+		atomic64_inc(&g2d->vmap_failures);
+		dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+		return ret;
+	}
+	ret = g2d_ensure_temp_capacity(g2d, copy_size);
+	if (ret) {
+		dma_buf_vunmap(dmabuf, &map);
+		dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+		return ret;
+	}
+	memcpy(g2d->temp_scale_buf.vaddr, map.vaddr, copy_size);
+	dma_buf_vunmap(dmabuf, &map);
+	dma_buf_end_cpu_access(dmabuf, DMA_TO_DEVICE);
+	atomic64_inc(&g2d->stage_src_count); /* Telemetry: source staging used */
+	*dma_out = g2d->temp_scale_buf.dma_addr;
+	return 0;
+}
 
 /**
  * struct sunxi_g2d_job - G2D job descriptor
@@ -873,7 +1108,65 @@ struct sunxi_g2d_job {
 	u32 temp2_height;
 	u32 temp2_pitch;
 	u32 temp2_format;
+
+	/* Writeback (destination/output) staging: when the final write target
+	 * (explicit out buffer or in-place dst) is not linearly mappable for the HW,
+	 * we direct HW output to a temporary coherent buffer and copy it back on
+	 * cleanup, deferring the fence signal until after the copyback.
+	 */
+	bool wb_out_active;           /* Writeback staging is active */
+	bool wb_out_is_explicit;      /* true: copy back into out_dmabuf, false: into dst_dmabuf */
+	struct g2d_dma_mem wb_out_buf;/* Temporary linear buffer for writeback */
+	bool wb_out_is_cache;         /* Reused from device wb_small_cache; do not free on cleanup */
+	bool wb_out_is_persistent;    /* Using device temp_wb_buf; do not free on cleanup */
+	size_t wb_out_size;           /* Logical size used for accounting */
 };
+
+/* ===== Job pool helpers ===== */
+static struct sunxi_g2d_job *g2d_job_alloc(struct sunxi_g2d_dev *g2d)
+{
+	struct sunxi_g2d_job *job = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&g2d->job_pool_lock, flags);
+	if (!list_empty(&g2d->job_pool_free)) {
+		job = list_first_entry(&g2d->job_pool_free, struct sunxi_g2d_job, node);
+		list_del_init(&job->node);
+		g2d->job_pool_free_count--;
+		spin_unlock_irqrestore(&g2d->job_pool_lock, flags);
+		atomic64_inc(&g2d->job_pool_hits);
+		memset(job, 0, sizeof(*job));
+		return job;
+	}
+	spin_unlock_irqrestore(&g2d->job_pool_lock, flags);
+
+	atomic64_inc(&g2d->job_pool_misses);
+	if (g2d->job_cache)
+		return kmem_cache_zalloc(g2d->job_cache, GFP_KERNEL);
+	return kzalloc(sizeof(*job), GFP_KERNEL);
+}
+
+static void g2d_job_free(struct sunxi_g2d_dev *g2d, struct sunxi_g2d_job *job)
+{
+	unsigned long flags;
+	if (!job)
+		return;
+
+	spin_lock_irqsave(&g2d->job_pool_lock, flags);
+	if (g2d->job_pool_free_count < g2d->job_pool_max) {
+		INIT_LIST_HEAD(&job->node);
+		list_add(&job->node, &g2d->job_pool_free);
+		g2d->job_pool_free_count++;
+		spin_unlock_irqrestore(&g2d->job_pool_lock, flags);
+		return;
+	}
+	spin_unlock_irqrestore(&g2d->job_pool_lock, flags);
+
+	if (g2d->job_cache)
+		kmem_cache_free(g2d->job_cache, job);
+	else
+		kfree(job);
+}
 
 static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 {
@@ -886,6 +1179,155 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 	/* Trace cleanup entry */
 	pr_debug("sunxi_g2d: cleanup job %p sync_file=%p fence=%p fd=%d\n", job,
 		 job->sync_file, job->fence, job->fence_fd);
+
+	/* If writeback staging was used, copy the HW output from the temporary
+	 * buffer back into the original destination/output dma-buf region before
+	 * releasing attachments. Defer fence signal until after copy-back.
+	 */
+	if (job->wb_out_active) {
+		struct dma_buf *target_dmabuf = job->wb_out_is_explicit ? job->out_dmabuf : job->dst_dmabuf;
+		u32 stage_pitch0 = job->data.blit.out_pitch;   /* pitch used by WB temp (plane0) */
+		u32 stage_format = job->data.blit.out_format;  /* format used by WB temp */
+		u32 target_x = job->wb_out_is_explicit ? 0 : job->data.blit.dst_x;
+		u32 target_y = job->wb_out_is_explicit ? 0 : job->data.blit.dst_y;
+		u32 copy_w = job->data.blit.dst_w;
+		u32 copy_h = job->data.blit.dst_h;
+
+		if (target_dmabuf && job->wb_out_buf.vaddr) {
+			struct iosys_map map;
+			int ret;
+
+			ret = dma_buf_begin_cpu_access(target_dmabuf, DMA_TO_DEVICE);
+			if (!ret) {
+				ret = dma_buf_vmap(target_dmabuf, &map);
+				if (!ret) {
+					u8 *dst_base = (u8 *)map.vaddr;
+					u8 *src_base = (u8 *)job->wb_out_buf.vaddr;
+
+					if (sunxi_g2d_is_yuv_planar(stage_format) || sunxi_g2d_is_yuv_semiplanar(stage_format)) {
+						/* Compute plane info for staging (source) and target buffers */
+						u32 s_user_stride[3] = { stage_pitch0, 0, 0 };
+						u32 s_stride[3], s_off[3];
+						u32 t_user_stride[3];
+						u32 t_stride[3], t_off[3];
+						u32 t_pitch0 = job->wb_out_is_explicit ? job->data.blit.out_pitch : job->data.blit.dst_pitch;
+						u32 t_format = job->wb_out_is_explicit ? job->data.blit.out_format : job->data.blit.dst_format;
+						u32 t_width  = job->wb_out_is_explicit ? job->data.blit.out_width  : job->data.blit.dst_width;
+						u32 t_height = job->wb_out_is_explicit ? job->data.blit.out_height : job->data.blit.dst_height;
+
+						t_user_stride[0] = t_pitch0; t_user_stride[1] = 0; t_user_stride[2] = 0;
+						sunxi_g2d_get_yuv_plane_info(stage_format, copy_w, copy_h, s_user_stride, s_stride, s_off);
+						sunxi_g2d_get_yuv_plane_info(t_format, t_width, t_height, t_user_stride, t_stride, t_off);
+
+						/* Plane 0: Y or packed */
+						{
+							u8 *s = src_base + s_off[0];
+							u8 *d = dst_base + t_off[0] + (size_t)target_y * t_stride[0] + (size_t)target_x;
+							u32 i;
+							for (i = 0; i < copy_h; i++)
+								memcpy(d + (size_t)i * t_stride[0], s + (size_t)i * s_stride[0], copy_w);
+						}
+
+						/* Chroma planes */
+						if (sunxi_g2d_is_yuv_planar(stage_format)) {
+							/* 4:2:0 or 4:2:2 planar */
+							u32 sub_w = (stage_format == G2D_FMT_YUV420_P || stage_format == G2D_FMT_YUV420_P_VU) ? (copy_w >> 1) :
+									(stage_format == G2D_FMT_YUV411_P ? (copy_w >> 2) : (copy_w >> 1));
+							u32 sub_h = (stage_format == G2D_FMT_YUV420_P || stage_format == G2D_FMT_YUV420_P_VU) ? (copy_h >> 1) : copy_h;
+							u32 cx = (stage_format == G2D_FMT_YUV411_P) ? (target_x >> 2) : (target_x >> 1);
+							u32 cy = (stage_format == G2D_FMT_YUV420_P || stage_format == G2D_FMT_YUV420_P_VU) ? (target_y >> 1) : target_y;
+							/* U plane (1) */
+							{
+								u8 *s = src_base + s_off[1];
+								u8 *d = dst_base + t_off[1] + (size_t)cy * t_stride[1] + (size_t)cx;
+								u32 i;
+								for (i = 0; i < sub_h; i++)
+									memcpy(d + (size_t)i * t_stride[1], s + (size_t)i * s_stride[1], sub_w);
+							}
+							/* V plane (2) */
+							{
+								u8 *s = src_base + s_off[2];
+								u8 *d = dst_base + t_off[2] + (size_t)cy * t_stride[2] + (size_t)cx;
+								u32 i;
+								for (i = 0; i < sub_h; i++)
+									memcpy(d + (size_t)i * t_stride[2], s + (size_t)i * s_stride[2], sub_w);
+							}
+						} else {
+							/* Semi-planar (NV12/NV21 variants) */
+							u32 sub_h = (stage_format >= G2D_FMT_YUV420_SP_UVUV && stage_format <= G2D_FMT_YUV420_SP_VUVU) ? (copy_h >> 1) : copy_h;
+							/* UV plane row bytes: round up to even width for 4:2:0 */
+							u32 uv_row_bytes = (stage_format >= G2D_FMT_YUV420_SP_UVUV && stage_format <= G2D_FMT_YUV420_SP_VUVU) ? ALIGN(copy_w, 2) : copy_w;
+							u32 cx_bytes = (stage_format >= G2D_FMT_YUV420_SP_UVUV && stage_format <= G2D_FMT_YUV420_SP_VUVU) ? (ALIGN_DOWN(target_x, 2)) : target_x;
+							u32 cy = (stage_format >= G2D_FMT_YUV420_SP_UVUV && stage_format <= G2D_FMT_YUV420_SP_VUVU) ? (target_y >> 1) : target_y;
+							u8 *s = src_base + s_off[1];
+							u8 *d = dst_base + t_off[1] + (size_t)cy * t_stride[1] + (size_t)cx_bytes;
+							u32 i;
+							for (i = 0; i < sub_h; i++)
+								memcpy(d + (size_t)i * t_stride[1], s + (size_t)i * s_stride[1], uv_row_bytes);
+						}
+					} else {
+						/* RGB or packed formats */
+						u32 bpp = 0; size_t row_bytes;
+						u32 t_pitch0 = job->wb_out_is_explicit ? job->data.blit.out_pitch : job->data.blit.dst_pitch;
+						sunxi_g2d_format_to_hw(stage_format, &bpp);
+						row_bytes = (size_t)copy_w * bpp;
+						u8 *s = src_base;
+						u8 *d = dst_base + (size_t)target_y * t_pitch0 + (size_t)target_x * bpp;
+						u32 i;
+						for (i = 0; i < copy_h; i++)
+							memcpy(d + (size_t)i * t_pitch0, s + (size_t)i * stage_pitch0, row_bytes);
+					}
+
+					/* Telemetry */
+					if (job->g2d) {
+						size_t total_bytes = 0;
+						if (sunxi_g2d_is_yuv_planar(stage_format)) {
+							total_bytes = (size_t)copy_w * copy_h /* Y */
+								+ (size_t)(copy_w >> 1) * ((stage_format == G2D_FMT_YUV420_P || stage_format == G2D_FMT_YUV420_P_VU) ? (copy_h >> 1) : copy_h) /* U */
+								+ (size_t)(copy_w >> 1) * ((stage_format == G2D_FMT_YUV420_P || stage_format == G2D_FMT_YUV420_P_VU) ? (copy_h >> 1) : copy_h); /* V */
+						} else if (sunxi_g2d_is_yuv_semiplanar(stage_format)) {
+							total_bytes = (size_t)copy_w * copy_h /* Y */
+								+ (size_t)ALIGN(copy_w, 2) * ((stage_format >= G2D_FMT_YUV420_SP_UVUV && stage_format <= G2D_FMT_YUV420_SP_VUVU) ? (copy_h >> 1) : copy_h); /* UV */
+						} else {
+							u32 bpp = 0; sunxi_g2d_format_to_hw(stage_format, &bpp);
+							total_bytes = (size_t)copy_w * copy_h * bpp;
+						}
+						atomic64_add(total_bytes, &job->g2d->stage_wb_bytes_copied);
+						dev_dbg(job->g2d->dev, "cleanup: writeback copyback ~%zu bytes (dst=%s)\n",
+							total_bytes, job->wb_out_is_explicit ? "out" : "dst");
+					}
+
+					dma_buf_vunmap(target_dmabuf, &map);
+				}
+				dma_buf_end_cpu_access(target_dmabuf, DMA_TO_DEVICE);
+			}
+		}
+
+		/* Release writeback staging resources/accounting */
+		if (job->g2d) {
+			if (job->wb_out_is_persistent) {
+				/* Persistent buffer stays allocated on the device; only update counters */
+				atomic64_sub(job->wb_out_size, &job->g2d->stage_wb_active_bytes);
+				atomic64_dec(&job->g2d->stage_wb_active_jobs);
+			} else if (job->wb_out_buf.sgt) {
+				/* Live accounting: writeback temp being released (cache or ephemeral) */
+				if (job->wb_out_is_cache) {
+					atomic64_sub(job->g2d->wb_small_cache.size, &job->g2d->stage_wb_active_bytes);
+					atomic64_dec(&job->g2d->stage_wb_active_jobs);
+					/* Mark cache available again */
+					job->g2d->wb_small_cache_in_use = false;
+				} else {
+					atomic64_sub(job->wb_out_buf.size, &job->g2d->stage_wb_active_bytes);
+					atomic64_dec(&job->g2d->stage_wb_active_jobs);
+					g2d_dma_mem_free(job->g2d->dev, &job->wb_out_buf);
+				}
+			}
+		}
+
+		/* Now that the content is in the original buffer, signal fence if not already */
+		if (job->fence && !dma_fence_is_signaled(job->fence))
+			dma_fence_signal(job->fence);
+	}
 
 	/* Release sync_file if still present (not installed) */
 	if (job->sync_file) {
@@ -966,8 +1408,8 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 		}
 	}
 
-	pr_debug("sunxi_g2d: cleanup - free job %p\n", job);
-	kfree(job);
+	pr_debug("sunxi_g2d: cleanup - free/return job %p\n", job);
+	g2d_job_free(job->g2d, job);
 }
 
 /* ===== dma_fence wrapper for sunxi jobs ===== */
@@ -2092,8 +2534,8 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 			spin_unlock(&g2d->job_lock);
 
 			if (job) {
-				/* Signal the fence */
-				if (job->fence) {
+				/* Signal the fence unless we must defer due to writeback staging */
+				if (job->fence && !job->wb_out_active) {
 					struct sunxi_g2d_fence *sf =
 						container_of(
 							job->fence,
@@ -3552,7 +3994,7 @@ static int g2d_dmabuf_attach(struct dma_buf *dmabuf,
 	a->mapped = false;
 	attach->priv = a;
 
-	dev_info(buf->dev, "g2d_dmabuf_attach: dmabuf=%p attach->dev=%p orig_nents=%u\n",
+	dev_dbg(buf->dev, "g2d_dmabuf_attach: dmabuf=%p attach->dev=%p orig_nents=%u\n",
 			 dmabuf, attach->dev, buf->mem.sgt ? buf->mem.sgt->orig_nents : 0);
 
 	return 0;
@@ -3580,7 +4022,7 @@ static struct sg_table *g2d_dmabuf_map(struct dma_buf_attachment *attach,
 	struct g2d_dmabuf_attachment *a = attach->priv;
 	int ret;
 
-	dev_info(attach->dev, "g2d_dmabuf_map: attach->dev=%p dir=%d orig_nents=%u\n",
+	dev_dbg(attach->dev, "g2d_dmabuf_map: attach->dev=%p dir=%d orig_nents=%u\n",
 			 attach->dev, dir, a->sgt.orig_nents);
 
 	ret = dma_map_sgtable(attach->dev, &a->sgt, dir, 0);
@@ -3590,7 +4032,7 @@ static struct sg_table *g2d_dmabuf_map(struct dma_buf_attachment *attach,
 	}
 
 	a->mapped = true;
-	dev_info(attach->dev, "g2d_dmabuf_map: mapped, first DMA addr=0x%pad\n",
+	dev_dbg(attach->dev, "g2d_dmabuf_map: mapped, first DMA addr=0x%pad\n",
 			 &sg_dma_address(a->sgt.sgl));
 	return &a->sgt;
 }
@@ -3620,7 +4062,7 @@ static int g2d_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	struct g2d_dma_buffer *buf = dmabuf->priv;
 	int ret;
 
-	dev_info(buf->dev, "g2d_dmabuf_mmap: size=%zu vma_size=%lu\n",
+	dev_dbg(buf->dev, "g2d_dmabuf_mmap: size=%zu vma_size=%lu\n",
 			 buf->mem.size, vma->vm_end - vma->vm_start);
 
 	if (buf->mem.is_coherent) {
@@ -3635,7 +4077,7 @@ static int g2d_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 		ret = dma_mmap_noncontiguous(buf->dev, vma, buf->mem.size,
 						   buf->mem.sgt);
 	}
-	dev_info(buf->dev, "g2d_dmabuf_mmap: ret=%d\n", ret);
+	dev_dbg(buf->dev, "g2d_dmabuf_mmap: ret=%d\n", ret);
 	return ret;
 }
 
@@ -4295,11 +4737,8 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 				temp_bpp = 4;
 		}
 
-		u32 temp_pitch = ALIGN(blend_w * temp_bpp,
-			       128); /* Align pitch to 128 bytes */
-		u32 temp_size = temp_pitch *
-				blend_h; /* Use aligned pitch for buffer size */
-		struct g2d_dma_mem temp_alloc = {};
+	u32 temp_pitch = ALIGN(blend_w * temp_bpp,
+		   128); /* Align pitch to 128 bytes */
 
 		/* Use the source's pixel format for the temporary buffer. Scaling
 		 * is a raw resampling operation and must not apply blending or
@@ -4307,11 +4746,12 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 		u32 temp_format = src_format;
 
 		dev_dbg(g2d->dev,
-			"⚠️  Allocating internal temp buffer: %ux%u pitch=%u (%u bytes) fmt=%u\n",
-			blend_w, blend_h, temp_pitch, temp_size, temp_format);
+			"⚠️  Ensuring internal temp buffer: %ux%u pitch=%u (size=%zu) fmt=%u\n",
+			blend_w, blend_h, temp_pitch, g2d->temp_scale_buf.size, temp_format);
 
-		ret = g2d_dma_mem_alloc(g2d->dev, temp_size, &temp_alloc,
-					  GFP_KERNEL);
+		/* Ensure persistent temp buffer is allocated with enough capacity */
+		ret = g2d_ensure_temp_buffer(g2d, &g2d->temp_scale_buf,
+						 blend_w, blend_h, temp_bpp, 128, &temp_pitch);
 		if (ret) {
 			dev_err(g2d->dev,
 				"Failed to allocate temp buffer for scaling\n");
@@ -4320,7 +4760,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 
 		dev_dbg(g2d->dev,
 			"✅ Temp buffer allocated: vaddr=%p dma=0x%llx pitch=%u (aligned to 128)\n",
-			temp_alloc.vaddr, (u64)temp_alloc.dma_addr, temp_pitch);
+			g2d->temp_scale_buf.vaddr, (u64)g2d->temp_scale_buf.dma_addr, temp_pitch);
 
 		/* 
 		* STEP 1: Scale src → temp buffer (EXACT size, no positioning)
@@ -4336,7 +4776,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 			src_y, src_crop_w, src_crop_h, src_pitch);
 		dev_dbg(g2d->dev,
 			"  temp: 0x%llx (%ux%u) fmt=%u pitch=%u (ALIGNED)\n",
-			(u64)temp_alloc.dma_addr, blend_w, blend_h, temp_format,
+			(u64)g2d->temp_scale_buf.dma_addr, blend_w, blend_h, temp_format,
 			temp_pitch);
 
 		u8 temp_color_space = src_color_space;
@@ -4345,16 +4785,15 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 
 		ret = sunxi_g2d_do_scale(
 			g2d, src_dma_addr, src_w, src_h, src_pitch, src_format,
-			src_x, src_y, src_crop_w, src_crop_h, temp_alloc.dma_addr, blend_w,
+			src_x, src_y, src_crop_w, src_crop_h, g2d->temp_scale_buf.dma_addr, blend_w,
 			blend_h, /* TEMP: exact size */
 			temp_pitch, temp_format, /* pitch = ALIGNED */
 			0, 0, blend_w, blend_h, /* Write at (0,0) */
 			src_color_space, temp_color_space,
-			temp_alloc.vaddr); /* DUMP temp buffer for debug */
+			g2d->temp_scale_buf.vaddr); /* DUMP temp buffer for debug */
 		if (ret) {
 			dev_err(g2d->dev, "❌ Step 1 (scale) failed: %d\n",
 				ret);
-			g2d_dma_mem_free(g2d->dev, &temp_alloc);
 			return ret;
 		}
 
@@ -4374,7 +4813,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 			(u64)src_dma_addr, src_format, src_crop_w, src_crop_h);
 
 		/* Update src parameters to point to temp buffer */
-	src_dma_addr = temp_alloc.dma_addr; /* Read from temp buffer */
+	src_dma_addr = g2d->temp_scale_buf.dma_addr; /* Read from temp buffer */
 		src_w = blend_w; /* Temp buffer width */
 		src_h = blend_h; /* Temp buffer height */
 		src_pitch = temp_pitch; /* Temp buffer pitch (ALIGNED to 128) */
@@ -4400,8 +4839,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 		/* Fall through to normal alpha blend below (without scaling) */
 		/* IMPORTANT: temp buffer will be freed after blend completes */
 
-		/* Store temp buffer info for cleanup after blend */
-		g2d->temp_scale_buf = temp_alloc;
+		/* Persistent temp buffer will be kept for reuse */
 	}
 
 	/* Enable hardware */
@@ -4914,15 +5352,7 @@ static int sunxi_g2d_do_blit_alpha_3buf(
 	dev_dbg(g2d->dev, "BLIT_ALPHA_CORRECT completed via IRQ\n");
 	sunxi_g2d_hw_disable(g2d);
 
-	/* Free temporary scaling buffer if it was allocated */
-	if (g2d->temp_scale_buf.sgt) {
-		dev_dbg(g2d->dev,
-			"Freeing temp scale buffer: vaddr=%p dma=0x%llx size=%zu\n",
-			g2d->temp_scale_buf.vaddr,
-			(u64)g2d->temp_scale_buf.dma_addr,
-			g2d->temp_scale_buf.size);
-		g2d_dma_mem_free(g2d->dev, &g2d->temp_scale_buf);
-	}
+	/* Keep temporary scaling buffer allocated for reuse (persistent) */
 
 	return 0;
 }
@@ -6246,10 +6676,48 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
-				     "SCALE src");
-	if (ret)
-		goto err_unmap_src;
+	/* Pre-compute strides/offsets for possible staging */
+	u32 src_stride[3], src_plane_offset[3];
+	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
+					 cmd.src.stride, src_stride, src_plane_offset);
+
+	/* If force_staging is enabled, stage source unconditionally.
+	 * Otherwise, map normally and only fall back to staging when allowed.
+	 */
+	if (g2d_force_staging) {
+		size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+					    cmd.src.width, cmd.src.height,
+					    src_stride, src_plane_offset);
+		/* Unmap/detach DMA mapping before CPU staging */
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+		dma_buf_detach(src_dmabuf, src_attach);
+		src_sgt = NULL;
+		src_attach = NULL;
+		ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+		if (ret)
+			goto err_put_src;
+	} else {
+		ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+					 "SCALE src");
+		if (ret) {
+			if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+				size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+								cmd.src.width, cmd.src.height,
+								src_stride, src_plane_offset);
+				/* Unmap attachment before CPU staging */
+				dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+				dma_buf_detach(src_dmabuf, src_attach);
+				src_sgt = NULL;
+				src_attach = NULL;
+				/* Stage into coherent temp */
+				ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+				if (ret)
+					goto err_put_src;
+			} else {
+				goto err_unmap_src;
+			}
+		}
+	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -6277,67 +6745,142 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
-				     "SCALE dst");
-	if (ret)
-		goto err_unmap_dst;
+	/* Determine destination DMA or enable writeback staging for SCALE */
+	{
+		bool dst_wb_needed = false;
+		bool wb_is_cache = false;
+		bool wb_is_persistent = false;
+		u32 out_pitch = 0;
+		size_t wb_size = 0;
+		struct g2d_dma_mem wb_local = {0};
 
-	/* Create fence for async operation */
-	fence = sunxi_g2d_fence_create(g2d);
-	if (!fence) {
-		dev_err(g2d->dev, "SCALE: fence_create failed\n");
-		ret = -ENOMEM;
-		goto err_unmap_dst;
+		ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr, "SCALE dst");
+		if (ret) {
+			if (ret == -EOPNOTSUPP && (g2d_allow_staging_fallback || g2d_force_staging))
+				dst_wb_needed = true;
+			else
+				goto err_unmap_dst;
+		} else if (g2d_force_staging) {
+			/* Even if contiguous, force writeback staging for diagnostics */
+			dst_wb_needed = true;
+		}
+
+		if (dst_wb_needed) {
+			u32 bpp = dst_bpp;
+			out_pitch = cmd.dst_w * bpp;
+			wb_size = (size_t)out_pitch * cmd.dst_h;
+
+			if (g2d_wb_cache_enable && g2d->wb_small_cache.sgt &&
+			    g2d->wb_small_cache.size >= wb_size &&
+			    !g2d->wb_small_cache_in_use &&
+			    wb_size <= (size_t)g2d_wb_cache_max_kb * 1024) {
+				/* Use small cache */
+				dst_dma_addr = g2d->wb_small_cache.dma_addr;
+				wb_is_cache = true;
+				wb_local = g2d->wb_small_cache;
+			} else {
+				/* Use persistent device buffer to avoid churn */
+				int a = g2d_ensure_capacity(g2d->dev, &g2d->temp_wb_buf, wb_size);
+				if (a) {
+					dev_err(g2d->dev, "SCALE: ensure temp_wb_buf failed: %d (size=%zu)\n", a, wb_size);
+					goto err_unmap_dst;
+				}
+
+				dst_dma_addr = g2d->temp_wb_buf.dma_addr;
+				wb_is_persistent = true;
+				wb_local = g2d->temp_wb_buf;
+			}
+		}
+
+		/* Create fence for async operation */
+		fence = sunxi_g2d_fence_create(g2d);
+		if (!fence) {
+			dev_err(g2d->dev, "SCALE: fence_create failed\n");
+			ret = -ENOMEM;
+			goto err_unmap_dst;
+		}
+
+		/* Create sync_file for userspace */
+		sync_file = sync_file_create(fence);
+		if (!sync_file) {
+			dev_err(g2d->dev, "SCALE: sync_file_create failed\n");
+			dma_fence_put(fence);
+			ret = -ENOMEM;
+			goto err_unmap_dst;
+		}
+
+		fence_fd = get_unused_fd_flags(O_CLOEXEC);
+		if (fence_fd < 0) {
+			dev_err(g2d->dev, "SCALE: get_unused_fd failed\n");
+			fput(sync_file->file);
+			ret = fence_fd;
+			goto err_unmap_dst;
+		}
+
+		/* Create/obtain async job (from pool if available) */
+		job = g2d_job_alloc(g2d);
+		if (!job) {
+			dev_err(g2d->dev, "SCALE: job allocation failed\n");
+			put_unused_fd(fence_fd);
+			fput(sync_file->file);
+			ret = -ENOMEM;
+			goto err_unmap_dst;
+		}
+
+		INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+		job->g2d = g2d;
+		job->fence = fence;
+		job->src_dmabuf = src_dmabuf;
+		job->dst_dmabuf = dst_dmabuf;
+		job->src_attach = src_attach;
+		job->dst_attach = dst_attach;
+		job->src_sgt = src_sgt;
+		job->dst_sgt = dst_sgt;
+
+		/* Setup job parameters */
+		job->type = G2D_JOB_CMD_SCALE;
+		job->src_dma = src_dma_addr;
+		job->dst_dma = dst_dma_addr;
+
+		/* If WB staging applies, finalize job flags and accounting now */
+		if (dst_wb_needed) {
+			job->wb_out_active = true;
+			job->wb_out_is_explicit = false;
+			if (wb_is_cache) {
+				job->wb_out_is_cache = true;
+				job->wb_out_is_persistent = false;
+				job->wb_out_buf = wb_local;
+				atomic64_inc(&g2d->stage_wb_active_jobs);
+				atomic64_add(job->wb_out_buf.size, &g2d->stage_wb_active_bytes);
+				g2d->wb_small_cache_in_use = true;
+				atomic64_inc(&g2d->wb_cache_hits);
+			} else if (wb_is_persistent) {
+				job->wb_out_is_cache = false;
+				job->wb_out_is_persistent = true;
+				job->wb_out_buf = wb_local;
+				job->wb_out_size = wb_size;
+				atomic64_inc(&g2d->stage_wb_active_jobs);
+				atomic64_add(job->wb_out_size, &g2d->stage_wb_active_bytes);
+				atomic64_inc(&g2d->wb_cache_misses);
+			} else {
+				/* Should not happen here, but keep a safe fallback */
+				job->wb_out_is_cache = false;
+				job->wb_out_is_persistent = false;
+				job->wb_out_buf = wb_local;
+				atomic64_inc(&g2d->stage_wb_active_jobs);
+				atomic64_add(job->wb_out_buf.size, &g2d->stage_wb_active_bytes);
+				atomic64_inc(&g2d->wb_cache_misses);
+			}
+
+			/* Provide cleanup with staging buffer layout */
+			job->data.blit.out_pitch = out_pitch;
+			job->data.blit.out_format = cmd.dst.format;
+		}
 	}
-
-	/* Create sync_file for userspace */
-	sync_file = sync_file_create(fence);
-	if (!sync_file) {
-		dev_err(g2d->dev, "SCALE: sync_file_create failed\n");
-		dma_fence_put(fence);
-		ret = -ENOMEM;
-		goto err_unmap_dst;
-	}
-
-	fence_fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fence_fd < 0) {
-		dev_err(g2d->dev, "SCALE: get_unused_fd failed\n");
-		fput(sync_file->file);
-		ret = fence_fd;
-		goto err_unmap_dst;
-	}
-
-	/* Create async job */
-	job = kzalloc(sizeof(*job), GFP_KERNEL);
-	if (!job) {
-		dev_err(g2d->dev, "SCALE: job allocation failed\n");
-		put_unused_fd(fence_fd);
-		fput(sync_file->file);
-		ret = -ENOMEM;
-		goto err_unmap_dst;
-	}
-
-	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-	job->g2d = g2d;
-	job->fence = fence;
-	job->src_dmabuf = src_dmabuf;
-	job->dst_dmabuf = dst_dmabuf;
-	job->src_attach = src_attach;
-	job->dst_attach = dst_attach;
-	job->src_sgt = src_sgt;
-	job->dst_sgt = dst_sgt;
-
-	/* Setup job parameters */
-	job->type = G2D_JOB_CMD_SCALE;
-	job->src_dma = src_dma_addr;
-	job->dst_dma = dst_dma_addr;
 
 	/* Calculate proper strides for YUV formats */
-	u32 src_stride[3], src_plane_offset[3];
 	u32 dst_stride[3], dst_plane_offset[3];
-	
-	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
-				     cmd.src.stride, src_stride, src_plane_offset);
+    
 	sunxi_g2d_get_yuv_plane_info(cmd.dst.format, cmd.dst.width, cmd.dst.height,
 				     cmd.dst.stride, dst_stride, dst_plane_offset);
 
@@ -6484,10 +7027,47 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
-				     "CMD_BLEND src");
-	if (ret)
-		goto err_unmap_src;
+	/* Pre-compute strides/offsets for possible staging */
+	u32 src_stride[3], src_plane_offset[3];
+	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
+					 cmd.src.stride, src_stride, src_plane_offset);
+
+	/* If force staging is enabled, stage source unconditionally.
+	 * Otherwise try linear DMA and fall back to staging if allowed.
+	 */
+	if (g2d_force_staging) {
+		size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+							cmd.src.width, cmd.src.height,
+							src_stride, src_plane_offset);
+		/* Unmap/detach before CPU staging */
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+		dma_buf_detach(src_dmabuf, src_attach);
+		src_sgt = NULL;
+		src_attach = NULL;
+		ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+		if (ret)
+			goto err_put_src;
+	} else {
+		ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+					 "CMD_BLEND src");
+		if (ret) {
+			if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+				size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+								cmd.src.width, cmd.src.height,
+								src_stride, src_plane_offset);
+				/* Unmap/detach before CPU staging */
+				dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+				dma_buf_detach(src_dmabuf, src_attach);
+				src_sgt = NULL;
+				src_attach = NULL;
+				ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+				if (ret)
+					goto err_put_src;
+			} else {
+				goto err_unmap_src;
+			}
+		}
+	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -6508,10 +7088,46 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
-				     "CMD_BLEND dst");
-	if (ret)
-		goto err_unmap_dst;
+	/* Allow staging for DST (background) if non-linear or when forced */
+	{
+		/* Pre-compute dst strides for potential staging */
+		u32 dst_stride_calc[3], dst_plane_offset[3];
+		sunxi_g2d_get_yuv_plane_info(cmd.dst.format, cmd.dst.width, cmd.dst.height,
+					     cmd.dst.stride, dst_stride_calc, dst_plane_offset);
+		if (g2d_force_staging) {
+			size_t copy_size = g2d_calc_total_linear_size(cmd.dst.format,
+							cmd.dst.width, cmd.dst.height,
+							dst_stride_calc, dst_plane_offset);
+			/* Unmap/detach before CPU staging */
+			dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_TO_DEVICE);
+			dma_buf_detach(dst_dmabuf, dst_attach);
+			dst_sgt = NULL;
+			dst_attach = NULL;
+			ret = g2d_stage_src_dmabuf(g2d, dst_dmabuf, copy_size, &dst_dma_addr);
+			if (ret)
+				goto err_put_dst;
+		} else {
+			ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+					     "CMD_BLEND dst");
+			if (ret) {
+				if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+					size_t copy_size = g2d_calc_total_linear_size(cmd.dst.format,
+								cmd.dst.width, cmd.dst.height,
+								dst_stride_calc, dst_plane_offset);
+					/* Unmap/detach before CPU staging */
+					dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_TO_DEVICE);
+					dma_buf_detach(dst_dmabuf, dst_attach);
+					dst_sgt = NULL;
+					dst_attach = NULL;
+					ret = g2d_stage_src_dmabuf(g2d, dst_dmabuf, copy_size, &dst_dma_addr);
+					if (ret)
+						goto err_put_dst;
+				} else {
+					goto err_unmap_dst;
+				}
+			}
+		}
+	}
 
 	/* Import output buffer */
 	out_dmabuf = dma_buf_get(cmd.out.dma_fd);
@@ -6559,8 +7175,8 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_unmap_out;
 	}
 
-	/* Create async job */
-	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	/* Create/obtain async job (from pool if available) */
+	job = g2d_job_alloc(g2d);
 	if (!job) {
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
@@ -6588,7 +7204,6 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->out_dma = out_dma_addr;
 
 	/* Calculate proper strides for YUV formats */
-	u32 src_stride[3], src_plane_offset[3];
 	u32 dst_stride[3], dst_plane_offset[3];
 	u32 out_stride[3], out_plane_offset[3];
 	
@@ -6697,6 +7312,13 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	struct sync_file *sync_file;
 	int fence_fd;
 	struct sunxi_g2d_job *job;
+	/* Writeback staging locals for dst */
+	bool wb_needed = false;
+	bool wb_is_cache = false;
+	bool wb_is_persistent = false;
+	struct g2d_dma_mem wb_buf = {0};
+	dma_addr_t wb_dma = 0;
+	u32 wb_out_pitch = 0;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
@@ -6757,10 +7379,46 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+	/* Pre-compute strides/offsets for possible staging */
+	u32 src_stride[3], src_plane_offset[3];
+	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
+				     cmd.src.stride, src_stride, src_plane_offset);
+
+	/* Force or fallback source staging */
+	if (g2d_force_staging) {
+		size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+							cmd.src.width, cmd.src.height,
+							src_stride, src_plane_offset);
+		/* Unmap before staging */
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+		dma_buf_detach(src_dmabuf, src_attach);
+		src_sgt = NULL;
+		src_attach = NULL;
+		ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+		if (ret)
+			goto err_put_src;
+	} else {
+		ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
 				     "CMD_ROTATE src");
-	if (ret)
-		goto err_unmap_src;
+		if (ret) {
+			if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+				/* Stage source into coherent temp if IOVA not contiguous */
+				size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+					       cmd.src.width, cmd.src.height,
+					       src_stride, src_plane_offset);
+				/* Unmap before staging */
+				dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+				dma_buf_detach(src_dmabuf, src_attach);
+				src_sgt = NULL;
+				src_attach = NULL;
+				ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+				if (ret)
+					goto err_put_src;
+			} else {
+				goto err_unmap_src;
+			}
+		}
+	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -6781,10 +7439,47 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+	/* Determine if writeback staging is needed for destination (output) */
+	{
+		ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
 				     "CMD_ROTATE dst");
-	if (ret)
-		goto err_unmap_dst;
+		if (ret) {
+			if (ret == -EOPNOTSUPP && (g2d_allow_staging_fallback || g2d_force_staging))
+				wb_needed = true;
+			else
+				goto err_unmap_dst;
+		} else if (g2d_force_staging) {
+			wb_needed = true;
+		}
+
+		if (wb_needed) {
+			/* Calculate tight out_pitch and allocate/reuse buffer */
+			u32 bpp = dst_bpp;
+			u32 row_bytes = cmd.dst_w * bpp;
+			size_t wb_size = (size_t)row_bytes * cmd.dst_h;
+
+			wb_out_pitch = row_bytes;
+
+			if (g2d_wb_cache_enable && g2d->wb_small_cache.sgt &&
+				g2d->wb_small_cache.size >= wb_size &&
+				!g2d->wb_small_cache_in_use &&
+				wb_size <= (size_t)g2d_wb_cache_max_kb * 1024) {
+				wb_dma = g2d->wb_small_cache.dma_addr;
+				wb_is_cache = true;
+				/* Counters will be updated after job allocation */
+				wb_buf = g2d->wb_small_cache; /* record size for accounting */
+			} else {
+				int a = g2d_ensure_capacity(g2d->dev, &g2d->temp_wb_buf, wb_size);
+				if (a) {
+					dev_err(g2d->dev, "ROTATE: ensure temp_wb_buf failed: %d (size=%zu)\n", a, wb_size);
+					goto err_unmap_dst;
+				}
+				wb_dma = g2d->temp_wb_buf.dma_addr;
+				wb_is_persistent = true;
+				wb_buf = g2d->temp_wb_buf; /* for copy-back vaddr access */
+			}
+		}
+	}
 
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
@@ -6808,8 +7503,8 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_unmap_dst;
 	}
 
-	/* Create async job */
-	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	/* Create/obtain async job (from pool if available) */
+	job = g2d_job_alloc(g2d);
 	if (!job) {
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
@@ -6830,14 +7525,45 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	/* Setup job parameters */
 	job->type = G2D_JOB_CMD_ROTATE;
 	job->src_dma = src_dma_addr;
-	job->dst_dma = dst_dma_addr;
+		/* If writeback staging is needed, direct HW to temp buffer and mark job */
+	if (wb_needed) {
+		job->dst_dma = wb_dma;
+		job->wb_out_active = true;
+		job->wb_out_is_explicit = false; /* copy back into dst */
+		if (wb_is_cache) {
+			job->wb_out_is_cache = true;
+			job->wb_out_is_persistent = false;
+			job->wb_out_buf = wb_buf;
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(job->wb_out_buf.size, &g2d->stage_wb_active_bytes);
+			g2d->wb_small_cache_in_use = true;
+			atomic64_inc(&g2d->wb_cache_hits);
+		} else if (wb_is_persistent) {
+			job->wb_out_is_cache = false;
+			job->wb_out_is_persistent = true;
+			job->wb_out_buf = wb_buf; /* points to device persistent buffer */
+			job->wb_out_size = (size_t)wb_out_pitch * cmd.dst_h;
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(job->wb_out_size, &g2d->stage_wb_active_bytes);
+			atomic64_inc(&g2d->wb_cache_misses);
+		} else {
+			job->wb_out_is_cache = false;
+			job->wb_out_is_persistent = false;
+			job->wb_out_buf = wb_buf; /* ephemeral allocation */
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(job->wb_out_buf.size, &g2d->stage_wb_active_bytes);
+			atomic64_inc(&g2d->wb_cache_misses);
+		}
+			/* Provide cleanup with staging buffer characteristics */
+			job->data.blit.out_pitch = wb_out_pitch;
+			job->data.blit.out_format = cmd.dst.format;
+			/* Do NOT modify dst_x/dst_y/dst_pitch; they describe target placement */
+	} else {
+		job->dst_dma = dst_dma_addr;
+	}
 
-	/* Calculate proper strides for YUV formats */
-	u32 src_stride[3], src_plane_offset[3];
+	/* Calculate proper strides for YUV formats (dst only here; src already computed) */
 	u32 dst_stride[3], dst_plane_offset[3];
-	
-	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
-				     cmd.src.stride, src_stride, src_plane_offset);
 	sunxi_g2d_get_yuv_plane_info(cmd.dst.format, cmd.dst.width, cmd.dst.height,
 				     cmd.dst.stride, dst_stride, dst_plane_offset);
 
@@ -6971,10 +7697,30 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
+	/* Pre-compute strides/offsets for potential staging */
+	u32 src_stride[3], src_plane_offset[3];
+	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
+				     cmd.src.stride, src_stride, src_plane_offset);
+
 	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
-				     "CMD_MASK src");
-	if (ret)
-		goto err_unmap_src;
+			     "CMD_MASK src");
+	if (ret) {
+		if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+			size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+							       cmd.src.width, cmd.src.height,
+							       src_stride, src_plane_offset);
+			/* Unmap/detach before staging */
+			dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+			dma_buf_detach(src_dmabuf, src_attach);
+			src_sgt = NULL;
+			src_attach = NULL;
+			ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+			if (ret)
+				goto err_put_src;
+		} else {
+			goto err_unmap_src;
+		}
+	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -7052,8 +7798,8 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_unmap_out;
 	}
 
-	/* Create async job */
-	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	/* Create/obtain async job (from pool if available) */
+	job = g2d_job_alloc(g2d);
 	if (!job) {
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
@@ -7083,13 +7829,9 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	job->dst_dma = dst_dma_addr;
 	job->out_dma = out_dma_addr;
 
-	/* Calculate proper strides for YUV formats */
-	u32 src_stride[3], src_plane_offset[3];
+	/* Calculate proper strides for YUV formats (dst/out only; src precomputed) */
 	u32 dst_stride[3], dst_plane_offset[3];
 	u32 out_stride[3], out_plane_offset[3];
-	
-	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
-				     cmd.src.stride, src_stride, src_plane_offset);
 	sunxi_g2d_get_yuv_plane_info(cmd.dst.format, cmd.dst.width, cmd.dst.height,
 				     cmd.dst.stride, dst_stride, dst_plane_offset);
 	if (has_out_buffer) {
@@ -7214,6 +7956,13 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	struct sync_file *sync_file;
 	int fence_fd;
 	struct sunxi_g2d_job *job;
+	/* Writeback staging locals for dst */
+	bool wb_needed = false;
+	bool wb_is_cache = false;
+	bool wb_is_persistent = false;
+	struct g2d_dma_mem wb_buf = {0};
+	dma_addr_t wb_dma = 0;
+	u32 wb_out_pitch = 0;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
@@ -7255,10 +8004,45 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
-				     "CMD_COPY src");
-	if (ret)
-		goto err_unmap_src;
+	/* Pre-compute strides/offsets for possible staging */
+	u32 src_stride[3], src_plane_offset[3];
+	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
+				     cmd.src.stride, src_stride, src_plane_offset);
+
+	/* Force or fallback source staging */
+	if (g2d_force_staging) {
+		size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+							cmd.src.width, cmd.src.height,
+							src_stride, src_plane_offset);
+		/* Unmap/detach before staging */
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+		dma_buf_detach(src_dmabuf, src_attach);
+		src_sgt = NULL;
+		src_attach = NULL;
+		ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+		if (ret)
+			goto err_put_src;
+	} else {
+		ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
+			     "CMD_COPY src");
+		if (ret) {
+			if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+				size_t copy_size = g2d_calc_total_linear_size(cmd.src.format,
+				       cmd.src.width, cmd.src.height,
+				       src_stride, src_plane_offset);
+				/* Unmap/detach before staging */
+				dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+				dma_buf_detach(src_dmabuf, src_attach);
+				src_sgt = NULL;
+				src_attach = NULL;
+				ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+				if (ret)
+					goto err_put_src;
+			} else {
+				goto err_unmap_src;
+			}
+		}
+	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
@@ -7279,10 +8063,45 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_dst;
 	}
 
-	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
+	/* Determine if writeback staging is needed for destination (output) */
+	{
+		ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
 				     "CMD_COPY dst");
-	if (ret)
-		goto err_unmap_dst;
+		if (ret) {
+			if (ret == -EOPNOTSUPP && (g2d_allow_staging_fallback || g2d_force_staging))
+				wb_needed = true;
+			else
+				goto err_unmap_dst;
+		} else if (g2d_force_staging) {
+			wb_needed = true;
+		}
+
+		if (wb_needed) {
+			u32 bpp = dst_bpp;
+			u32 row_bytes = cmd.dst_w * bpp;
+			size_t wb_size = (size_t)row_bytes * cmd.dst_h;
+
+			wb_out_pitch = row_bytes;
+
+			if (g2d_wb_cache_enable && g2d->wb_small_cache.sgt &&
+			    g2d->wb_small_cache.size >= wb_size &&
+			    !g2d->wb_small_cache_in_use &&
+			    wb_size <= (size_t)g2d_wb_cache_max_kb * 1024) {
+				wb_dma = g2d->wb_small_cache.dma_addr;
+				wb_is_cache = true;
+				wb_buf = g2d->wb_small_cache;
+			} else {
+				int a = g2d_ensure_capacity(g2d->dev, &g2d->temp_wb_buf, wb_size);
+				if (a) {
+					dev_err(g2d->dev, "COPY: ensure temp_wb_buf failed: %d (size=%zu)\n", a, wb_size);
+					goto err_unmap_dst;
+				}
+				wb_dma = g2d->temp_wb_buf.dma_addr;
+				wb_is_persistent = true;
+				wb_buf = g2d->temp_wb_buf; /* for copy-back vaddr access */
+			}
+		}
+	}
 
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
@@ -7306,8 +8125,8 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_unmap_dst;
 	}
 
-	/* Create async job */
-	job = kzalloc(sizeof(*job), GFP_KERNEL);
+	/* Create/obtain async job (from pool if available) */
+	job = g2d_job_alloc(g2d);
 	if (!job) {
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
@@ -7328,14 +8147,43 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	/* Setup job parameters */
 	job->type = G2D_JOB_CMD_COPY;
 	job->src_dma = src_dma_addr;
-	job->dst_dma = dst_dma_addr;
+	if (wb_needed) {
+		job->dst_dma = wb_dma;
+		job->wb_out_active = true;
+		job->wb_out_is_explicit = false; /* copy back into dst */
+		if (wb_is_cache) {
+			job->wb_out_is_cache = true;
+			job->wb_out_is_persistent = false;
+			job->wb_out_buf = wb_buf;
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(job->wb_out_buf.size, &g2d->stage_wb_active_bytes);
+			g2d->wb_small_cache_in_use = true;
+			atomic64_inc(&g2d->wb_cache_hits);
+		} else if (wb_is_persistent) {
+			job->wb_out_is_cache = false;
+			job->wb_out_is_persistent = true;
+			job->wb_out_buf = wb_buf; /* persistent device buffer */
+			job->wb_out_size = (size_t)wb_out_pitch * cmd.dst_h;
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(job->wb_out_size, &g2d->stage_wb_active_bytes);
+			atomic64_inc(&g2d->wb_cache_misses);
+		} else {
+			job->wb_out_is_cache = false;
+			job->wb_out_is_persistent = false;
+			job->wb_out_buf = wb_buf;
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(job->wb_out_buf.size, &g2d->stage_wb_active_bytes);
+			atomic64_inc(&g2d->wb_cache_misses);
+		}
+		job->data.blit.out_pitch = wb_out_pitch;
+		job->data.blit.out_format = cmd.dst.format;
+		/* Keep dst_x/dst_y/dst_pitch for target placement; WB uses out_pitch */
+	} else {
+		job->dst_dma = dst_dma_addr;
+	}
 
-	/* Calculate proper strides for YUV formats */
-	u32 src_stride[3], src_plane_offset[3];
+	/* Calculate proper strides for YUV formats (dst only; src already computed) */
 	u32 dst_stride[3], dst_plane_offset[3];
-	
-	sunxi_g2d_get_yuv_plane_info(cmd.src.format, cmd.src.width, cmd.src.height,
-				     cmd.src.stride, src_stride, src_plane_offset);
 	sunxi_g2d_get_yuv_plane_info(cmd.dst.format, cmd.dst.width, cmd.dst.height,
 				     cmd.dst.stride, dst_stride, dst_plane_offset);
 
@@ -7453,6 +8301,11 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	int fence_fd = -1;
 	unsigned long flags;
 	int ret;
+	bool out_wb_needed = false; /* writeback staging needed for explicit out */
+	struct g2d_dma_mem wb_alloc = {};
+	bool dst_wb_candidate = false; /* dst non-linear candidate for in-place writeback */
+	bool dst_wb_needed = false;    /* decided in-place writeback */
+	struct g2d_dma_mem wb_alloc_dst = {};
 
 	if (copy_from_user(&blit, (void __user *)arg, sizeof(blit)))
 		return -EFAULT;
@@ -7510,10 +8363,32 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		goto err_detach_src;
 	}
 
+	/* Pre-compute strides/offsets for potential staging */
+	u32 src_stride[3], src_plane_offset[3];
+	sunxi_g2d_get_yuv_plane_info(blit.src.format, blit.src.width, blit.src.height,
+			     blit.src.stride, src_stride, src_plane_offset);
+
 	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
-				     "BLIT src");
-	if (ret)
-		goto err_unmap_src;
+		     "BLIT src");
+	if (ret) {
+		if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+			/* Stage source into coherent temp; reuse temp_scale_buf */
+			size_t copy_size = g2d_calc_total_linear_size(blit.src.format,
+				       blit.src.width, blit.src.height,
+				       src_stride, src_plane_offset);
+			dev_dbg(g2d->dev, "BLIT: staging fallback for non-contiguous src (size=%zu)\n", copy_size);
+			/* Unmap/detach before staging */
+			dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+			dma_buf_detach(src_dmabuf, src_attach);
+			src_sgt = NULL;
+			src_attach = NULL;
+			ret = g2d_stage_src_dmabuf(g2d, src_dmabuf, copy_size, &src_dma_addr);
+			if (ret)
+				goto err_put_src_dmabuf;
+		} else {
+			goto err_unmap_src;
+		}
+	}
 
 	/* If userspace provided an input fence fd, wait on it first */
 	if (blit.fence_fd_in >= 0) {
@@ -7560,9 +8435,16 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	}
 
 	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
-				     "BLIT dst");
-	if (ret)
-		goto err_unmap_dst;
+			     "BLIT dst");
+	if (ret) {
+		if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+			/* We'll consider in-place writeback staging later (only if no blending) */
+			dst_wb_candidate = true;
+			dev_dbg(g2d->dev, "BLIT: dst non-contiguous; candidate for in-place writeback staging\n");
+		} else {
+			goto err_unmap_dst;
+		}
+	}
 
 	/* Calculate bytes per pixel for source using format conversion helper */
 	if (sunxi_g2d_format_to_hw(blit.src.format, &src_bpp) < 0) {
@@ -7585,13 +8467,9 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	 * with different strides and memory offsets. Standard single-plane calculation
 	 * causes incorrect memory access (blue tint, repeated frames).
 	 */
-	u32 src_stride[3], src_plane_offset[3];
 	u32 dst_stride[3], dst_plane_offset[3];
-	
-	sunxi_g2d_get_yuv_plane_info(blit.src.format, blit.src.width, blit.src.height,
-				     blit.src.stride, src_stride, src_plane_offset);
 	sunxi_g2d_get_yuv_plane_info(blit.dst.format, blit.dst.width, blit.dst.height,
-				     blit.dst.stride, dst_stride, dst_plane_offset);
+			     blit.dst.stride, dst_stride, dst_plane_offset);
 	
 	/* Use plane 0 stride for compatibility with existing code */
 	src_pitch = src_stride[0];
@@ -7651,9 +8529,16 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		}
 
 		ret = g2d_sg_dma_address(g2d->dev, out_sgt, &out_dma_addr,
-				     "BLIT out");
-		if (ret)
-			goto err_unmap_out;
+			     "BLIT out");
+		if (ret) {
+			if (ret == -EOPNOTSUPP && g2d_allow_staging_fallback) {
+				/* Use writeback staging for non-contiguous OUT */
+				dev_dbg(g2d->dev, "BLIT: enabling writeback staging for non-contiguous out\n");
+				out_wb_needed = true;
+			} else {
+				goto err_unmap_out;
+			}
+		}
 
 		dev_dbg(g2d->dev,
 			"3-buffer operation: out buffer imported (fd=%d addr=0x%llx)\n",
@@ -7667,7 +8552,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	bool has_out_buffer = (blit.out.dma_fd >= 0);
 	if (has_out_buffer) {
 		out_pitch = blit.out.stride[0] ? blit.out.stride[0] :
-						 (blit.out.width * dst_bpp);
+					 (blit.out.width * dst_bpp);
 	} else {
 		out_pitch = dst_pitch;
 	}
@@ -7697,7 +8582,7 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	 * - GLOBAL_ALPHA or MIXER_ALPHA modes need blending
 	 */
 	bool src_has_alpha_format = (blit.src.format == G2D_FMT_ARGB8888 ||
-				     blit.src.format == G2D_FMT_ABGR8888);
+			     blit.src.format == G2D_FMT_ABGR8888);
 	bool needs_alpha =
 		has_out_buffer || /* 3-buffer = blending */
 		(src_has_alpha_format &&
@@ -7716,11 +8601,125 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 
 	bool needs_scaling = (blit.dst_w != src_crop_w) ||
 			     (blit.dst_h != src_crop_h);
+	/* If we couldn't map DST and there is no explicit OUT (in-place),
+	 * only allow writeback staging when we don't need to read DST background (no blending).
+	 */
+	if (dst_wb_candidate && !has_out_buffer) {
+		if (needs_alpha) {
+			dev_err(g2d->dev, "BLIT: in-place blending requires readable DST; non-contiguous dst unsupported without CPU staging\n");
+			ret = -EOPNOTSUPP;
+			goto err_unmap_out;
+		}
+		/* OK to stage write-only in-place operations */
+		dst_wb_needed = true;
+		dev_dbg(g2d->dev, "BLIT: enabling writeback staging for non-contiguous in-place DST\n");
+	}
+
+	/* Force writeback staging (diagnostics): if enabled, route HW output to
+	 * temporary buffer and CPU copy back regardless of contiguity.
+	 */
+	if (g2d_force_staging) {
+		if (has_out_buffer)
+			out_wb_needed = true;
+		else
+			dst_wb_needed = true;
+	}
+
 
 	dev_dbg(g2d->dev,
 		"BLIT auto-detect: has_out=%d src_alpha_fmt=%d needs_alpha=%d needs_rotation=%d needs_scaling=%d\n",
 		has_out_buffer, src_has_alpha_format, needs_alpha,
 		needs_rotation, needs_scaling);
+
+	/* Calculate output buffer dimensions (out_pitch already calculated above) */
+	u32 out_w, out_h, out_format;
+	if (has_out_buffer) {
+		/* Explicit output buffer - use its dimensions */
+		out_w = blit.out.width;
+		out_h = blit.out.height;
+		out_format = blit.out.format;
+	} else {
+		/* In-place operation - output uses dst dimensions */
+		out_w = blit.dst.width;
+		out_h = blit.dst.height;
+		out_format = blit.dst.format;
+	}
+
+	/* If writeback staging is needed for OUT, allocate the temporary buffer now
+	 * and make HW write into it by replacing out_dma_addr.
+	 */
+	if (out_wb_needed) {
+		size_t wb_size = (size_t)out_pitch * out_h;
+		atomic64_add(wb_size, &g2d->stage_wb_req_bytes);
+		/* Try cache reuse if enabled */
+		if (g2d_wb_cache_enable && wb_size <= (size_t)g2d_wb_cache_max_kb * 1024 &&
+		    g2d->wb_small_cache.sgt && g2d->wb_small_cache.size >= wb_size &&
+		    !g2d->wb_small_cache_in_use) {
+			/* Reuse cache */
+			out_dma_addr = g2d->wb_small_cache.dma_addr;
+			atomic64_inc(&g2d->wb_cache_hits);
+			atomic64_inc(&g2d->stage_wb_out_count);
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(g2d->wb_small_cache.size, &g2d->stage_wb_active_bytes);
+			g2d->wb_small_cache_in_use = true;
+			wb_alloc = g2d->wb_small_cache; /* For job bookkeeping copy */
+			wb_alloc.size = g2d->wb_small_cache.size;
+			/* Mark this later in job struct as cache */
+		} else {
+			/* Allocate fresh (and maybe seed cache) */
+			ret = g2d_dma_mem_alloc(g2d->dev, wb_size, &wb_alloc, GFP_KERNEL);
+			if (ret) {
+				atomic64_inc(&g2d->wb_cache_misses);
+				dev_err(g2d->dev, "Failed to allocate writeback buffer: size=%zu\n", wb_size);
+				goto err_unmap_out;
+			}
+			out_dma_addr = wb_alloc.dma_addr;
+			atomic64_inc(&g2d->stage_wb_out_count);
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(wb_size, &g2d->stage_wb_active_bytes);
+			/* Seed cache if empty and conditions met */
+			if (g2d_wb_cache_enable && !g2d->wb_small_cache.sgt &&
+			    wb_size <= (size_t)g2d_wb_cache_max_kb * 1024) {
+				g2d->wb_small_cache = wb_alloc; /* Keep one copy for reuse */
+				g2d->wb_small_cache_in_use = true; /* This job consuming cache */
+			}
+		}
+	}
+
+	/* If writeback staging is needed for in-place DST, allocate buffer and
+	 * redirect HW output to it via out_dma_addr.
+	 */
+	if (dst_wb_needed) {
+		size_t wb_size = (size_t)out_pitch * out_h;
+		atomic64_add(wb_size, &g2d->stage_wb_req_bytes);
+		if (g2d_wb_cache_enable && wb_size <= (size_t)g2d_wb_cache_max_kb * 1024 &&
+		    g2d->wb_small_cache.sgt && g2d->wb_small_cache.size >= wb_size &&
+		    !g2d->wb_small_cache_in_use) {
+			out_dma_addr = g2d->wb_small_cache.dma_addr;
+			atomic64_inc(&g2d->wb_cache_hits);
+			atomic64_inc(&g2d->stage_wb_inplace_count);
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(g2d->wb_small_cache.size, &g2d->stage_wb_active_bytes);
+			g2d->wb_small_cache_in_use = true;
+			wb_alloc_dst = g2d->wb_small_cache;
+		} else {
+			ret = g2d_dma_mem_alloc(g2d->dev, wb_size, &wb_alloc_dst, GFP_KERNEL);
+			if (ret) {
+				atomic64_inc(&g2d->wb_cache_misses);
+				dev_err(g2d->dev, "Failed to allocate writeback buffer (dst): size=%zu\n", wb_size);
+				goto err_unmap_out;
+			}
+			out_dma_addr = wb_alloc_dst.dma_addr;
+			atomic64_inc(&g2d->stage_wb_inplace_count);
+			atomic64_inc(&g2d->stage_wb_active_jobs);
+			atomic64_add(wb_size, &g2d->stage_wb_active_bytes);
+			if (g2d_wb_cache_enable && !g2d->wb_small_cache.sgt &&
+			    wb_size <= (size_t)g2d_wb_cache_max_kb * 1024) {
+				g2d->wb_small_cache = wb_alloc_dst;
+				g2d->wb_small_cache_in_use = true;
+			}
+		}
+	}
 
 	/* Check for incompatible single-pass combinations */
 	if (needs_rotation && needs_scaling) {
@@ -7747,52 +8746,46 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			u32 temp_bpp = src_has_alpha_format ? src_bpp : dst_bpp;
 
 			u32 temp_pitch = ALIGN(temp_w * temp_bpp, 32);
-			size_t temp_size = temp_pitch * temp_h;
 
 			/* Calculate rotated/intermediate size (after rotation) */
 			bool rot_90 =
 				!!(blit.flags & (G2D_BLIT_FLAG_ROTATE_90 |
-						 G2D_BLIT_FLAG_ROTATE_270));
+						G2D_BLIT_FLAG_ROTATE_270));
 			u32 temp2_w = rot_90 ? temp_h : temp_w;
 			u32 temp2_h = rot_90 ? temp_w : temp_h;
 			u32 temp2_pitch = ALIGN(temp2_w * temp_bpp, 32);
-			size_t temp2_size = temp2_pitch * temp2_h;
+			/* temp buffer sizes are implied by pitch*height; no local size vars needed */
 
-		/* Allocate temporary buffers using IOMMU-backed pages */
-		struct g2d_dma_mem temp_alloc = {};
-		struct g2d_dma_mem temp2_alloc = {};
 
-		ret = g2d_dma_mem_alloc(g2d->dev, temp_size, &temp_alloc,
-					   GFP_KERNEL);
+		/* Ensure persistent temp buffers exist and are large enough */
+		ret = g2d_ensure_temp_buffer(g2d, &g2d->temp_scale_buf,
+					 temp_w, temp_h, temp_bpp, 32, &temp_pitch);
 		if (ret) {
 			dev_err(g2d->dev,
-				"Failed to allocate temp buffer 1 for 3-pass: size=%zu\n",
-				temp_size);
+				"Failed to ensure temp buffer 1 for 3-pass: %ux%u\n",
+				temp_w, temp_h);
 			goto err_unmap_out;
 		}
 
-		ret = g2d_dma_mem_alloc(g2d->dev, temp2_size, &temp2_alloc,
-					   GFP_KERNEL);
+		ret = g2d_ensure_temp_buffer(g2d, &g2d->temp_rot_buf,
+					 temp2_w, temp2_h, temp_bpp, 32, &temp2_pitch);
 		if (ret) {
 			dev_err(g2d->dev,
-				"Failed to allocate temp buffer 2 for 3-pass: size=%zu\n",
-				temp2_size);
-			g2d_dma_mem_free(g2d->dev, &temp_alloc);
+				"Failed to ensure temp buffer 2 for 3-pass: %ux%u\n",
+				temp2_w, temp2_h);
 			goto err_unmap_out;
 		}
 
 		dev_dbg(g2d->dev,
-			"Allocated temp buffers for 3-pass: t1 vaddr=%p dma=0x%llx size=%zu t2 vaddr=%p dma=0x%llx size=%zu\n",
-			temp_alloc.vaddr, (u64)temp_alloc.dma_addr, temp_size,
-			temp2_alloc.vaddr, (u64)temp2_alloc.dma_addr, temp2_size);
+			"Ensured persistent temp buffers for 3-pass: t1 vaddr=%p dma=0x%llx pitch=%u, t2 vaddr=%p dma=0x%llx pitch=%u\n",
+			g2d->temp_scale_buf.vaddr, (u64)g2d->temp_scale_buf.dma_addr, temp_pitch,
+			g2d->temp_rot_buf.vaddr, (u64)g2d->temp_rot_buf.dma_addr, temp2_pitch);
 
 			/* Create job for 3-pass async execution */
 			job = kzalloc(sizeof(*job), GFP_KERNEL);
 		if (!job) {
 			dev_err(g2d->dev,
 				"Failed to allocate job for 3-pass blit\n");
-			g2d_dma_mem_free(g2d->dev, &temp_alloc);
-			g2d_dma_mem_free(g2d->dev, &temp2_alloc);
 			ret = -ENOMEM;
 			goto err_unmap_out;
 		}
@@ -7830,16 +8823,16 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			job->data.blit.dst_color_space = blit.dst.color_space;
 
 			job->data.blit.out_width = has_out_buffer ?
-							   blit.out.width :
-							   blit.dst.width;
+						   blit.out.width :
+						   blit.dst.width;
 			job->data.blit.out_height = has_out_buffer ?
-							    blit.out.height :
-							    blit.dst.height;
+						    blit.out.height :
+						    blit.dst.height;
 			job->data.blit.out_pitch = has_out_buffer ? out_pitch :
-								    dst_pitch;
+							    dst_pitch;
 			job->data.blit.out_format = has_out_buffer ?
-							    blit.out.format :
-							    blit.dst.format;
+						    blit.out.format :
+						    blit.dst.format;
 
 			job->data.blit.flags = blit.flags;
 			job->data.blit.bld_mode = blit.bld_mode;
@@ -7867,21 +8860,27 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			job->out_attach = out_attach;
 			job->out_sgt = out_sgt;
 
-		/* Store temp buffer info for 3-pass execution */
-		job->temp_buf = temp_alloc;
-		job->temp_width = temp_w;
-		job->temp_height = temp_h;
-		job->temp_pitch = temp_pitch;
-		/* Preserve alpha in temp format when source contains alpha */
-		job->temp_format = src_has_alpha_format ?
-				   blit.src.format :
-				   blit.dst.format;
+			/* Store temp buffer info for 3-pass execution (references only) */
+			job->temp_buf.vaddr = g2d->temp_scale_buf.vaddr;
+			job->temp_buf.dma_addr = g2d->temp_scale_buf.dma_addr;
+			job->temp_buf.size = g2d->temp_scale_buf.size;
+			job->temp_buf.sgt = NULL;
+			job->temp_width = temp_w;
+			job->temp_height = temp_h;
+			job->temp_pitch = temp_pitch;
+			/* Preserve alpha in temp format when source contains alpha */
+			job->temp_format = src_has_alpha_format ?
+					   blit.src.format :
+					   blit.dst.format;
 
-		job->temp2_buf = temp2_alloc;
-		job->temp2_width = temp2_w;
-		job->temp2_height = temp2_h;
-		job->temp2_pitch = temp2_pitch;
-			job->temp2_format = src_has_alpha_format ?
+			job->temp2_buf.vaddr = g2d->temp_rot_buf.vaddr;
+			job->temp2_buf.dma_addr = g2d->temp_rot_buf.dma_addr;
+			job->temp2_buf.size = g2d->temp_rot_buf.size;
+			job->temp2_buf.sgt = NULL;
+			job->temp2_width = temp2_w;
+			job->temp2_height = temp2_h;
+			job->temp2_pitch = temp2_pitch;
+				job->temp2_format = src_has_alpha_format ?
 						    blit.src.format :
 						    blit.dst.format;
 
@@ -7890,8 +8889,6 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			if (!fence) {
 				dev_err(g2d->dev,
 					"Failed to create fence for 3-pass blit\n");
-				g2d_dma_mem_free(g2d->dev, &job->temp_buf);
-				g2d_dma_mem_free(g2d->dev, &job->temp2_buf);
 				kfree(job);
 				ret = -ENOMEM;
 				goto err_no_cleanup; /* Don't cleanup DMA-BUFs, we haven't transferred ownership yet */
@@ -7904,8 +8901,6 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 				dev_err(g2d->dev,
 					"Failed to create sync_file for 3-pass blit\n");
 				dma_fence_put(fence);
-				g2d_dma_mem_free(g2d->dev, &job->temp_buf);
-				g2d_dma_mem_free(g2d->dev, &job->temp2_buf);
 				kfree(job);
 				ret = -ENOMEM;
 				goto err_no_cleanup;
@@ -7918,8 +8913,6 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 				fput(sync_file->file);
 				kfree(sync_file);
 				dma_fence_put(fence);
-				g2d_dma_mem_free(g2d->dev, &job->temp_buf);
-				g2d_dma_mem_free(g2d->dev, &job->temp2_buf);
 				kfree(job);
 				ret = fence_fd;
 				goto err_no_cleanup;
@@ -7961,6 +8954,12 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			dev_dbg(g2d->dev,
 				"3-pass BLIT async: returned fence_fd=%d to userspace\n",
 				fence_fd);
+
+			/* Record writeback staging state (3-pass) */
+			job->wb_out_active = out_wb_needed || dst_wb_needed;
+			job->wb_out_is_explicit = has_out_buffer;
+			if (job->wb_out_active)
+				job->wb_out_buf = out_wb_needed ? wb_alloc : wb_alloc_dst;
 
 			/* Success - DMA-BUFs and temp buffers now owned by job, return immediately */
 			return 0;
@@ -8043,13 +9042,13 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.dst_color_space = blit.dst.color_space;
 
 		job->data.blit.out_width = has_out_buffer ? blit.out.width :
-							    blit.dst.width;
+					    blit.dst.width;
 		job->data.blit.out_height = has_out_buffer ? blit.out.height :
-							     blit.dst.height;
+					     blit.dst.height;
 		job->data.blit.out_pitch = has_out_buffer ? out_pitch :
-							    dst_pitch;
+						    dst_pitch;
 		job->data.blit.out_format = has_out_buffer ? blit.out.format :
-							     blit.dst.format;
+						     blit.dst.format;
 
 		job->data.blit.flags = blit.flags;
 		job->data.blit.bld_mode = blit.bld_mode;
@@ -8157,6 +9156,18 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 			"2-pass BLIT async: returned fence_fd=%d to userspace\n",
 			fence_fd);
 
+		/* Record writeback staging state (2-pass) */
+		job->wb_out_active = out_wb_needed || dst_wb_needed;
+		job->wb_out_is_explicit = has_out_buffer;
+			job->wb_out_is_cache = false;
+			if (job->wb_out_active) {
+				if ((out_wb_needed && g2d_wb_cache_enable && g2d->wb_small_cache_in_use && wb_alloc.sgt == g2d->wb_small_cache.sgt) ||
+				    (dst_wb_needed && g2d_wb_cache_enable && g2d->wb_small_cache_in_use && wb_alloc_dst.sgt == g2d->wb_small_cache.sgt)) {
+					job->wb_out_is_cache = true;
+				}
+				job->wb_out_buf = out_wb_needed ? wb_alloc : wb_alloc_dst;
+			}
+
 		/* Success - DMA-BUFs and temp buffer now owned by job, return immediately */
 		return 0;
 	}
@@ -8177,10 +9188,10 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		snprintf(op_desc, sizeof(op_desc), "%s%s%s",
 			 needs_scaling ? "SCALE" : "",
 			 needs_alpha ? (needs_scaling ? "+BLEND" : "BLEND") :
-				       "",
+			       "",
 			 needs_rotation ?
 				 (needs_scaling || needs_alpha ? "+ROT" :
-								 "ROT") :
+						 "ROT") :
 				 "");
 		dev_dbg(g2d->dev, "BLIT operation: %s %ux%u -> %ux%u\n",
 			op_desc, src_crop_w, src_crop_h, blit.dst_w,
@@ -8188,20 +9199,6 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 	} else {
 		dev_dbg(g2d->dev, "BLIT: simple copy %ux%u\n", src_crop_w,
 			src_crop_h);
-	}
-
-	/* Calculate output buffer dimensions (out_pitch already calculated above) */
-	u32 out_w, out_h, out_format;
-	if (has_out_buffer) {
-		/* Explicit output buffer - use its dimensions */
-		out_w = blit.out.width;
-		out_h = blit.out.height;
-		out_format = blit.out.format;
-	} else {
-		/* In-place operation - output uses dst dimensions */
-		out_w = blit.dst.width;
-		out_h = blit.dst.height;
-		out_format = blit.dst.format;
 	}
 
 	/* Create async job */
@@ -8312,6 +9309,18 @@ static long sunxi_g2d_ioctl_blit(struct sunxi_g2d_dev *g2d, unsigned long arg)
 		job->data.blit.needs_rotation = needs_rotation;
 		job->data.blit.needs_scaling = needs_scaling;
 
+		/* Record writeback staging state (single-pass) */
+		job->wb_out_active = out_wb_needed || dst_wb_needed;
+		job->wb_out_is_explicit = has_out_buffer;
+		job->wb_out_is_cache = false;
+		if (job->wb_out_active) {
+			if ((out_wb_needed && g2d_wb_cache_enable && g2d->wb_small_cache_in_use && wb_alloc.sgt == g2d->wb_small_cache.sgt) ||
+			    (dst_wb_needed && g2d_wb_cache_enable && g2d->wb_small_cache_in_use && wb_alloc_dst.sgt == g2d->wb_small_cache.sgt)) {
+				job->wb_out_is_cache = true;
+			}
+			job->wb_out_buf = out_wb_needed ? wb_alloc : wb_alloc_dst;
+		}
+
 		/* Enqueue job */
 		spin_lock_irqsave(&g2d->job_lock, flags);
 		list_add_tail(&job->node, &g2d->job_queue);
@@ -8350,6 +9359,17 @@ err_unmap_out:
 	/* Only cleanup if buffers weren't transferred to async job.
 	 * If src/dst/out_dmabuf are NULL, ownership was transferred to job.
 	 */
+	if (wb_alloc.sgt) {
+		/* Roll back live accounting for writeback buffer */
+		atomic64_sub(wb_alloc.size, &g2d->stage_wb_active_bytes);
+		atomic64_dec(&g2d->stage_wb_active_jobs);
+		g2d_dma_mem_free(g2d->dev, &wb_alloc);
+	}
+	if (wb_alloc_dst.sgt) {
+		atomic64_sub(wb_alloc_dst.size, &g2d->stage_wb_active_bytes);
+		atomic64_dec(&g2d->stage_wb_active_jobs);
+		g2d_dma_mem_free(g2d->dev, &wb_alloc_dst);
+	}
 	if (out_sgt && out_attach)
 		dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
 err_detach_out:
@@ -8651,8 +9671,17 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 	}
 
 	buf->dev = g2d->dev;
-	ret = g2d_dma_mem_alloc(buf->dev, alloc.size, &buf->mem,
-				     GFP_KERNEL);
+	/* Honor per-allocation flags to select backend */
+	if (alloc.flags & (G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT)) {
+		int mode = (alloc.flags & G2D_ALLOC_F_COHERENT) ? 2 : 0;
+		if (mode == 0 && (alloc.flags & G2D_ALLOC_F_CONTIGUOUS))
+			mode = 2; /* contiguous requirement maps to coherent backend here */
+		ret = __g2d_dma_mem_alloc_mode(buf->dev, alloc.size, &buf->mem,
+						   GFP_KERNEL, mode);
+	} else {
+		ret = g2d_dma_mem_alloc(buf->dev, alloc.size, &buf->mem,
+					 GFP_KERNEL);
+	}
 	if (ret) {
 		dev_err(g2d->dev, "ALLOC_BUFFER: dma_alloc_noncontiguous FAILED\n");
 		kfree(buf);
@@ -9053,6 +10082,147 @@ static const struct file_operations sunxi_g2d_fops = {
 	.compat_ioctl = sunxi_g2d_ioctl,
 };
 
+/* ===== sysfs: staging telemetry (per platform device) ===== */
+static ssize_t staging_src_show(struct device *dev,
+							   struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+					  (unsigned long long)atomic64_read(&g2d->stage_src_count));
+}
+
+static ssize_t staging_wb_out_show(struct device *dev,
+								   struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+					  (unsigned long long)atomic64_read(&g2d->stage_wb_out_count));
+}
+
+static ssize_t staging_wb_inplace_show(struct device *dev,
+									   struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+					  (unsigned long long)atomic64_read(&g2d->stage_wb_inplace_count));
+}
+
+static ssize_t staging_wb_bytes_show(struct device *dev,
+									 struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+					  (unsigned long long)atomic64_read(&g2d->stage_wb_bytes_copied));
+}
+
+static ssize_t staging_wb_active_jobs_show(struct device *dev,
+						 struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+					  (unsigned long long)atomic64_read(&g2d->stage_wb_active_jobs));
+}
+
+static ssize_t staging_wb_active_bytes_show(struct device *dev,
+						 struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+					  (unsigned long long)atomic64_read(&g2d->stage_wb_active_bytes));
+}
+
+static DEVICE_ATTR_RO(staging_src);
+static DEVICE_ATTR_RO(staging_wb_out);
+static DEVICE_ATTR_RO(staging_wb_inplace);
+static DEVICE_ATTR_RO(staging_wb_bytes);
+static DEVICE_ATTR_RO(staging_wb_active_jobs);
+static DEVICE_ATTR_RO(staging_wb_active_bytes);
+/* New sysfs attributes for extended telemetry */
+static ssize_t vmap_attempts_show(struct device *dev,
+					  struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+			  (unsigned long long)atomic64_read(&g2d->vmap_attempts));
+}
+static ssize_t vmap_failures_show(struct device *dev,
+					  struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+			  (unsigned long long)atomic64_read(&g2d->vmap_failures));
+}
+static ssize_t wb_cache_hits_show(struct device *dev,
+					  struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+			  (unsigned long long)atomic64_read(&g2d->wb_cache_hits));
+}
+static ssize_t wb_cache_misses_show(struct device *dev,
+					    struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+			  (unsigned long long)atomic64_read(&g2d->wb_cache_misses));
+}
+static ssize_t staging_wb_req_bytes_show(struct device *dev,
+					    struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+			  (unsigned long long)atomic64_read(&g2d->stage_wb_req_bytes));
+}
+static DEVICE_ATTR_RO(vmap_attempts);
+static DEVICE_ATTR_RO(vmap_failures);
+static DEVICE_ATTR_RO(wb_cache_hits);
+static DEVICE_ATTR_RO(wb_cache_misses);
+static DEVICE_ATTR_RO(staging_wb_req_bytes);
+
+/* Job-pool telemetry (read-only): hits/misses and pool sizing */
+static ssize_t job_pool_hits_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+			  (unsigned long long)atomic64_read(&g2d->job_pool_hits));
+}
+
+static ssize_t job_pool_misses_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%llu\n",
+			  (unsigned long long)atomic64_read(&g2d->job_pool_misses));
+}
+
+static ssize_t job_pool_free_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%d\n", g2d->job_pool_free_count);
+}
+
+static ssize_t job_pool_min_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%d\n", g2d->job_pool_min);
+}
+
+static ssize_t job_pool_max_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct sunxi_g2d_dev *g2d = dev_get_drvdata(dev);
+	return sysfs_emit(buf, "%d\n", g2d->job_pool_max);
+}
+
+static DEVICE_ATTR_RO(job_pool_hits);
+static DEVICE_ATTR_RO(job_pool_misses);
+static DEVICE_ATTR_RO(job_pool_free);
+static DEVICE_ATTR_RO(job_pool_min);
+static DEVICE_ATTR_RO(job_pool_max);
+
 /* ========== Platform driver ========== */
 
 static int sunxi_g2d_probe(struct platform_device *pdev)
@@ -9184,12 +10354,46 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	mutex_init(&g2d->dev_mutex);
 	spin_lock_init(&g2d->job_lock);
 	INIT_LIST_HEAD(&g2d->job_queue);
+	/* Init job pool */
+	spin_lock_init(&g2d->job_pool_lock);
+	INIT_LIST_HEAD(&g2d->job_pool_free);
+	g2d->job_pool_free_count = 0;
+	g2d->job_pool_min = 32; /* default min */
+	g2d->job_pool_max = 256; /* default max */
+	g2d->job_cache = kmem_cache_create("sunxi_g2d_job",
+					   sizeof(struct sunxi_g2d_job),
+					   __alignof__(struct sunxi_g2d_job),
+					   SLAB_HWCACHE_ALIGN, NULL);
+	atomic64_set(&g2d->job_pool_hits, 0);
+	atomic64_set(&g2d->job_pool_misses, 0);
+	if (g2d->job_cache) {
+		int i;
+		for (i = 0; i < g2d->job_pool_min; i++) {
+			struct sunxi_g2d_job *job = kmem_cache_zalloc(g2d->job_cache, GFP_KERNEL);
+			if (!job)
+				break;
+			list_add(&job->node, &g2d->job_pool_free);
+			g2d->job_pool_free_count++;
+		}
+	}
 	init_waitqueue_head(&g2d->irq_wait);
 	atomic_set(&g2d->irq_done, 0);
 	atomic_set(&g2d->users, 0);
 	atomic64_set(&g2d->jobs_submitted, 0);
 	atomic64_set(&g2d->jobs_done, 0);
 	atomic64_set(&g2d->jobs_failed, 0);
+	atomic64_set(&g2d->stage_src_count, 0);
+	atomic64_set(&g2d->stage_wb_out_count, 0);
+	atomic64_set(&g2d->stage_wb_inplace_count, 0);
+	atomic64_set(&g2d->stage_wb_bytes_copied, 0);
+	atomic64_set(&g2d->stage_wb_active_jobs, 0);
+	atomic64_set(&g2d->stage_wb_active_bytes, 0);
+	atomic64_set(&g2d->vmap_attempts, 0);
+	atomic64_set(&g2d->vmap_failures, 0);
+	atomic64_set(&g2d->wb_cache_hits, 0);
+	atomic64_set(&g2d->wb_cache_misses, 0);
+	atomic64_set(&g2d->stage_wb_req_bytes, 0);
+	g2d->wb_small_cache_in_use = false;
 
 	/* Initialize fence context/sequence for dma-fence support */
 	g2d->fence_context = dma_fence_context_alloc(1);
@@ -9263,6 +10467,30 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 		DRIVER_VERSION);
 	dev_info(&pdev->dev, "registered as /dev/g2d\n");
 
+	/* Create sysfs telemetry attributes on the platform device */
+	device_create_file(&pdev->dev, &dev_attr_staging_src);
+	device_create_file(&pdev->dev, &dev_attr_staging_wb_out);
+	device_create_file(&pdev->dev, &dev_attr_staging_wb_inplace);
+	device_create_file(&pdev->dev, &dev_attr_staging_wb_bytes);
+	device_create_file(&pdev->dev, &dev_attr_staging_wb_active_jobs);
+	device_create_file(&pdev->dev, &dev_attr_staging_wb_active_bytes);
+	device_create_file(&pdev->dev, &dev_attr_vmap_attempts);
+	device_create_file(&pdev->dev, &dev_attr_vmap_failures);
+	device_create_file(&pdev->dev, &dev_attr_wb_cache_hits);
+	device_create_file(&pdev->dev, &dev_attr_wb_cache_misses);
+	device_create_file(&pdev->dev, &dev_attr_staging_wb_req_bytes);
+	/* Job-pool telemetry */
+	device_create_file(&pdev->dev, &dev_attr_job_pool_hits);
+	device_create_file(&pdev->dev, &dev_attr_job_pool_misses);
+	device_create_file(&pdev->dev, &dev_attr_job_pool_free);
+	device_create_file(&pdev->dev, &dev_attr_job_pool_min);
+	device_create_file(&pdev->dev, &dev_attr_job_pool_max);
+
+	dev_info(&pdev->dev, "job-pool: free=%d min=%d max=%d hits=%llu misses=%llu\n",
+		 g2d->job_pool_free_count, g2d->job_pool_min, g2d->job_pool_max,
+		 (unsigned long long)atomic64_read(&g2d->job_pool_hits),
+		 (unsigned long long)atomic64_read(&g2d->job_pool_misses));
+
 	return 0;
 
 err_del_cdev:
@@ -9298,13 +10526,68 @@ static void sunxi_g2d_remove(struct platform_device *pdev)
 	if (g2d->rcq_enabled)
 		sunxi_g2d_rcq_free(g2d->dev, &g2d->rcq);
 
+	/* Free persistent temporary buffers */
+	if (g2d->temp_scale_buf.sgt)
+		g2d_dma_mem_free(g2d->dev, &g2d->temp_scale_buf);
+	if (g2d->temp_rot_buf.sgt)
+		g2d_dma_mem_free(g2d->dev, &g2d->temp_rot_buf);
+
 	/* Disable hardware if still enabled */
 	mutex_lock(&g2d->dev_mutex);
 	if (g2d->hw_enabled)
 		sunxi_g2d_hw_disable(g2d);
 	mutex_unlock(&g2d->dev_mutex);
 
+	/* Print brief staging telemetry on removal */
+	dev_info(&pdev->dev,
+		 "staging: src=%llu wb_out=%llu wb_inplace=%llu wb_bytes=%llu wb_active_jobs=%llu wb_active_bytes=%llu vmap_attempts=%llu vmap_failures=%llu wb_cache_hits=%llu wb_cache_misses=%llu wb_req_bytes=%llu\n",
+		 (unsigned long long)atomic64_read(&g2d->stage_src_count),
+		 (unsigned long long)atomic64_read(&g2d->stage_wb_out_count),
+		 (unsigned long long)atomic64_read(&g2d->stage_wb_inplace_count),
+		 (unsigned long long)atomic64_read(&g2d->stage_wb_bytes_copied),
+		 (unsigned long long)atomic64_read(&g2d->stage_wb_active_jobs),
+		 (unsigned long long)atomic64_read(&g2d->stage_wb_active_bytes),
+		 (unsigned long long)atomic64_read(&g2d->vmap_attempts),
+		 (unsigned long long)atomic64_read(&g2d->vmap_failures),
+		 (unsigned long long)atomic64_read(&g2d->wb_cache_hits),
+		 (unsigned long long)atomic64_read(&g2d->wb_cache_misses),
+		 (unsigned long long)atomic64_read(&g2d->stage_wb_req_bytes));
+
 	dev_info(&pdev->dev, "unregistered /dev/g2d\n");
+
+	/* Destroy job pool */
+	if (g2d->job_cache) {
+		unsigned long flags;
+		spin_lock_irqsave(&g2d->job_pool_lock, flags);
+		while (!list_empty(&g2d->job_pool_free)) {
+			struct sunxi_g2d_job *job = list_first_entry(&g2d->job_pool_free, struct sunxi_g2d_job, node);
+			list_del(&job->node);
+			kmem_cache_free(g2d->job_cache, job);
+		}
+		g2d->job_pool_free_count = 0;
+		spin_unlock_irqrestore(&g2d->job_pool_lock, flags);
+		kmem_cache_destroy(g2d->job_cache);
+		g2d->job_cache = NULL;
+	}
+
+	/* Remove sysfs telemetry attributes */
+	device_remove_file(&pdev->dev, &dev_attr_staging_src);
+	device_remove_file(&pdev->dev, &dev_attr_staging_wb_out);
+	device_remove_file(&pdev->dev, &dev_attr_staging_wb_inplace);
+	device_remove_file(&pdev->dev, &dev_attr_staging_wb_bytes);
+	device_remove_file(&pdev->dev, &dev_attr_staging_wb_active_jobs);
+	device_remove_file(&pdev->dev, &dev_attr_staging_wb_active_bytes);
+	device_remove_file(&pdev->dev, &dev_attr_vmap_attempts);
+	device_remove_file(&pdev->dev, &dev_attr_vmap_failures);
+	device_remove_file(&pdev->dev, &dev_attr_wb_cache_hits);
+	device_remove_file(&pdev->dev, &dev_attr_wb_cache_misses);
+	device_remove_file(&pdev->dev, &dev_attr_staging_wb_req_bytes);
+	/* Job-pool telemetry */
+	device_remove_file(&pdev->dev, &dev_attr_job_pool_hits);
+	device_remove_file(&pdev->dev, &dev_attr_job_pool_misses);
+	device_remove_file(&pdev->dev, &dev_attr_job_pool_free);
+	device_remove_file(&pdev->dev, &dev_attr_job_pool_min);
+	device_remove_file(&pdev->dev, &dev_attr_job_pool_max);
 }
 
 static const struct of_device_id sunxi_g2d_of_match[] = {
