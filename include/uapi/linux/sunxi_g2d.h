@@ -225,12 +225,30 @@ struct g2d_version {
 	__u32 driver_patchlevel;
 };
 
-/* G2D buffer allocation request (TODO: Not yet implemented) */
+/* G2D buffer allocation request */
 struct g2d_alloc_buffer {
 	__u64 size;		/* IN: Buffer size in bytes */
 	__s32 dma_fd;		/* OUT: DMA-BUF file descriptor */
-	__u32 flags;		/* Reserved for future use */
+	__u32 flags; 		/* IN: Allocation flags (see G2D_ALLOC_F_*) */
 };
+
+/* g2d_alloc_buffer.flags
+ *
+ * By default, the driver uses its module parameter g2d_alloc_mode to decide
+ * the allocation backend. These flags allow userspace to request a specific
+ * backend per-allocation without changing the module-wide default.
+ *
+ * - G2D_ALLOC_F_CONTIGUOUS: Require a single, IOVA-contiguous DMA segment.
+ *   This is mandatory for G2D linear surfaces on T113 to avoid hardware DMA
+ *   past the first SG entry. If set, the driver will choose a backend that
+ *   yields a single contiguous segment (e.g., dma_alloc_coherent if available).
+ *
+ * - G2D_ALLOC_F_COHERENT: Prefer a cache-coherent mapping for CPU access.
+ *   When combined with CONTIGUOUS, this selects the coherent/IOMMU backend
+ *   (dma_alloc_coherent + dma_get_sgtable_attrs) when possible.
+ */
+#define G2D_ALLOC_F_CONTIGUOUS		(1u << 0)
+#define G2D_ALLOC_F_COHERENT		(1u << 1)
 
 /* Selftest helper for userspace to create a kernel-backed fence that will
  * be signalled after a timeout. Used for isolating fence lifecycle bugs

@@ -40,6 +40,121 @@ El driver `sunxi-g2d` proporciona acceso hardware al acelerador gráfico 2D de A
 
 Estas mejoras están en la rama `sunxi-g2d-m2m` y fueron validadas con los demos incluidos (fillrect, blit, rotate, mask, bouncing-ball). Ver commits recientes en el repositorio para detalles de cambios.
 
+### Parámetros de Módulo (Configuración Runtime)
+
+| Parámetro | Default | Tipo | Descripción Breve | Uso/Impacto |
+|-----------|---------|------|-------------------|-------------|
+| `g2d_alloc_use_system_heap` | `true` | bool | Usa páginas sistema para buffers internos en vez de CMA | Ahorra CMA; dejar `true` salvo problemas DMA |
+| `g2d_alloc_mode` | `2` | int | 0=CMA, 1=system pages, 2=coherent (dma_alloc_coherent) | Backend asignación interna (no framebuffer) |
+| `g2d_allow_staging_fallback` | `false` | bool | Permite staging si sg no es contiguo | Diagnóstico de buffers fragmentados |
+| `g2d_wb_cache_enable` | `true` | bool | Cache staging writeback pequeño | Reduce vmap/vmalloc churn |
+| `g2d_wb_cache_max_kb` | `128` | uint | Tamaño máximo cache (KB) | Ajustar según patrón de buffers pequeños |
+| `rcq_enable_bit` | `true` | bool | Toggle heredado RCQ (sin efecto real) | Mantener default; deprecado |
+| `exp_both_pipes` | `true` | bool | Activa ambos pipes BLD en YUV BLIT | Workaround timeouts YUV->RGB |
+| `force_vsu_1to1_for_yuv_blit` | `true` | bool | Fuerza VSU incluso 1:1 en BLIT YUV | Uniformiza flujo y evita quirks |
+| `mixer_scan_order` | `-1` | int | Orden scan mixer (-1 no tocar) | Sólo tuning experimental |
+| `v0_chroma_subsample_mode` | `0` | int | Control subsampling crominancia V0 | Diagnóstico artefactos YUV |
+| `vsu_chroma_half_phase_420` | `false` | bool | Half-phase global 4:2:0 | Corrección co-siting crominancia |
+| `vsu_chroma_half_phase_h_420` | `false` | bool | Half-phase eje H 4:2:0 | Ajuste fino horizontal |
+| `vsu_chroma_half_phase_v_420` | `false` | bool | Half-phase eje V 4:2:0 | Ajuste fino vertical |
+| `vsu_chroma_filter_linear` | `false` | bool | Filtro lineal en crominancia | Simplifica FIR; diagnóstico |
+| `vsu_chroma_c_size_match_luma` | `false` | bool | Igualar VS_C_SIZE a luma | Pruebas dimensionamiento |
+| `yuv_planar_uv_order` | `0` | int | Orden UV planar (0=I420,1=YV12) | Ajustar según formato fuente |
+| `force_csc_color_space_in` | `-1` | int | Forzar espacio color entrada | Diagnóstico matices CSC |
+| `g2d_force_staging` | `false` | bool | Fuerza staging src/writeback | Sólo pruebas; penaliza rendimiento |
+| `g2d_force_staging_min_kb` | `200` | int | Umbral tamaño staging forzado | Evita staging en buffers pequeños |
+| `g2d_enable_staging` | `0` | bool | Habilita staging global | Activar para campañas de test |
+| `g2d_debug_flags` | `0` | ulong | Bitmask debug (remap YUV, dump) | Inspección formatos/artefactos |
+
+#### Recomendaciones de Producción
+- Mantener `g2d_force_staging=0` y `g2d_enable_staging=0` salvo pruebas específicas.
+- Evitar toggles crominancia (`vsu_chroma_*`) si no hay artefactos observados.
+- Ajustar `g2d_alloc_mode=1` sólo si se desea evitar `dma_alloc_coherent`.
+- Elevar `g2d_force_staging_min_kb` si staging aún alcanza buffers medianos no deseados.
+
+#### Carga Ejemplo Ajustada
+```bash
+modprobe sunxi-g2d g2d_alloc_mode=1 g2d_wb_cache_enable=1 g2d_force_staging=1 g2d_force_staging_min_kb=400
+```
+Forzará backend system pages, mantendrá cache y aplicará staging sólo a superficies grandes (>400KB).
+
+#### Depuración Rápida
+| Síntoma | Parámetro | Acción |
+|---------|-----------|--------|
+| FPS baja | `g2d_force_staging` | Desactivar staging forzado |
+| Artefactos crominancia | `vsu_chroma_half_phase_420` | Activar y validar mejora |
+| UV desalineado | `yuv_planar_uv_order` | Ajustar orden correcto |
+| Pitch staging extraño | `g2d_force_staging_min_kb` | Subir umbral |
+| CMA agotada | `g2d_alloc_mode` | Cambiar a 1 (system pages) |
+
+### 🧩 Política de Memoria y Asignación de Buffers (T113)
+
+El pipeline gráfico en T113 distingue claramente entre dos tipos de buffers:
+
+1. Buffer de **scanout / framebuffer** (leído por el display engine / mixers)
+2. Buffers de **trabajo G2D** (intermedios para escalado, blit, blend, composición)
+
+#### 1. Scanout (Framebuffer)
+
+El hardware de display en T113 (DE/Mixer) no está detrás de un IOMMU y **requiere memoria físicamente contigua** para leer sin corrupción. Por ello el mecanismo recomendado es:
+
+- Crear el framebuffer con un **DRM dumb buffer** (ioctl DRM_MODE_CREATE_DUMB) o desde el **CMA heap** (`/dev/dma_heap/default_cma_region`).
+- Evitar usar heaps de sistema (páginas no contiguas) o buffers G2D para scanout directo: provocará "garabatos" / datos incoherentes en pantalla.
+- El pitch/stride debe alinearse según el formato; para ARGB8888 típicamente `stride = width * 4`.
+
+#### 2. Buffers de Trabajo (Operaciones G2D)
+
+Para operaciones COPY / SCALE / BLEND / FILL se pueden usar:
+
+- **System heap** (`/dev/dma_heap/system`) cuando el driver valida que `sg_table->nents == 1` (en T113 la implementación rechaza superficies lineales multi‑segmento). Esto permite ahorrar CMA y aprovechar páginas normales.
+- **CMA heap** si se desea máxima compatibilidad (siempre contiguo).
+- **Coherente/IOMMU** mediante la bandera COHERENT (cuando el backend de asignación `dma_alloc_coherent` está habilitado: útil para evitar problemas de caché en ciertos flujos). En T113 no hay IOMMU para display, pero la G2D puede trabajar con direcciones DMA coherentes.
+
+#### Flags de Asignación UAPI
+
+Al usar `G2D_IOC_ALLOC_BUFFER` se pueden especificar flags:
+
+- `G2D_ALLOC_F_CONTIGUOUS`: Fuerza asignación físicamente contigua (CMA / dumb equivalente). Úsalo para buffers que serán compartidos con hardware externo que requiere contigüidad.
+- `G2D_ALLOC_F_COHERENT`: Solicita memoria DMA coherente (`dma_alloc_coherent`). Útil para minimizar necesidad de operaciones de caché al compartir con CPU.
+
+Si ningún flag se pasa, el driver selecciona backend según los parámetros de módulo (ver defaults abajo).
+
+#### Parámetros por Defecto del Driver
+
+- `g2d_alloc_mode = 2` (modo híbrido: permite system heap si es seguro, cae a CMA cuando se necesita contigüidad)
+- `g2d_alloc_use_system_heap = true` (prioriza páginas de sistema para buffers de trabajo cuando son lineales y contiguas)
+
+Estos valores equilibran uso de memoria y rendimiento: scanout permanece en CMA/dumb; trabajo intermedio aprovecha memoria general.
+
+#### Recomendaciones Prácticas
+
+| Caso | Recomendado | Motivo |
+|------|-------------|--------|
+| Framebuffer principal (scanout) | DRM dumb (contiguo) | Evita corrupción en display engine |
+| Buffer temporal de escalado | system heap (sin flags) | Ahorra CMA, suficiente contigüidad (1 segmento) |
+| Buffer para blending múltiple | system heap o CMA si falla | Garantiza linealidad y evita rechazos por sg>1 |
+| Buffer compartido con otro IP que necesita contigüidad | flag CONTIGUOUS | Seguridad de acceso físico |
+| Buffer donde latencias de caché son críticas | flag COHERENT | Acceso CPU/HW consistente |
+
+#### Diagnóstico Rápido
+
+Síntoma: Imagen con "ruido" o patrones aleatorios en pantalla tras copiar al framebuffer.
+
+1. Verificar si el framebuffer proviene de system heap no contiguo.
+2. Re-crear usando DRM dumb buffer.
+3. Confirmar en `dmesg` que el driver G2D no reporta rechazo por `sg->nents > 1`.
+
+#### Patrón de Uso Recomendado
+
+1. Crear framebuffer con DRM dumb → exportar DMA-BUF fd.
+2. Asignar buffers de trabajo vía `G2D_IOC_ALLOC_BUFFER` (sin flags) → obtiene system heap si posible.
+3. Encadenar operaciones G2D (SCALE → BLEND → COPY final al framebuffer) usando fences.
+4. Solo usar COHERENT o CONTIGUOUS si existe requisito explícito de hardware externo.
+
+> Nota: El driver valida internamente los tamaños y rechaza superficies multi‑segmento para formatos lineales, previniendo corrupción silenciosa.
+
+---
+
 ### 🆕 Modo Asíncrono (v2.9.17+)
 
 **IMPORTANTE:** A partir de la versión 2.9.17, el driver opera de forma asíncrona por defecto:
@@ -89,6 +204,55 @@ Ver **[Job Queue Design](../../patches/demo-g2d/docs/JOB-QUEUE-ASYNC-DESIGN.md)*
   CONFIG_DMABUF_HEAPS_SYSTEM=y
   CONFIG_DMABUF_HEAPS_CMA=y
   ```
+
+### MBUS y Prioridad (QoS)
+
+El acelerador G2D compite por ancho de banda de memoria con otros IP (DE/Mixer, codecs, CPU). En SoCs T113/D1 el MBUS expone registros de configuración por "master" y el G2D es el **master 9**. El driver mapea el bloque MBUS y aplica un workaround de prioridad/QoS:
+
+| Aspecto | Valor aplicado | Motivo |
+|---------|----------------|--------|
+| ACEN (enable) | Bit master 9 forzado a 1 | Garantiza que el master esté activo |
+| PRI | 1 (alto) | Elevar prioridad frente a tráfico de baja prioridad |
+| QOS | 3 (máximo) | Reducir latencia en ráfagas (lecturas/escrituras) |
+
+Esto se realiza en `sunxi_g2d_setup_mbus()` durante `probe()` después de mapear los registros (`sunxi_g2d_map_mbus`). Si el mapeo falla el driver aborta el probe para evitar operar con configuración incierta.
+
+#### Razón del Workaround
+Actualmente no existe un driver `interconnect` genérico para estos SoCs que gestione dinámicamente la calidad de servicio. Ajustar PRI/QOS evita:
+
+- Flicker intermitente durante operaciones de composición o escalado bajo carga.
+- Caída marcada de FPS (p.ej. de 60 → 10) cuando hay presión de memoria simultánea.
+
+#### Verificación
+
+1. Cargar el módulo con `modprobe sunxi-g2d`.
+2. Revisar `dmesg | grep MBUS` para ver líneas `MBUS CFG0(9)` si `debug` está habilitado.
+3. Confirmar que el registro refleja PRI=1 y QOS=3.
+
+#### Device Tree (ejemplo mínimo)
+```dts
+g2d: g2d@0x05400000 {
+        compatible = "allwinner,t113-g2d"; // Ejemplo
+        reg = <0x0 0x05400000 0x0 0x1000>;
+        clocks = <&ccu CLK_BUS_G2D>, <&ccu CLK_G2D>, <&ccu CLK_MBUS_G2D>;
+        clock-names = "bus_g2d", "g2d", "mbus_g2d";
+        resets = <&ccu RST_BUS_G2D>;
+        interconnects = <&mbus 0 &mbus 1>; // Placeholder; camino "dma-mem"
+        interconnect-names = "dma-mem";
+};
+```
+Nota: Ajustar `compatible` y recursos según el DTS real. El camino `interconnects` es preparatorio para reemplazar el workaround manual cuando exista soporte pleno.
+
+#### Señales de Problema de MBUS
+
+| Síntoma | Posible Causa | Acción |
+|---------|---------------|--------|
+| Flicker en composición | PRI/QOS no aplicados | Revisar mapeo MBUS y logs |
+| FPS bajo sostenido | Contención de memoria | Verificar QoS y carga de otros masters |
+| Errores DMA esporádicos | Master no habilitado (ACEN) | Confirmar bit ACEN master 9 |
+
+Con un futuro driver de interconnect estas configuraciones deberían migrarse a peticiones dinámicas de ancho de banda en lugar de ser estáticas.
+
 
 ### Hardware
 
