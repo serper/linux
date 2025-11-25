@@ -60,6 +60,7 @@
 #include "sunxi-g2d-structs.h"
 #include "sunxi-g2d-scaler-coeffs.h"
 #include "sunxi-g2d-rcq.h"
+#include "sunxi-g2d-csc-tables.h"
 
 #define DRIVER_NAME "sunxi-g2d"
 #define DRIVER_VERSION "2.9.16"
@@ -1593,9 +1594,105 @@ static void sunxi_g2d_disable_workfn(struct work_struct *work)
 
 /* Forward declarations for job execution helpers */
 static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
-				     dma_addr_t dst_dma, u32 width, u32 height,
-				     u32 pitch, u32 color, u32 color_format,
-				     u32 dst_format);
+					 dma_addr_t dst_dma, u32 width, u32 height,
+					 u32 pitch, u32 color, u32 color_format,
+					 u32 dst_format);
+
+static int sunxi_g2d_do_blend_rcq(
+	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma, u32 src_width,
+	u32 src_height, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
+	u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma, u32 dst_width,
+	u32 dst_height, u32 dst_pitch, u32 dst_format, u32 dst_x, u32 dst_y,
+	dma_addr_t out_dma, u32 out_width, u32 out_height, u32 out_pitch,
+	u32 out_format, u32 out_x, u32 out_y, u32 blend_w, u32 blend_h,
+	u32 bld_mode, u32 alpha_mode, u32 global_alpha, u32 premul_mode,
+	struct g2d_csc_state *csc_state);
+
+static int sunxi_g2d_do_blit_rot(
+	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma, u32 src_width,
+	u32 src_height, u32 src_pitch, u32 src_format, u32 src_crop_x,
+	u32 src_crop_y, u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma,
+	u32 dst_width, u32 dst_height, u32 dst_pitch, u32 dst_format,
+	u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags)
+{
+	struct g2d_rot_reg *rot_regs = NULL;
+	u32 rot_size = 0;
+	u32 rot_mode = 0;
+	int ret;
+
+	/* Map flags to ROT mode */
+	if (flags & G2D_BLIT_FLAG_ROTATE_90)
+		rot_mode = G2D_ROT_90;
+	else if (flags & G2D_BLIT_FLAG_ROTATE_180)
+		rot_mode = G2D_ROT_180;
+	else if (flags & G2D_BLIT_FLAG_ROTATE_270)
+		rot_mode = G2D_ROT_270;
+	else if (flags & G2D_BLT_FLIP_HORIZONTAL)
+		rot_mode = G2D_ROT_H;
+	else if (flags & G2D_BLT_FLIP_VERTICAL)
+		rot_mode = G2D_ROT_V;
+	else
+		return -EINVAL;
+
+	/* Build ROT block */
+	/* Use src_crop_w/h as input size to ROT */
+	ret = g2d_rcq_build_rot(src_crop_w, src_crop_h, src_pitch, src_dma,
+				src_format, dst_w, dst_h, dst_pitch,
+				dst_dma, dst_format, rot_mode, &rot_regs,
+				&rot_size);
+	if (ret)
+		return ret;
+
+	/* Reset IRQ done */
+	atomic_set(&g2d->irq_done, 0);
+
+	/* Configure RCQ hardware registers (HEAD/LEN) before start */
+	{
+		struct g2d_rcq_header *header;
+		u32 *cmd_buf = g2d->rcq.vir_addr;
+		dma_addr_t cmd_dma = g2d->rcq.phy_addr;
+		
+		/* Clear RCQ buffer */
+		memset(cmd_buf, 0, G2D_RCQ_MAX_SIZE);
+		
+		/* Create Header */
+		header = (struct g2d_rcq_header *)cmd_buf;
+		header->low_addr = lower_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
+		header->dw0.bits.len = rot_size;
+		header->dw0.bits.high_addr = upper_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
+		header->dirty.bits.dirty = 1;
+		header->dirty.bits.n_header_len = 0; /* Last block */
+		header->reg_offset = G2D_ROT; /* ROT base offset */
+		
+		/* Copy ROT block data */
+		memcpy(cmd_buf + (sizeof(struct g2d_rcq_header)/4), rot_regs, rot_size);
+	}
+	
+	kfree(rot_regs);
+
+	/* Start RCQ */
+	sunxi_g2d_rcq_setup_hw(g2d->base, &g2d->rcq);
+	sunxi_g2d_rcq_start(g2d->base, false, true);
+	wmb();
+
+	/* Wait for completion */
+	{
+		int timeout_jiffies = msecs_to_jiffies(100);
+		int wait_result;
+
+		wait_result = wait_event_interruptible_timeout(
+			g2d->irq_wait, atomic_read(&g2d->irq_done),
+			timeout_jiffies);
+		if (wait_result <= 0) {
+			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
+			dev_err(g2d->dev,
+				"ROT_RCQ timeout or interrupted: %d\n", ret);
+			return ret;
+		}
+	}
+	
+	return 0;
+}
 
 /**
  * sunxi_g2d_job_worker - Workqueue worker for async job processing
@@ -1759,8 +1856,6 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 		break;
 
 	case G2D_JOB_CMD_ROTATE:
-		break;
-#if 0
 		/* Rotation/flip operation using ROT block */
 		ret = sunxi_g2d_do_blit_rot(
 			g2d, job->src_dma, job->data.blit.src_width,
@@ -1787,39 +1882,30 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
-#endif
 		break;
 
 	case G2D_JOB_CMD_MASK:
-		break;
-#if 0
 		/* Color keying / chromakey operation */
-		ret = sunxi_g2d_do_blit_alpha_3buf(
+		/* Using RCQ blend implementation */
+		ret = sunxi_g2d_do_blend_rcq(
 			g2d, job->src_dma, job->data.blit.src_width,
 			job->data.blit.src_height, job->data.blit.src_pitch,
 			job->data.blit.src_format, job->data.blit.src_crop_x,
 			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->data.blit.src_alpha,
-			job->data.blit.src_alpha_mode,
-			job->data.blit.src_premul,
-			job->data.blit.src_color_space, job->dst_dma,
-			job->dst_dma, /* dst_base_addr = dst_dma */
+			job->data.blit.src_crop_h, job->dst_dma,
+			job->data.blit.dst_width, job->data.blit.dst_height,
+			job->data.blit.dst_pitch, job->data.blit.dst_format,
+			job->data.blit.dst_x, job->data.blit.dst_y,
+			job->dst_dma, /* out_dma = dst_dma (in-place) */
 			job->data.blit.dst_width, job->data.blit.dst_height,
 			job->data.blit.dst_pitch, job->data.blit.dst_format,
 			job->data.blit.dst_x, job->data.blit.dst_y,
 			job->data.blit.dst_w, job->data.blit.dst_h,
-			job->data.blit.dst_alpha, job->data.blit.dst_alpha_mode,
-			job->data.blit.dst_premul,
-			job->data.blit.dst_color_space, job->out_dma,
-			job->data.blit.out_width, job->data.blit.out_height,
-			job->data.blit.out_pitch, job->data.blit.out_format,
-			job->data.blit.dst_w, job->data.blit.dst_h,
 			job->data.blit.bld_mode,
-			job->data.blit.color_key_enable,
-			job->data.blit.color_key_mode,
-			job->data.blit.color_key_min,
-			job->data.blit.color_key_max,
-			&job->csc_state);
+			job->data.blit.src_alpha_mode,
+			job->data.blit.src_alpha,
+			job->data.blit.src_premul,
+			&g2d->csc_state);
 
 		if (ret < 0) {
 			dev_err(g2d->dev, "G2D_CMD_MASK failed: %d\n", ret);
@@ -1834,7 +1920,6 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 			queue_work(g2d->job_wq, &job->cleanup_work);
 			queue_work(g2d->job_wq, &g2d->job_work);
 		}
-#endif
 		break;
 
 	case G2D_JOB_CMD_COPY:
@@ -2666,12 +2751,6 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 	}
 
 	sunxi_g2d_rcq_setup_hw(g2d->base, &g2d->rcq);
-
-	/* BSP pattern: MIXER global registers via MMIO before RCQ */
-	g2d_write(g2d, MIXER_FILLCOLOR0, 0xFF000000);
-	g2d_write(g2d, MIXER_SIZE,
-		  ((width - 1) & 0x1FFF) | (((height - 1) & 0x1FFF) << 16));
-	wmb();
 
 	/* Start RCQ and MIXER */
 	sunxi_g2d_rcq_start(g2d->base, false, true);
@@ -6044,6 +6123,91 @@ cleanup:
 	kfree(wb_regs);
 
 	return ret;
+}
+
+/**
+ * g2d_csc_init - Initialize CSC state with default values
+ * @state: Pointer to CSC state structure
+ */
+void g2d_csc_init(struct g2d_csc_state *state)
+{
+	if (!state)
+		return;
+
+	state->base_601 = Ycbcr2rgb_601;
+	state->base_709 = Ycbcr2rgb_709;
+
+	/* Initialize current tables with base values */
+	/* Offset 36 (Limit->Full) is what we use for YUV->RGB */
+	memcpy(state->current_601, Ycbcr2rgb_601, sizeof(state->current_601));
+	memcpy(state->current_709, Ycbcr2rgb_709, sizeof(state->current_709));
+
+	/* Default adjustments */
+	state->adj.brightness = 0;
+	state->adj.contrast = 100;
+	state->adj.saturation = 100;
+
+	state->dirty_601 = false;
+	state->dirty_709 = false;
+}
+
+/**
+ * g2d_csc_update - Recalculate CSC tables based on adjustments
+ * @state: Pointer to CSC state structure
+ *
+ * Recalculates the "Limit -> Full" (offset 36) block of the CSC matrices.
+ */
+void g2d_csc_update(struct g2d_csc_state *state)
+{
+	int r;
+	s32 *curr;
+	const s32 *base;
+	int offset = 36; /* Limit -> Full block */
+
+	if (!state)
+		return;
+
+	/* Update 601 table */
+	curr = state->current_601 + offset;
+	base = state->base_601 + offset;
+
+	for (r = 0; r < 3; r++) {
+		/* Col 0: Y (Contrast only) */
+		curr[r * 4 + 0] = (base[r * 4 + 0] * state->adj.contrast) / 100;
+
+		/* Col 1: U (Contrast * Saturation) */
+		curr[r * 4 + 1] =
+			(base[r * 4 + 1] * state->adj.contrast * state->adj.saturation) /
+			10000;
+
+		/* Col 2: V (Contrast * Saturation) */
+		curr[r * 4 + 2] =
+			(base[r * 4 + 2] * state->adj.contrast * state->adj.saturation) /
+			10000;
+
+		/* Col 3: Constant (Contrast + Brightness) */
+		/* Brightness is added in RGB space (after matrix), so we add it to the constant term.
+		 * Constant term is in Q10 fixed point (approx), so shift brightness by 10.
+		 */
+		curr[r * 4 + 3] = (base[r * 4 + 3] * state->adj.contrast) / 100 +
+				  (state->adj.brightness << 10);
+	}
+
+	/* Update  709 table */
+	curr = state->current_709 + offset;
+	base = state->base_709 + offset;
+
+	for (r = 0; r < 3; r++) {
+		curr[r * 4 + 0] = (base[r * 4 + 0] * state->adj.contrast) / 100;
+		curr[r * 4 + 1] =
+			(base[r * 4 + 1] * state->adj.contrast * state->adj.saturation) /
+			10000;
+		curr[r * 4 + 2] =
+			(base[r * 4 + 2] * state->adj.contrast * state->adj.saturation) /
+			10000;
+		curr[r * 4 + 3] = (base[r * 4 + 3] * state->adj.contrast) / 100 +
+				  (state->adj.brightness << 10);
+	}
 }
 
 /*
