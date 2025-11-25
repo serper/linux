@@ -98,7 +98,8 @@ static void sunxi_g2d_get_yuv_plane_info(u32 fmt, u32 width, u32 height,
 					 const u32 *user_stride, u32 *stride,
 					 u32 *plane_offset);
 
-static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
+				 struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
 				 u32 src_width, u32 src_height, u32 src_pitch,
 				 u32 src_format, u32 src_x, u32 src_y,
 				 u32 src_crop_w, u32 src_crop_h,
@@ -106,7 +107,8 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 				 u32 dst_height, u32 dst_pitch, u32 dst_format,
 				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h);
 
-static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
+				  struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
 				  u32 src_width, u32 src_height, u32 src_pitch,
 				  u32 src_format, u32 src_x, u32 src_y,
 				  u32 src_crop_w, u32 src_crop_h,
@@ -117,14 +119,14 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 				  struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blend_rcq(
-	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma, u32 src_width,
-	u32 src_height, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
-	u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma, u32 dst_width,
-	u32 dst_height, u32 dst_pitch, u32 dst_format, u32 dst_x, u32 dst_y,
-	dma_addr_t out_dma, u32 out_width, u32 out_height, u32 out_pitch,
-	u32 out_format, u32 out_x, u32 out_y, u32 blend_w, u32 blend_h,
-	u32 bld_mode, u32 alpha_mode, u32 global_alpha, u32 premul_mode,
-	struct g2d_csc_state *csc_state);
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format, u32 src_x,
+	u32 src_y, u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma,
+	u32 dst_width, u32 dst_height, u32 dst_pitch, u32 dst_format, u32 dst_x,
+	u32 dst_y, dma_addr_t out_dma, u32 out_width, u32 out_height,
+	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
+	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
+	u32 premul_mode, struct g2d_csc_state *csc_state);
 
 struct g2d_dma_mem {
 	void *vaddr;
@@ -571,7 +573,6 @@ struct sunxi_g2d_dev {
 enum g2d_job_type {
 	G2D_JOB_FILLRECT,
 	G2D_JOB_BLIT,
-	/* Specialized command types from G2D_IOC_CMD */
 	G2D_JOB_CMD_COPY,
 	G2D_JOB_CMD_SCALE,
 	G2D_JOB_CMD_BLEND,
@@ -678,6 +679,10 @@ struct sunxi_g2d_job {
 	struct g2d_dma_mem wb_out_buf;
 	size_t wb_out_size;
 
+	/* Prebuilt RCQ buffer for this job (built in ioctl context) */
+	struct g2d_rcq_mem rcq;
+	bool rcq_ready;
+
 	/* Temporary buffers for multi-step operations */
 	struct g2d_dma_mem temp_buf;
 	struct g2d_dma_mem temp2_buf;
@@ -736,6 +741,25 @@ static void g2d_job_free(struct sunxi_g2d_dev *g2d, struct sunxi_g2d_job *job)
 		kmem_cache_free(g2d->job_cache, job);
 	else
 		kfree(job);
+}
+
+static int g2d_job_prepare_rcq(struct sunxi_g2d_dev *g2d,
+			       struct sunxi_g2d_job *job)
+{
+	int ret;
+
+	if (!g2d || !job)
+		return -EINVAL;
+
+	if (!g2d->rcq_enabled)
+		return -EOPNOTSUPP;
+
+	ret = sunxi_g2d_rcq_alloc(g2d->dev, &job->rcq, G2D_RCQ_MAX_SIZE);
+	if (ret)
+		return ret;
+
+	job->rcq_ready = false;
+	return 0;
 }
 
 static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
@@ -1101,6 +1125,10 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 				(u64)job->temp2_buf.dma_addr,
 				job->temp2_buf.size);
 			g2d_dma_mem_free(job->g2d->dev, &job->temp2_buf);
+		}
+		if (job->rcq.vir_addr) {
+			sunxi_g2d_rcq_free(job->g2d->dev, &job->rcq);
+			job->rcq_ready = false;
 		}
 	}
 
@@ -1537,31 +1565,35 @@ static void sunxi_g2d_disable_workfn(struct work_struct *work)
 
 /* Forward declarations for job execution helpers */
 static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
-					 dma_addr_t dst_dma, u32 width, u32 height,
-					 u32 pitch, u32 color, u32 color_format,
-					 u32 dst_format);
+				     struct g2d_rcq_mem *rcq,
+				     dma_addr_t dst_dma, u32 width, u32 height,
+				     u32 pitch, u32 color, u32 color_format,
+				     u32 dst_format);
 
 static int sunxi_g2d_do_blend_rcq(
-	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma, u32 src_width,
-	u32 src_height, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
-	u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma, u32 dst_width,
-	u32 dst_height, u32 dst_pitch, u32 dst_format, u32 dst_x, u32 dst_y,
-	dma_addr_t out_dma, u32 out_width, u32 out_height, u32 out_pitch,
-	u32 out_format, u32 out_x, u32 out_y, u32 blend_w, u32 blend_h,
-	u32 bld_mode, u32 alpha_mode, u32 global_alpha, u32 premul_mode,
-	struct g2d_csc_state *csc_state);
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format, u32 src_x,
+	u32 src_y, u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma,
+	u32 dst_width, u32 dst_height, u32 dst_pitch, u32 dst_format, u32 dst_x,
+	u32 dst_y, dma_addr_t out_dma, u32 out_width, u32 out_height,
+	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
+	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
+	u32 premul_mode, struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot(
-	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma, u32 src_width,
-	u32 src_height, u32 src_pitch, u32 src_format, u32 src_crop_x,
-	u32 src_crop_y, u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma,
-	u32 dst_width, u32 dst_height, u32 dst_pitch, u32 dst_format,
-	u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags)
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format,
+	u32 src_crop_x, u32 src_crop_y, u32 src_crop_w, u32 src_crop_h,
+	dma_addr_t dst_dma, u32 dst_width, u32 dst_height, u32 dst_pitch,
+	u32 dst_format, u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags)
 {
 	struct g2d_rot_reg *rot_regs = NULL;
 	u32 rot_size = 0;
 	u32 rot_mode = 0;
 	int ret;
+
+	if (!g2d->rcq_enabled)
+		return -EOPNOTSUPP;
 
 	/* Map flags to ROT mode */
 	if (flags & G2D_BLIT_FLAG_ROTATE_90)
@@ -1586,35 +1618,76 @@ static int sunxi_g2d_do_blit_rot(
 	if (ret)
 		return ret;
 
-	/* Reset IRQ done */
-	atomic_set(&g2d->irq_done, 0);
+	if (!rcq || !rcq->vir_addr) {
+		kfree(rot_regs);
+		return -EINVAL;
+	}
 
-	/* Configure RCQ hardware registers (HEAD/LEN) before start */
+	sunxi_g2d_rcq_reset(rcq);
+
+	/* Configure RCQ buffer with single ROT block */
 	{
 		struct g2d_rcq_header *header;
-		u32 *cmd_buf = g2d->rcq.vir_addr;
-		dma_addr_t cmd_dma = g2d->rcq.phy_addr;
-		
-		/* Clear RCQ buffer */
-		memset(cmd_buf, 0, G2D_RCQ_MAX_SIZE);
-		
-		/* Create Header */
+		u32 *cmd_buf = rcq->vir_addr;
+		dma_addr_t cmd_dma = rcq->phy_addr;
+
+		memset(cmd_buf, 0, rcq->size);
+
 		header = (struct g2d_rcq_header *)cmd_buf;
-		header->low_addr = lower_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
+		header->low_addr =
+			lower_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
 		header->dw0.bits.len = rot_size;
-		header->dw0.bits.high_addr = upper_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
+		header->dw0.bits.high_addr =
+			upper_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
 		header->dirty.bits.dirty = 1;
 		header->dirty.bits.n_header_len = 0; /* Last block */
 		header->reg_offset = G2D_ROT; /* ROT base offset */
-		
-		/* Copy ROT block data */
-		memcpy(cmd_buf + (sizeof(struct g2d_rcq_header)/4), rot_regs, rot_size);
+
+		memcpy(cmd_buf + (sizeof(struct g2d_rcq_header) / 4), rot_regs,
+		       rot_size);
+
+		rcq->header_count = 1;
+		rcq->header_len_bytes = sizeof(struct g2d_rcq_header);
+		rcq->used = rcq->header_len_bytes + rot_size;
 	}
-	
+
 	kfree(rot_regs);
 
-	/* Start RCQ */
-	sunxi_g2d_rcq_setup_hw(g2d->base, &g2d->rcq);
+	return ret;
+}
+
+static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
+				 struct g2d_rcq_mem *rcq)
+{
+	volatile struct g2d_top_reg *g2d_top;
+	int ret = 0;
+
+	if (!g2d || !rcq || !rcq->vir_addr)
+		return -EINVAL;
+
+	if (!g2d->rcq_enabled)
+		return -EOPNOTSUPP;
+
+	g2d_top = (volatile struct g2d_top_reg *)g2d->base;
+
+	/* Reset RCQ/mixer block before launching a new task */
+	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+	wmb();
+	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+	wmb();
+
+	/* Prepare IRQ */
+	atomic_set(&g2d->irq_done, 0);
+	{
+		union g2d_rcq_irq_ctl irq_ctl;
+		irq_ctl.dwval = 0;
+		irq_ctl.bits.task_end_irq_en = 1;
+		g2d_write(g2d, G2D_RCQ_IRQ_CTL, irq_ctl.dwval);
+		wmb();
+	}
+
+	/* Program RCQ HEAD/LEN and start */
+	sunxi_g2d_rcq_setup_hw(g2d->base, rcq);
 	sunxi_g2d_rcq_start(g2d->base, false, true);
 	wmb();
 
@@ -1629,12 +1702,18 @@ static int sunxi_g2d_do_blit_rot(
 		if (wait_result <= 0) {
 			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
 			dev_err(g2d->dev,
-				"ROT_RCQ timeout or interrupted: %d\n", ret);
-			return ret;
+				"RCQ execution timeout or interrupted: %d\n",
+				ret);
 		}
 	}
-	
-	return 0;
+
+	/* Reset after completion to keep mixer clean for next task */
+	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+	wmb();
+	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+	wmb();
+
+	return ret;
 }
 
 /**
@@ -1678,232 +1757,9 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 	dev_dbg(g2d->dev, "job_worker: executing job=%p type=%d fence=%p\n",
 		job, job->type, job->fence);
 
-	/* Execute job based on type (HW will IRQ when done) */
-	switch (job->type) {
-	case G2D_JOB_FILLRECT:
-		/* Always use RCQ path for fillrect */
-		if (job->dst_sgt) {
-			dma_addr_t base_dma = sg_dma_address(job->dst_sgt->sgl);
-			u32 sgt_len = sg_dma_len(job->dst_sgt->sgl);
-			u64 offset = (u64)job->dst_dma - base_dma;
-			dev_dbg(g2d->dev,
-				"JOB_WORKER: dst_dma=0x%pad (base=0x%pad + offset=%llu) sgt_len=%u\n",
-				&job->dst_dma, &base_dma, offset, sgt_len);
-		}
-		ret = sunxi_g2d_do_fillrect_rcq(g2d, job->dst_dma,
-						job->data.fillrect.width,
-						job->data.fillrect.height,
-						job->data.fillrect.pitch,
-						job->data.fillrect.color,
-						job->data.fillrect.color_format,
-						job->data.fillrect.dst_format);
-		if (ret) {
-			dev_err(g2d->dev, "job_worker: fillrect failed: %d\n",
-				ret);
-			dma_fence_set_error(job->fence, ret);
-			dma_fence_signal(job->fence);
-
-			spin_lock_irqsave(&g2d->job_lock, flags);
-			g2d->current_job = NULL;
-			atomic64_inc(&g2d->jobs_failed);
-			spin_unlock_irqrestore(&g2d->job_lock, flags);
-
-			/* Cleanup and try next job */
-			queue_work(g2d->job_wq, &job->cleanup_work);
-			queue_work(g2d->job_wq, &g2d->job_work);
-		}
-		break;
-
-	case G2D_JOB_BLIT:
-		break;
-
-	case G2D_JOB_CMD_SCALE:
-		/* Scaling operation using VSU via RCQ (migrated from legacy MMIO)
-		 * This uses the new RCQ-based sunxi_g2d_do_scale_rcq() to avoid
-		 * MMIO interference with other RCQ operations (like G2D_CMD_COPY).
-		 * BSP pattern: Everything via RCQ, no mixed MMIO/RCQ operations.
-		 */
-		dev_dbg(
-			g2d->dev,
-			"job_worker: executing SCALE job src=%ux%u crop=%ux%u → dst=%ux%u\n",
-			job->data.blit.src_width, job->data.blit.src_height,
-			job->data.blit.src_crop_w, job->data.blit.src_crop_h,
-			job->data.blit.dst_w, job->data.blit.dst_h);
-		ret = sunxi_g2d_do_scale_rcq(
-			g2d, job->src_dma, job->data.blit.src_width,
-			job->data.blit.src_height, job->data.blit.src_pitch,
-			job->data.blit.src_format, job->data.blit.src_crop_x,
-			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->dst_dma,
-			job->data.blit.dst_width, job->data.blit.dst_height,
-			job->data.blit.dst_pitch, job->data.blit.dst_format,
-			job->data.blit.dst_x, job->data.blit.dst_y,
-			job->data.blit.dst_w, job->data.blit.dst_h,
-			job->data.blit.src_color_space,
-			job->data.blit.dst_color_space,
-			&job->csc_state);
-
-		if (ret < 0) {
-			dev_err(g2d->dev, "G2D_CMD_SCALE (RCQ) failed: %d\n",
-				ret);
-			dma_fence_set_error(job->fence, ret);
-			dma_fence_signal(job->fence);
-
-			spin_lock_irqsave(&g2d->job_lock, flags);
-			g2d->current_job = NULL;
-			atomic64_inc(&g2d->jobs_failed);
-			spin_unlock_irqrestore(&g2d->job_lock, flags);
-
-			queue_work(g2d->job_wq, &job->cleanup_work);
-			queue_work(g2d->job_wq, &g2d->job_work);
-		}
-		break;
-
-	case G2D_JOB_CMD_BLEND:
-		/* Alpha blending operation via RCQ - eliminates MMIO contamination
-		 * UI2 (foreground/src) + V0 (background/dst) → WB (out)
-		 */
-		ret = sunxi_g2d_do_blend_rcq(
-			g2d, job->src_dma, job->data.blit.src_width,
-			job->data.blit.src_height, job->data.blit.src_pitch,
-			job->data.blit.src_format, job->data.blit.src_crop_x,
-			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->dst_dma,
-			job->data.blit.dst_width, job->data.blit.dst_height,
-			job->data.blit.dst_pitch, job->data.blit.dst_format,
-			job->data.blit.dst_x, job->data.blit.dst_y,
-			job->out_dma, job->data.blit.out_width,
-			job->data.blit.out_height, job->data.blit.out_pitch,
-			job->data.blit.out_format, job->data.blit.dst_x,
-			job->data.blit
-				.dst_y, /* out_x/y = dst_x/y for in-place blend */
-			job->data.blit.dst_w,
-			job->data.blit.dst_h, /* blend region */
-			job->data.blit.bld_mode, job->data.blit.src_alpha_mode,
-			job->data.blit.src_alpha, job->data.blit.src_premul,
-			&job->csc_state);
-
-		if (ret < 0) {
-			dev_err(g2d->dev, "G2D_CMD_BLEND failed: %d\n", ret);
-			dma_fence_set_error(job->fence, ret);
-			dma_fence_signal(job->fence);
-
-			spin_lock_irqsave(&g2d->job_lock, flags);
-			g2d->current_job = NULL;
-			atomic64_inc(&g2d->jobs_failed);
-			spin_unlock_irqrestore(&g2d->job_lock, flags);
-
-			queue_work(g2d->job_wq, &job->cleanup_work);
-			queue_work(g2d->job_wq, &g2d->job_work);
-		}
-		break;
-
-	case G2D_JOB_CMD_ROTATE:
-		/* Rotation/flip operation using ROT block */
-		ret = sunxi_g2d_do_blit_rot(
-			g2d, job->src_dma, job->data.blit.src_width,
-			job->data.blit.src_height, job->data.blit.src_pitch,
-			job->data.blit.src_format, job->data.blit.src_crop_x,
-			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->dst_dma,
-			job->data.blit.dst_width, job->data.blit.dst_height,
-			job->data.blit.dst_pitch, job->data.blit.dst_format,
-			job->data.blit.dst_x, job->data.blit.dst_y,
-			job->data.blit.dst_w, job->data.blit.dst_h,
-			job->data.blit.flags);
-
-		if (ret < 0) {
-			dev_err(g2d->dev, "G2D_CMD_ROTATE failed: %d\n", ret);
-			dma_fence_set_error(job->fence, ret);
-			dma_fence_signal(job->fence);
-
-			spin_lock_irqsave(&g2d->job_lock, flags);
-			g2d->current_job = NULL;
-			atomic64_inc(&g2d->jobs_failed);
-			spin_unlock_irqrestore(&g2d->job_lock, flags);
-
-			queue_work(g2d->job_wq, &job->cleanup_work);
-			queue_work(g2d->job_wq, &g2d->job_work);
-		}
-		break;
-
-	case G2D_JOB_CMD_MASK:
-		/* Color keying / chromakey operation */
-		/* Using RCQ blend implementation */
-		ret = sunxi_g2d_do_blend_rcq(
-			g2d, job->src_dma, job->data.blit.src_width,
-			job->data.blit.src_height, job->data.blit.src_pitch,
-			job->data.blit.src_format, job->data.blit.src_crop_x,
-			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->dst_dma,
-			job->data.blit.dst_width, job->data.blit.dst_height,
-			job->data.blit.dst_pitch, job->data.blit.dst_format,
-			job->data.blit.dst_x, job->data.blit.dst_y,
-			job->dst_dma, /* out_dma = dst_dma (in-place) */
-			job->data.blit.dst_width, job->data.blit.dst_height,
-			job->data.blit.dst_pitch, job->data.blit.dst_format,
-			job->data.blit.dst_x, job->data.blit.dst_y,
-			job->data.blit.dst_w, job->data.blit.dst_h,
-			job->data.blit.bld_mode,
-			job->data.blit.src_alpha_mode,
-			job->data.blit.src_alpha,
-			job->data.blit.src_premul,
-			&g2d->csc_state);
-
-		if (ret < 0) {
-			dev_err(g2d->dev, "G2D_CMD_MASK failed: %d\n", ret);
-			dma_fence_set_error(job->fence, ret);
-			dma_fence_signal(job->fence);
-
-			spin_lock_irqsave(&g2d->job_lock, flags);
-			g2d->current_job = NULL;
-			atomic64_inc(&g2d->jobs_failed);
-			spin_unlock_irqrestore(&g2d->job_lock, flags);
-
-			queue_work(g2d->job_wq, &job->cleanup_work);
-			queue_work(g2d->job_wq, &g2d->job_work);
-		}
-		break;
-
-	case G2D_JOB_CMD_COPY:
-		/* Simple copy operation - no scaling, no blending, no rotation
-		 * Now using RCQ with modular builders instead of MMIO direct */
-
-		/* CRITICAL: Sync destination buffer for device write BEFORE G2D DMA
-		 * This ensures CPU caches are flushed and DRM scanout will see the data */
-		dma_sync_sg_for_device(g2d->dev, job->dst_sgt->sgl,
-				       job->dst_sgt->nents, DMA_FROM_DEVICE);
-		wmb();
-
-		ret = sunxi_g2d_do_blit_rcq(
-			g2d, job->src_dma, job->data.blit.src_width,
-			job->data.blit.src_height, job->data.blit.src_pitch,
-			job->data.blit.src_format, job->data.blit.src_crop_x,
-			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->dst_dma,
-			job->data.blit.dst_width, job->data.blit.dst_height,
-			job->data.blit.dst_pitch, job->data.blit.dst_format,
-			job->data.blit.dst_x, job->data.blit.dst_y,
-			job->data.blit.dst_w, job->data.blit.dst_h);
-
-		if (ret < 0) {
-			dev_err(g2d->dev, "G2D_CMD_COPY (RCQ) failed: %d\n",
-				ret);
-			dma_fence_set_error(job->fence, ret);
-			dma_fence_signal(job->fence);
-
-			spin_lock_irqsave(&g2d->job_lock, flags);
-			g2d->current_job = NULL;
-			atomic64_inc(&g2d->jobs_failed);
-			spin_unlock_irqrestore(&g2d->job_lock, flags);
-
-			queue_work(g2d->job_wq, &job->cleanup_work);
-			queue_work(g2d->job_wq, &g2d->job_work);
-		}
-		break;
-
-	default:
-		dev_err(g2d->dev, "job_worker: unknown job type %d\n",
+	if (!job->rcq_ready || !job->rcq.vir_addr) {
+		dev_err(g2d->dev,
+			"job_worker: RCQ not prepared for job type %d\n",
 			job->type);
 		dma_fence_set_error(job->fence, -EINVAL);
 		dma_fence_signal(job->fence);
@@ -1915,7 +1771,24 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 
 		queue_work(g2d->job_wq, &job->cleanup_work);
 		queue_work(g2d->job_wq, &g2d->job_work);
-		break;
+		return;
+	}
+
+	/* Execute RCQ */
+	ret = sunxi_g2d_execute_rcq(g2d, &job->rcq);
+
+	if (ret < 0) {
+		/* Signal failure and cleanup */
+		dma_fence_set_error(job->fence, ret);
+		dma_fence_signal(job->fence);
+
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		g2d->current_job = NULL;
+		atomic64_inc(&g2d->jobs_failed);
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+		queue_work(g2d->job_wq, &job->cleanup_work);
+		queue_work(g2d->job_wq, &g2d->job_work);
 	}
 
 	/* On success, HW is now running. IRQ handler will:
@@ -2504,13 +2377,12 @@ static void sunxi_g2d_get_yuv_plane_info(u32 fmt, u32 width, u32 height,
  * Returns 0 on success or negative error code.
  */
 static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
+				     struct g2d_rcq_mem *rcq,
 				     dma_addr_t dst_dma, u32 width, u32 height,
 				     u32 pitch, u32 color, u32 color_format,
 				     u32 dst_format)
 {
 	struct sunxi_g2d_rcq_frame_layout layout;
-	volatile struct g2d_top_reg *g2d_top;
-	volatile struct g2d_mixer_glb_reg *g2d_mixer;
 	int color_fmt_val, dst_fmt_val;
 	int ret;
 
@@ -2523,10 +2395,6 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 	struct g2d_mixer_bld_reg *bld_regs = NULL;
 	u32 bld_size;
 	u32 *wb_regs = NULL, wb_size;
-
-	g2d_top = (volatile struct g2d_top_reg *)g2d->base;
-	g2d_mixer =
-		(volatile struct g2d_mixer_glb_reg *)(g2d->base + G2D_MIXER);
 
 	/* Convert formats. For the fill color format we preserve the value
 	 * provided by the caller (UAPI `g2d_pixel_format`) and pass it through
@@ -2563,15 +2431,11 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 		dev_dbg(g2d->dev, "FILLRECT_RCQ: color swapped for XBGR framebuffer: 0x%08x\n", color);
 	}
 
-	if (!g2d->rcq_enabled || !g2d->rcq.vir_addr)
+	if (!g2d->rcq_enabled || !rcq || !rcq->vir_addr)
 		return -EOPNOTSUPP;
 
-	/* Reset RCQ buffer and hardware */
-	sunxi_g2d_rcq_reset(&g2d->rcq);
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
-	wmb();
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
-	wmb();
+	/* Reset RCQ buffer */
+	sunxi_g2d_rcq_reset(rcq);
 
 	/* ========== BUILD BLOCKS USING MODULAR FUNCTIONS ========== */
 
@@ -2661,7 +2525,7 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 
 	/* ========== PACK INTO RCQ BUFFER ========== */
 
-	ret = sunxi_g2d_rcq_pack_frame_7blocks(&g2d->rcq, &layout, v0_regs,
+	ret = sunxi_g2d_rcq_pack_frame_7blocks(rcq, &layout, v0_regs,
 					       u0_regs, u1_regs, u2_regs,
 					       scal_regs, bld_regs, wb_regs);
 	if (ret) {
@@ -2671,57 +2535,16 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 
 	dev_dbg(g2d->dev,
 		 "RCQ(modular) packed: headers=%u used=%u phy_addr=0x%pad\n",
-		 g2d->rcq.header_count, g2d->rcq.used, &g2d->rcq.phy_addr);
+		 rcq->header_count, rcq->used, &rcq->phy_addr);
 
 	/* DEBUG: Dump RCQ buffer contents when enabled */
 	if (g2d_rcq_debug) {
 		dev_dbg(g2d->dev,
 			 "RCQ(modular) full dump (%u headers, %u bytes):\n",
-			 g2d->rcq.header_count, g2d->rcq.used);
+			 rcq->header_count, rcq->used);
 		print_hex_dump(KERN_INFO, "RCQ: ", DUMP_PREFIX_OFFSET, 16, 4,
-			       g2d->rcq.vir_addr, g2d->rcq.used, false);
+			       rcq->vir_addr, rcq->used, false);
 	}
-
-	/* ========== EXECUTE RCQ ========== */
-
-	atomic_set(&g2d->irq_done, 0);
-	{
-		union g2d_rcq_irq_ctl irq_ctl;
-		irq_ctl.dwval = 0;
-		irq_ctl.bits.task_end_irq_en = 1;
-		g2d_write(g2d, G2D_RCQ_IRQ_CTL, irq_ctl.dwval);
-		wmb();
-	}
-
-	sunxi_g2d_rcq_setup_hw(g2d->base, &g2d->rcq);
-
-	/* Start RCQ and MIXER */
-	sunxi_g2d_rcq_start(g2d->base, false, true);
-	g2d_write(g2d, G2D_MIXER_CTL, G2D_MIXER_CTL_START);
-	wmb();
-
-	/* Wait for completion */
-	{
-		int timeout_jiffies = msecs_to_jiffies(100);
-		int wait_result;
-
-		wait_result = wait_event_interruptible_timeout(
-			g2d->irq_wait, atomic_read(&g2d->irq_done),
-			timeout_jiffies);
-		if (wait_result <= 0) {
-			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
-			dev_err(g2d->dev,
-				"RCQ(modular) timeout or interrupted: %d\n",
-				ret);
-			goto cleanup;
-		}
-	}
-
-	/* Reset after completion */
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
-	wmb();
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
-	wmb();
 
 	ret = 0;
 
@@ -3229,6 +3052,27 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	job->data.blit.dst_h = cmd.dst_h;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
 
+	ret = g2d_job_prepare_rcq(g2d, job);
+	if (ret)
+		goto err_free_job;
+
+	ret = sunxi_g2d_do_scale_rcq(
+		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
+		job->data.blit.src_height, job->data.blit.src_pitch,
+		job->data.blit.src_format, job->data.blit.src_crop_x,
+		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
+		job->data.blit.dst_height, job->data.blit.dst_pitch,
+		job->data.blit.dst_format, job->data.blit.dst_x,
+		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
+		job->data.blit.src_color_space, job->data.blit.dst_color_space,
+		&job->csc_state);
+	if (ret) {
+		sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+		goto err_free_job;
+	}
+	job->rcq_ready = true;
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -3266,7 +3110,19 @@ err_detach_src:
 	dma_buf_detach(src_dmabuf, src_attach);
 err_put_src:
 	dma_buf_put(src_dmabuf);
-	return ret;
+err_free_job:
+	if (!IS_ERR_OR_NULL(job)) {
+		if (job->rcq.vir_addr)
+			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+		g2d_job_free(g2d, job);
+	}
+	if (sync_file && sync_file->file)
+		fput(sync_file->file);
+	if (fence)
+		dma_fence_put(fence);
+	if (fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	goto err_unmap_dst;
 }
 
 /*
@@ -3536,6 +3392,30 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	job->data.blit.bld_mode = cmd.params.blend.bld_mode;
 
+	ret = g2d_job_prepare_rcq(g2d, job);
+	if (ret) {
+		goto err_free_job;
+	}
+
+	ret = sunxi_g2d_do_blend_rcq(
+		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
+		job->data.blit.src_height, job->data.blit.src_pitch,
+		job->data.blit.src_format, job->data.blit.src_crop_x,
+		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
+		job->data.blit.dst_height, job->data.blit.dst_pitch,
+		job->data.blit.dst_format, job->data.blit.dst_x,
+		job->data.blit.dst_y, job->out_dma, job->data.blit.out_width,
+		job->data.blit.out_height, job->data.blit.out_pitch,
+		job->data.blit.out_format, job->data.blit.dst_x,
+		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
+		job->data.blit.bld_mode, job->data.blit.src_alpha_mode,
+		job->data.blit.src_alpha, job->data.blit.src_premul,
+		&job->csc_state);
+	if (ret)
+		goto err_free_job;
+	job->rcq_ready = true;
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -3579,7 +3459,19 @@ err_detach_src:
 	dma_buf_detach(src_dmabuf, src_attach);
 err_put_src:
 	dma_buf_put(src_dmabuf);
-	return ret;
+err_free_job:
+	if (!IS_ERR_OR_NULL(job)) {
+		if (job->rcq.vir_addr)
+			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+		g2d_job_free(g2d, job);
+	}
+	if (sync_file && sync_file->file)
+		fput(sync_file->file);
+	if (fence)
+		dma_fence_put(fence);
+	if (fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	goto err_unmap_out;
 }
 
 /*
@@ -3778,6 +3670,26 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	job->data.blit.flags = flags;
 
+	ret = g2d_job_prepare_rcq(g2d, job);
+	if (ret)
+		goto err_free_job;
+
+	ret = sunxi_g2d_do_blit_rot(
+		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
+		job->data.blit.src_height, job->data.blit.src_pitch,
+		job->data.blit.src_format, job->data.blit.src_crop_x,
+		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
+		job->data.blit.dst_height, job->data.blit.dst_pitch,
+		job->data.blit.dst_format, job->data.blit.dst_x,
+		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
+		job->data.blit.flags);
+	if (ret) {
+		sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+		goto err_free_job;
+	}
+	job->rcq_ready = true;
+
 	/* Enqueue job to worker */
 	{
 		unsigned long iflags;
@@ -3817,7 +3729,19 @@ err_detach_src:
 	dma_buf_detach(src_dmabuf, src_attach);
 err_put_src:
 	dma_buf_put(src_dmabuf);
-	return ret;
+err_free_job:
+	if (!IS_ERR_OR_NULL(job)) {
+		if (job->rcq.vir_addr)
+			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+		g2d_job_free(g2d, job);
+	}
+	if (sync_file && sync_file->file)
+		fput(sync_file->file);
+	if (fence)
+		dma_fence_put(fence);
+	if (fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	goto err_unmap_dst;
 }
 
 /*
@@ -3943,6 +3867,27 @@ static long sunxi_g2d_cmd_fillrect(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.fillrect.color = cmd.params.fillrect.color;
 		job->data.fillrect.color_format = cmd.dst.format;
 		job->data.fillrect.dst_format = cmd.dst.format;
+
+		ret = g2d_job_prepare_rcq(g2d, job);
+		if (ret) {
+			dma_fence_put(job->fence);
+			kfree(job);
+			goto err_unmap_dst;
+		}
+
+		ret = sunxi_g2d_do_fillrect_rcq(
+			g2d, &job->rcq, job->dst_dma, job->data.fillrect.width,
+			job->data.fillrect.height, job->data.fillrect.pitch,
+			job->data.fillrect.color,
+			job->data.fillrect.color_format,
+			job->data.fillrect.dst_format);
+		if (ret) {
+			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+			dma_fence_put(job->fence);
+			kfree(job);
+			goto err_unmap_dst;
+		}
+		job->rcq_ready = true;
 
 		/* Store DMA-BUF references for cleanup */
 		job->dst_dmabuf = dst_dmabuf;
@@ -4227,6 +4172,29 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	/* Use SRCOVER blend mode for masking */
 	job->data.blit.bld_mode = G2D_BLD_SRCOVER;
 
+	ret = g2d_job_prepare_rcq(g2d, job);
+	if (ret)
+		goto err_free_job;
+
+	ret = sunxi_g2d_do_blend_rcq(
+		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
+		job->data.blit.src_height, job->data.blit.src_pitch,
+		job->data.blit.src_format, job->data.blit.src_crop_x,
+		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
+		job->data.blit.dst_height, job->data.blit.dst_pitch,
+		job->data.blit.dst_format, job->data.blit.dst_x,
+		job->data.blit.dst_y, job->out_dma, job->data.blit.out_width,
+		job->data.blit.out_height, job->data.blit.out_pitch,
+		job->data.blit.out_format, job->data.blit.dst_x,
+		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
+		job->data.blit.bld_mode, job->data.blit.src_alpha_mode,
+		job->data.blit.src_alpha, job->data.blit.src_premul,
+		&job->csc_state);
+	if (ret)
+		goto err_free_job;
+	job->rcq_ready = true;
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -4275,7 +4243,19 @@ err_detach_src:
 	dma_buf_detach(src_dmabuf, src_attach);
 err_put_src:
 	dma_buf_put(src_dmabuf);
-	return ret;
+err_free_job:
+	if (!IS_ERR_OR_NULL(job)) {
+		if (job->rcq.vir_addr)
+			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+		g2d_job_free(g2d, job);
+	}
+	if (sync_file && sync_file->file)
+		fput(sync_file->file);
+	if (fence)
+		dma_fence_put(fence);
+	if (fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	goto err_unmap_out;
 }
 
 /*
@@ -4452,6 +4432,24 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	job->data.blit.dst_h = cmd.dst_h;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
 
+	ret = g2d_job_prepare_rcq(g2d, job);
+	if (ret) {
+		goto err_free_job;
+	}
+
+	ret = sunxi_g2d_do_blit_rcq(
+		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
+		job->data.blit.src_height, job->data.blit.src_pitch,
+		job->data.blit.src_format, job->data.blit.src_crop_x,
+		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
+		job->data.blit.dst_height, job->data.blit.dst_pitch,
+		job->data.blit.dst_format, job->data.blit.dst_x,
+		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h);
+	if (ret)
+		goto err_free_job;
+	job->rcq_ready = true;
+
 	/* Enqueue job to worker */
 	{
 		unsigned long flags;
@@ -4489,7 +4487,19 @@ err_detach_src:
 	dma_buf_detach(src_dmabuf, src_attach);
 err_put_src:
 	dma_buf_put(src_dmabuf);
-	return ret;
+err_free_job:
+	if (!IS_ERR_OR_NULL(job)) {
+		if (job->rcq.vir_addr)
+			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+		g2d_job_free(g2d, job);
+	}
+	if (sync_file && sync_file->file)
+		fput(sync_file->file);
+	if (fence)
+		dma_fence_put(fence);
+	if (fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	goto err_unmap_dst;
 }
 
 /**
@@ -4498,7 +4508,8 @@ err_put_src:
  * RCQ version of simple copy/blit operation (no scaling, no rotation).
  * Uses builder functions for V0 (memory source), BLD (simple copy), and WB (output).
  */
-static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
+				 struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
 				 u32 src_width, u32 src_height, u32 src_pitch,
 				 u32 src_format, u32 src_x, u32 src_y,
 				 u32 src_crop_w, u32 src_crop_h,
@@ -4507,8 +4518,6 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h)
 {
 	struct sunxi_g2d_rcq_frame_layout layout;
-	volatile struct g2d_top_reg *g2d_top;
-	volatile struct g2d_mixer_glb_reg *g2d_mixer;
 	int src_fmt_val, dst_fmt_val;
 	int ret;
 	u32 src_bpp, dst_bpp;
@@ -4523,10 +4532,6 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 	u32 *scal_regs = NULL, scal_size = 0;
 	u32 *scal_en_regs = NULL, scal_en_size = 0;
 	u32 *wb_regs = NULL, wb_size;
-
-	g2d_top = (volatile struct g2d_top_reg *)g2d->base;
-	g2d_mixer =
-		(volatile struct g2d_mixer_glb_reg *)(g2d->base + G2D_MIXER);
 
 	/* Convert formats */
 	src_fmt_val = sunxi_g2d_format_to_hw(src_format, &src_bpp);
@@ -4582,15 +4587,11 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 			&src_dma, &dst_dma, src_pitch, dst_pitch);
 	}
 
-	if (!g2d->rcq_enabled || !g2d->rcq.vir_addr)
+	if (!g2d->rcq_enabled || !rcq || !rcq->vir_addr)
 		return -EOPNOTSUPP;
 
-	/* Reset RCQ buffer and hardware */
-	sunxi_g2d_rcq_reset(&g2d->rcq);
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
-	wmb();
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
-	wmb();
+	/* Reset RCQ buffer for this job */
+	sunxi_g2d_rcq_reset(rcq);
 
 	/* Keep destination base; positioning is handled via BLD mem_coor */
 	dma_addr_t dst_offset_dma;
@@ -4861,10 +4862,10 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 		       layout.blocks[__i].dirty);
 	}
 
-	ret = sunxi_g2d_rcq_pack_frame_8blocks(&g2d->rcq, &layout, v0_regs,
-			       u0_regs, u1_regs, u2_regs,
-			       scal_regs, scal_en_regs,
-			       bld_regs, wb_regs);
+	ret = sunxi_g2d_rcq_pack_frame_8blocks(rcq, &layout, v0_regs, u0_regs,
+					       u1_regs, u2_regs, scal_regs,
+					       scal_en_regs, bld_regs,
+					       wb_regs);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to pack RCQ frame: %d\n", ret);
 		goto cleanup;
@@ -4875,8 +4876,7 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 		dev_dbg(
 			g2d->dev,
 			"BLIT_RCQ packed: headers=%u used=%u phy_addr=0x%pad\n",
-			g2d->rcq.header_count, g2d->rcq.used,
-			&g2d->rcq.phy_addr);
+			rcq->header_count, rcq->used, &rcq->phy_addr);
 
 		/* Dump V0 block data */
 		dev_dbg(g2d->dev, "V0 block: size=%u bytes\n", v0_size);
@@ -4895,86 +4895,10 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 
 		dev_dbg(g2d->dev,
 			 "BLIT_RCQ full dump (%u headers, %u bytes):\n",
-			 g2d->rcq.header_count, g2d->rcq.used);
+			 rcq->header_count, rcq->used);
 		print_hex_dump(KERN_INFO, "RCQ: ", DUMP_PREFIX_OFFSET, 16, 4,
-			       g2d->rcq.vir_addr, g2d->rcq.used, false);
+			       rcq->vir_addr, rcq->used, false);
 	}
-
-	/* ========== EXECUTE RCQ ========== */
-
-	atomic_set(&g2d->irq_done, 0);
-	{
-		union g2d_rcq_irq_ctl irq_ctl;
-		irq_ctl.dwval = 0;
-		irq_ctl.bits.task_end_irq_en = 1;
-		g2d_write(g2d, G2D_RCQ_IRQ_CTL, irq_ctl.dwval);
-		wmb();
-	}
-
-	/* BSP pattern: MIXER global registers setup
-	 * MIXER_SIZE format: (height-1) << 16 | (width-1)
-	 * CRITICAL: These must match the BLD output size (region being copied)
-	 */
-	u32 mixer_size_val = ((dst_w - 1) & 0x1FFF) |
-			     (((dst_h - 1) & 0x1FFF) << 16);
-
-	if (g2d_rcq_debug) {
-		dev_dbg(g2d->dev,
-			 "RCQ READY: dst_w=%u dst_h=%u size_val=0x%08x\n",
-			 dst_w, dst_h, mixer_size_val);
-		dev_dbg(
-			g2d->dev,
-			"RCQ READY: dst_offset_dma=0x%pad (base=0x%pad + y=%u * pitch=%u + x=%u * bpp=%u)\n",
-			&dst_offset_dma, &dst_dma, dst_y, dst_pitch, dst_x,
-			dst_bpp);
-	}
-
-	/* BSP pattern (g2d_mixer_apply): NO MMIO operations when using RCQ!
-	 * Everything is configured via RCQ blocks:
-	 * - V0 block: source configuration
-	 * - BLD block: blending, CSC, sizes (BLD_SIZE, OUT_SIZE all in RCQ)
-	 * - WB block: writeback configuration
-	 * 
-	 * The BSP does NOT write:
-	 * - MIXER_CTL (no reset, no start)
-	 * - MIXER_SIZE (configured in BLD block OUT_SIZE register)
-	 * - BLD_SIZE (configured in BLD block)
-	 * 
-	 * Only RCQ control registers are touched:
-	 * - g2d_top_rcq_update_en(0) → disable updates
-	 * - g2d_top_set_rcq_head() → set DMA address
-	 * - g2d_top_rcq_irq_en(1) → enable IRQ
-	 * - g2d_top_rcq_update_en(1) → START (this triggers everything)
-	 */
-
-	/* Configure RCQ hardware registers (HEAD/LEN) before start */
-	sunxi_g2d_rcq_setup_hw(g2d->base, &g2d->rcq);
-
-	/* Start RCQ: This will process all blocks and trigger MIXER automatically */
-	sunxi_g2d_rcq_start(g2d->base, false, true);
-	wmb();
-
-	/* Wait for completion */
-	{
-		int timeout_jiffies = msecs_to_jiffies(100);
-		int wait_result;
-
-		wait_result = wait_event_interruptible_timeout(
-			g2d->irq_wait, atomic_read(&g2d->irq_done),
-			timeout_jiffies);
-		if (wait_result <= 0) {
-			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
-			dev_err(g2d->dev,
-				"BLIT_RCQ timeout or interrupted: %d\n", ret);
-			goto cleanup;
-		}
-	}
-
-	/* Reset after completion */
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
-	wmb();
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
-	wmb();
 
 	ret = 0;
 
@@ -5005,7 +4929,8 @@ cleanup:
  *   Block 2: SCAL (active VSU scaler)
  *   Block 3: WB (writeback output)
  */
-static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
+static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
+				  struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
 				  u32 src_width, u32 src_height, u32 src_pitch,
 				  u32 src_format, u32 src_x, u32 src_y,
 				  u32 src_crop_w, u32 src_crop_h,
@@ -5016,7 +4941,6 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 				  struct g2d_csc_state *csc_state)
 {
 	struct sunxi_g2d_rcq_frame_layout layout;
-	volatile struct g2d_top_reg *g2d_top;
 	int src_fmt_val, dst_fmt_val;
 	int ret;
 	u32 src_bpp, dst_bpp;
@@ -5032,8 +4956,6 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 	u32 *scal_regs = NULL, scal_size;
 	u32 *scal_en_regs = NULL, scal_en_size;
 	u32 *wb_regs = NULL, wb_size;
-
-	g2d_top = (volatile struct g2d_top_reg *)g2d->base;
 
 	/* Convert formats */
 	src_fmt_val = sunxi_g2d_format_to_hw(src_format, &src_bpp);
@@ -5085,15 +5007,11 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 			 src_crop_w, src_crop_h, dst_w, dst_h);
 	}
 
-	if (!g2d->rcq_enabled || !g2d->rcq.vir_addr)
+	if (!g2d->rcq_enabled || !rcq || !rcq->vir_addr)
 		return -EOPNOTSUPP;
 
-	/* Reset RCQ buffer and hardware */
-	sunxi_g2d_rcq_reset(&g2d->rcq);
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
-	wmb();
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
-	wmb();
+	/* Reset RCQ buffer */
+	sunxi_g2d_rcq_reset(rcq);
 
 	/* Keep destination base; positioning is handled via BLD mem_coor */
 	/* dma_addr_t dst_offset_dma = dst_dma; */ /* Unused */
@@ -5263,10 +5181,9 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 	layout.blocks[7].dirty = 1;
 
 	/* ========== PACK INTO RCQ BUFFER ========== */
-	ret = sunxi_g2d_rcq_pack_frame_8blocks(&g2d->rcq, &layout, v0_regs,
-					       u0_regs, u1_regs, u2_regs,
-					       scal_regs, scal_en_regs,
-					       bld_regs, wb_regs);
+	ret = sunxi_g2d_rcq_pack_frame_8blocks(rcq, &layout, v0_regs, u0_regs,
+					       u1_regs, u2_regs, scal_regs,
+					       scal_en_regs, bld_regs, wb_regs);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to pack RCQ frame: %d\n", ret);
 		goto cleanup;
@@ -5277,8 +5194,7 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 		dev_dbg(
 			g2d->dev,
 			"SCALE_RCQ packed: headers=%u used=%u phy_addr=0x%pad\n",
-			g2d->rcq.header_count, g2d->rcq.used,
-			&g2d->rcq.phy_addr);
+			rcq->header_count, rcq->used, &rcq->phy_addr);
 
 		dev_dbg(g2d->dev, "V0 block: size=%u bytes\n", v0_size);
 		print_hex_dump(KERN_INFO, "V0: ", DUMP_PREFIX_OFFSET, 16, 4,
@@ -5296,46 +5212,6 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d, dma_addr_t src_dma,
 		print_hex_dump(KERN_INFO, "WB: ", DUMP_PREFIX_OFFSET, 16, 4,
 			       wb_regs, wb_size, false);
 	}
-
-	/* ========== EXECUTE RCQ ========== */
-
-	atomic_set(&g2d->irq_done, 0);
-	{
-		union g2d_rcq_irq_ctl irq_ctl;
-		irq_ctl.dwval = 0;
-		irq_ctl.bits.task_end_irq_en = 1;
-		g2d_write(g2d, G2D_RCQ_IRQ_CTL, irq_ctl.dwval);
-		wmb();
-	}
-
-	/* Configure RCQ hardware registers (HEAD/LEN) before start */
-	sunxi_g2d_rcq_setup_hw(g2d->base, &g2d->rcq);
-
-	/* Start RCQ: This will process all blocks and trigger MIXER automatically */
-	sunxi_g2d_rcq_start(g2d->base, false, true);
-	wmb();
-
-	/* Wait for completion */
-	{
-		int timeout_jiffies = msecs_to_jiffies(100);
-		int wait_result;
-
-		wait_result = wait_event_interruptible_timeout(
-			g2d->irq_wait, atomic_read(&g2d->irq_done),
-			timeout_jiffies);
-		if (wait_result <= 0) {
-			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
-			dev_err(g2d->dev,
-				"SCALE_RCQ timeout or interrupted: %d\n", ret);
-			goto cleanup;
-		}
-	}
-
-	/* Reset after completion */
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
-	wmb();
-	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
-	wmb();
 
 	ret = 0;
 
@@ -5395,14 +5271,14 @@ static u32 sunxi_g2d_swap_blend_mode(u32 mode)
  * register contamination affecting subsequent RCQ operations.
  */
 static int sunxi_g2d_do_blend_rcq(
-	struct sunxi_g2d_dev *g2d, dma_addr_t src_dma, u32 src_width,
-	u32 src_height, u32 src_pitch, u32 src_format, u32 src_x, u32 src_y,
-	u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma, u32 dst_width,
-	u32 dst_height, u32 dst_pitch, u32 dst_format, u32 dst_x, u32 dst_y,
-	dma_addr_t out_dma, u32 out_width, u32 out_height, u32 out_pitch,
-	u32 out_format, u32 out_x, u32 out_y, u32 blend_w, u32 blend_h,
-	u32 bld_mode, u32 alpha_mode, u32 global_alpha, u32 premul_mode,
-	struct g2d_csc_state *csc_state)
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format, u32 src_x,
+	u32 src_y, u32 src_crop_w, u32 src_crop_h, dma_addr_t dst_dma,
+	u32 dst_width, u32 dst_height, u32 dst_pitch, u32 dst_format, u32 dst_x,
+	u32 dst_y, dma_addr_t out_dma, u32 out_width, u32 out_height,
+	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
+	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
+	u32 premul_mode, struct g2d_csc_state *csc_state)
 {
 	struct g2d_mixer_ovl_u_reg *ui2_regs = NULL; /* Foreground (src) */
 	struct g2d_mixer_ovl_v_reg *v0_regs = NULL; /* Background (dst) */
@@ -5752,16 +5628,18 @@ static int sunxi_g2d_do_blend_rcq(
 
 	/* ========== PACK INTO RCQ BUFFER ========== */
 	if (needs_scaling) {
-		ret = sunxi_g2d_rcq_pack_frame_8blocks(&g2d->rcq, &layout,
-						       (u32 *)v0_regs, u0_regs, u1_regs,
-						       (u32 *)ui2_regs, scal_regs,
-						       scal_en_regs,
-						       (u32 *)bld_regs, (u32 *)wb_regs);
+		ret = sunxi_g2d_rcq_pack_frame_8blocks(rcq, &layout,
+						       (u32 *)v0_regs, u0_regs,
+						       u1_regs, (u32 *)ui2_regs,
+						       scal_regs, scal_en_regs,
+						       (u32 *)bld_regs,
+						       (u32 *)wb_regs);
 	} else {
-		ret = sunxi_g2d_rcq_pack_frame_7blocks(&g2d->rcq, &layout,
-						       (u32 *)v0_regs, u0_regs, u1_regs,
-						       (u32 *)ui2_regs, scal_regs,
-						       (u32 *)bld_regs, (u32 *)wb_regs);
+		ret = sunxi_g2d_rcq_pack_frame_7blocks(rcq, &layout,
+						       (u32 *)v0_regs, u0_regs,
+						       u1_regs, (u32 *)ui2_regs,
+						       scal_regs, (u32 *)bld_regs,
+						       (u32 *)wb_regs);
 	}
 	
 	if (ret) {
@@ -5772,43 +5650,9 @@ static int sunxi_g2d_do_blend_rcq(
 
 	dev_dbg(g2d->dev,
 		"BLEND_RCQ packed: headers=%u used=%u phy_addr=0x%llx\n",
-		g2d->rcq.header_count, g2d->rcq.used, (u64)g2d->rcq.phy_addr);
+		rcq->header_count, rcq->used, (u64)rcq->phy_addr);
 
-	/* ========== EXECUTE RCQ ========== */
-
-	atomic_set(&g2d->irq_done, 0);
-	{
-		union g2d_rcq_irq_ctl irq_ctl;
-		irq_ctl.dwval = 0;
-		irq_ctl.bits.task_end_irq_en = 1;
-		g2d_write(g2d, G2D_RCQ_IRQ_CTL, irq_ctl.dwval);
-		wmb();
-	}
-
-	/* Configure RCQ hardware registers (HEAD/LEN) before start */
-	sunxi_g2d_rcq_setup_hw(g2d->base, &g2d->rcq);
-
-	/* Start RCQ: This will process all blocks and trigger MIXER automatically */
-	sunxi_g2d_rcq_start(g2d->base, false, true);
-	wmb();
-
-	/* Wait for completion */
-	{
-		int timeout_jiffies = msecs_to_jiffies(100);
-		int wait_result;
-
-		wait_result = wait_event_interruptible_timeout(
-			g2d->irq_wait, atomic_read(&g2d->irq_done),
-			timeout_jiffies);
-		if (wait_result <= 0) {
-			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
-			dev_err(g2d->dev,
-				"BLEND_RCQ timeout or interrupted: %d\n", ret);
-			goto cleanup;
-		}
-	}
-
-	dev_dbg(g2d->dev, "BLEND_RCQ: completed successfully\n");
+	dev_dbg(g2d->dev, "BLEND_RCQ: prepared successfully\n");
 	ret = 0;
 
 cleanup:

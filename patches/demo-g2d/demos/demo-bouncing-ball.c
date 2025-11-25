@@ -54,6 +54,17 @@ static volatile int keep_running = 1;
  */
 static int pattern_mode = 0;
 
+/* Select pipeline: 0 = existing multi-step pipeline (scale then blend),
+ * 1 = single BLEND command that performs scaling + blending in one step
+ * Use command-line flag `--single-blend` to enable the single-blend pipeline.
+ */
+static int use_single_blend = 0;
+
+/* One frame Mode: if set to 1, run only one frame and exit.
+ * Use --oneframe on the command line.
+ */
+static int one_frame_mode = 0;
+
 void sigint_handler(int sig)
 {
 	(void)sig;
@@ -114,12 +125,12 @@ static int g2d_write_buffer(int g2d_fd, int dma_fd, void *data, size_t size,
 
 	printf("DEBUG: About to call ioctl(G2D_IOC_WRITE_BUFFER)\n");
 	fflush(stdout);
-	
+
 	int ret = ioctl(g2d_fd, G2D_IOC_WRITE_BUFFER, &rw);
-	
+
 	printf("DEBUG: ioctl returned ret=%d\n", ret);
 	fflush(stdout);
-	
+
 	if (ret < 0) {
 		perror("G2D_IOC_WRITE_BUFFER");
 		return ret;
@@ -127,7 +138,7 @@ static int g2d_write_buffer(int g2d_fd, int dma_fd, void *data, size_t size,
 
 	printf("DEBUG: g2d_write_buffer returning 0\n");
 	fflush(stdout);
-	
+
 	return 0;
 }
 
@@ -160,90 +171,157 @@ static int g2d_read_buffer(int g2d_fd, int dma_fd, void *data, size_t size,
  * Step 2b: ALPHA_BLEND ball_yuv (YUV) + temp → temp with scaling
  * Step 3: BLIT temp_buffer → framebuffer (final display)
  */
-/* Revised pipeline to avoid in-place BLEND flicker:
- * We now use a distinct BLEND output buffer (blend_dma_fd) different from the
- * destination/background read buffer (temp_dma_fd). Hardware G2D in-place
- * read+write (dst == out) has been observed to produce intermittent frames
- * missing the foreground (ball) under certain mixer/reset sequences.
- *
- * New pipeline:
- *   Step 1: COPY bg -> temp          (background copy)
- *   Step 2a: SCALE ball -> comp      (scaled ball with preserved alpha)
- *   Step 2b: BLEND comp + temp -> blend  (distinct output buffer)
- *   Step 3: COPY blend -> framebuffer (final scanout)
+/* FIXED pipeline to eliminate flickering caused by stale buffer reuse:
+ * Previous version reused temp buffer between frames causing cache coherency issues.
+ * 
+ * Corrected pipeline (4 steps, no buffer reuse between frames):
+ *   Step 1: SCALE ball -> comp       (scaled ball with preserved alpha)
+ *   Step 2: COPY bg -> blend         (FRESH background from immutable gradient)
+ *   Step 3: BLEND comp + blend -> blend (alpha composite at ball position)
+ *   Step 4: COPY blend -> framebuffer (final scanout to DRM backbuffer)
  */
 int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
-	       int ball_dma_fd, int temp_dma_fd,
-	       int comp_dma_fd, int blend_dma_fd, int fb_dma_fd,
-	       int x, int y, int radius, int ball_buffer_size)
+		       int ball_dma_fd, int temp_dma_fd, int comp_dma_fd,
+		       int blend_dma_fd, int fb_dma_fd, int x, int y,
+		       int radius, int ball_buffer_size)
 {
 	int ret;
 	int ball_size = radius * 2;
 
-	int backbuffer_y_offset = drm_get_backbuffer_offset(disp) / disp->pitch;
+	int backbuffer_y_offset =
+		drm_get_backbuffer_offset(disp); // / disp->pitch;
 
-	/* CORRECT PIPELINE: Two-step process for safe blending
+	/* FIXED PIPELINE: Avoid stale temp buffer causing flickering
 	 * 
 	 * Pipeline:
-	 * Step 1: BLIT bg → temp (copy full background)
-	 * Step 2: BLIT ball (ARGB src) + temp (XRGB dst) → temp (XRGB out) with scaling+blending at (x,y)
-	 *         - Read from temp at ball region (dst)
-	 *         - Write to temp at ball region (out)
-	 *         - Driver internally: scales ball from 110×110 to ball_size
-	 *         - Driver internally: blends scaled ball over background region
-	 * Step 3: BLIT temp → framebuffer (simple copy)
-	 * 
-	 * Key: After Step 1, temp has full background. In Step 2, we read temp region and write temp region
-	 * at the SAME location, but driver handles this correctly with 3-buffer mode.
+	 * Step 1: SCALE ball → comp (scale ball to target size with alpha)
+	 * Step 2: COPY bg → blend (FRESH background every frame, avoid stale temp!)
+	 * Step 3: BLEND comp + blend → blend (alpha composite at (x,y))
+	 * Step 4: COPY blend → framebuffer (final scanout)
 	 */
 
 	/* Simple bounds check - skip rendering if ball would go outside screen */
-	if (x < 0 || y < 0 || x + ball_size > (int)disp->width || 
+	if (x < 0 || y < 0 || x + ball_size > (int)disp->width ||
 	    y + ball_size > (int)disp->height) {
-		return 0;  /* Ball partially off-screen, skip this frame */
+		return 0; /* Ball partially off-screen, skip this frame */
 	}
 
-	/* Step 1: CMD_COPY bg → temp (copy full background first) */
-	struct g2d_cmd cmd_bg = { 0 };
-	cmd_bg.cmd_type = G2D_CMD_COPY;
-
-	cmd_bg.src.width = disp->width;
-	cmd_bg.src.height = disp->height;
-	cmd_bg.src.format = G2D_FMT_XRGB8888;
-	cmd_bg.src.stride[0] = disp->width * 4;
-	cmd_bg.src.dma_fd = bg_dma_fd;
-	cmd_bg.src.crop_x = 0;
-	cmd_bg.src.crop_y = 0;
-	cmd_bg.src.crop_w = disp->width;
-	cmd_bg.src.crop_h = disp->height;
-
-	cmd_bg.dst.width = disp->width;
-	cmd_bg.dst.height = disp->height;
-	cmd_bg.dst.format = G2D_FMT_XRGB8888;
-	cmd_bg.dst.stride[0] = disp->width * 4;
-	cmd_bg.dst.dma_fd = temp_dma_fd;
-
-	cmd_bg.dst_x = 0;
-	cmd_bg.dst_y = 0;
-	cmd_bg.dst_w = disp->width;
-	cmd_bg.dst_h = disp->height;
-
-	cmd_bg.fence_fd_in = -1;
-	cmd_bg.fence_fd_out = -1;
-
-	ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_bg);
-	if (ret < 0) {
-		perror("G2D_IOC_CMD (COPY: bg → temp)");
-		return -1;
-	}
-
-	sync_wait_and_close(cmd_bg.fence_fd_out, "CMD_COPY bg→temp");
-
-	/* Step 2a: CMD_SCALE ball → comp (scale ball to target size first) */
+	/* Step 1: CMD_SCALE ball → comp (scale ball to target size first) */
 	struct g2d_cmd cmd_scale_ball = { 0 };
 	cmd_scale_ball.cmd_type = G2D_CMD_SCALE;
 
-	/* Source: original ball texture (ARGB with radial alpha) */
+	/* If user requested the single BLEND pipeline, skip the separate SCALE + BLEND
+	 * path and instead perform a fresh background copy followed by a single
+	 * BLEND command that reads the original ball texture and scales it into
+	 * the destination region while compositing (driver will route through VSU).
+	 */
+	if (use_single_blend) {
+		/* Step A: CMD_COPY bg → blend (fresh background copy) */
+		{
+			struct g2d_cmd cmd_bg_copy = { 0 };
+			cmd_bg_copy.cmd_type = G2D_CMD_COPY;
+
+			cmd_bg_copy.src.width = disp->width;
+			cmd_bg_copy.src.height = disp->height;
+			cmd_bg_copy.src.format = G2D_FMT_ARGB8888;
+			cmd_bg_copy.src.stride[0] = disp->width * 4;
+			cmd_bg_copy.src.dma_fd = bg_dma_fd;
+			cmd_bg_copy.src.crop_x = 0;
+			cmd_bg_copy.src.crop_y = 0;
+			cmd_bg_copy.src.crop_w = disp->width;
+			cmd_bg_copy.src.crop_h = disp->height;
+
+			cmd_bg_copy.dst.width = disp->width;
+			cmd_bg_copy.dst.height = disp->height;
+			cmd_bg_copy.dst.format = G2D_FMT_ARGB8888;
+			cmd_bg_copy.dst.stride[0] = disp->width * 4;
+			cmd_bg_copy.dst.dma_fd = blend_dma_fd;
+			cmd_bg_copy.dst_x = 0;
+			cmd_bg_copy.dst_y = 0;
+			cmd_bg_copy.dst_w = disp->width;
+			cmd_bg_copy.dst_h = disp->height;
+			cmd_bg_copy.fence_fd_in = -1;
+			cmd_bg_copy.fence_fd_out = -1;
+
+			ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_bg_copy);
+			if (ret < 0) {
+				perror("G2D_IOC_CMD (COPY: bg → blend)");
+				return -1;
+			}
+			sync_wait_and_close(cmd_bg_copy.fence_fd_out,
+					    "CMD_COPY bg→blend");
+		}
+
+		/* Step B: Single BLEND that performs scaling + compositing in one command */
+		{
+			struct g2d_cmd cmd_blend_single = { 0 };
+			cmd_blend_single.cmd_type = G2D_CMD_BLEND;
+
+			/* Source: original ball texture (driver will scale this into dst region) */
+			cmd_blend_single.src.width = ball_buffer_size;
+			cmd_blend_single.src.height = ball_buffer_size;
+			cmd_blend_single.src.format = G2D_FMT_ARGB8888;
+			cmd_blend_single.src.stride[0] = ball_buffer_size * 4;
+			cmd_blend_single.src.dma_fd = ball_dma_fd;
+			cmd_blend_single.src.crop_x = 0;
+			cmd_blend_single.src.crop_y = 0;
+			cmd_blend_single.src.crop_w = ball_buffer_size;
+			cmd_blend_single.src.crop_h = ball_buffer_size;
+			/* Source texture uses straight (non-premultiplied) ARGB8888
+			 * (created above as (A<<24)|(R<<16)|(G<<8)|B), so set global
+			 * alpha to 255 and mark premul mode as NONE. Per-pixel alpha
+			 * will be used for blending.
+			 */
+			cmd_blend_single.src.alpha = 255;
+			cmd_blend_single.src.alpha_mode = G2D_PIXEL_ALPHA;
+			cmd_blend_single.src.premul_mode = G2D_PREMUL_NONE;
+
+			/* Destination READ: read the region of the background where the ball will be composited */
+			cmd_blend_single.dst.width = disp->width;
+			cmd_blend_single.dst.height = disp->height;
+			cmd_blend_single.dst.format = G2D_FMT_ARGB8888;
+			cmd_blend_single.dst.stride[0] = disp->width * 4;
+			cmd_blend_single.dst.dma_fd = blend_dma_fd;
+			cmd_blend_single.dst.crop_x = x;
+			cmd_blend_single.dst.crop_y = y;
+			cmd_blend_single.dst.crop_w =
+				ball_size; /* desired output size */
+			cmd_blend_single.dst.crop_h = ball_size;
+			cmd_blend_single.dst.alpha = 255;
+			cmd_blend_single.dst.alpha_mode = G2D_GLOBAL_ALPHA;
+			cmd_blend_single.dst.premul_mode = G2D_PREMUL_NONE;
+
+			/* Output: write in-place to blend buffer */
+			cmd_blend_single.out.width = disp->width;
+			cmd_blend_single.out.height = disp->height;
+			cmd_blend_single.out.format = G2D_FMT_ARGB8888;
+			cmd_blend_single.out.stride[0] = disp->width * 4;
+			cmd_blend_single.out.dma_fd = blend_dma_fd;
+
+			/* Destination position and size (this is the 'dst' size for scaling) */
+			cmd_blend_single.dst_x = x;
+			cmd_blend_single.dst_y = y;
+			cmd_blend_single.dst_w = ball_size;
+			cmd_blend_single.dst_h = ball_size;
+
+			cmd_blend_single.params.blend.bld_mode =
+				G2D_BLD_SRCOVER;
+			cmd_blend_single.fence_fd_in = -1;
+			cmd_blend_single.fence_fd_out = -1;
+
+			ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_blend_single);
+			if (ret < 0) {
+				perror("G2D_IOC_CMD (BLEND single-step scaling+blend)");
+				return -1;
+			}
+			sync_wait_and_close(cmd_blend_single.fence_fd_out,
+					    "CMD_BLEND single-scale+blend");
+		}
+
+		/* After single blend, jump to final copy to framebuffer */
+		goto do_copy;
+	}
+	/* Source: original ball texture */
 	cmd_scale_ball.src.width = ball_buffer_size;
 	cmd_scale_ball.src.height = ball_buffer_size;
 	cmd_scale_ball.src.format = G2D_FMT_ARGB8888;
@@ -254,17 +332,19 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 	cmd_scale_ball.src.crop_w = ball_buffer_size;
 	cmd_scale_ball.src.crop_h = ball_buffer_size;
 
-	/* Destination: composition buffer at scaled size (ARGB to preserve alpha) */
-	cmd_scale_ball.dst.width = ball_size;
-	cmd_scale_ball.dst.height = ball_size;
-	cmd_scale_ball.dst.format = G2D_FMT_ARGB8888;
-	cmd_scale_ball.dst.stride[0] = ball_buffer_size * 4;  /* Buffer is still ball_buffer_size wide */
+	/* Destination: composition buffer for scaled ball */
+	cmd_scale_ball.dst.width = ball_size; /* Physical buffer size (110) */
+	cmd_scale_ball.dst.height = ball_size; /* Physical buffer size (110) */
+	cmd_scale_ball.dst.format =
+		G2D_FMT_ARGB8888; /* Match src format (with alpha) */
+	cmd_scale_ball.dst.stride[0] =
+		ball_size * 4; /* Physical stride (440) */
 	cmd_scale_ball.dst.dma_fd = comp_dma_fd;
 
-	cmd_scale_ball.dst_x = 0;
+	cmd_scale_ball.dst_x = 0; /* Write at 0,0 within the buffer */
 	cmd_scale_ball.dst_y = 0;
-	cmd_scale_ball.dst_w = ball_size;
-	cmd_scale_ball.dst_h = ball_size;
+	cmd_scale_ball.dst_w = ball_size; /* Output image size (variable) */
+	cmd_scale_ball.dst_h = ball_size; /* Output image size (variable) */
 
 	cmd_scale_ball.fence_fd_in = -1;
 	cmd_scale_ball.fence_fd_out = -1;
@@ -277,38 +357,62 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 
 	sync_wait_and_close(cmd_scale_ball.fence_fd_out, "CMD_SCALE ball→comp");
 
-	/* Step 2b-1: Ensure blend buffer has the fresh background: COPY temp → blend */
+	// /* DEBUG: Read first few pixels of comp buffer to verify SCALE output */
+	// {
+	// 	uint32_t comp_pixels[16] = {0};  /* Read first 4×4 pixels */
+	// 	struct g2d_buffer_rw read_buf = {
+	// 		.dma_fd = comp_dma_fd,
+	// 		.offset = 0,
+	// 		.size = sizeof(comp_pixels),
+	// 		.user_ptr = (__u64)(unsigned long)comp_pixels
+	// 	};
+
+	// 	ret = ioctl(g2d_fd, G2D_IOC_READ_BUFFER, &read_buf);
+	// 	if (ret == 0) {
+	// 		printf("COMP buffer first 16 pixels after SCALE:\n");
+	// 		for (int i = 0; i < 16; i++) {
+	// 			printf("  [%2d] = 0x%08x", i, comp_pixels[i]);
+	// 			if ((i+1) % 4 == 0) printf("\n");
+	// 		}
+	// 	}
+	// }
+
+	/* Step 2: CMD_COPY bg → blend (fresh background copy) */
 	{
-		struct g2d_cmd cmd_copy_bg2blend = { 0 };
-		cmd_copy_bg2blend.cmd_type = G2D_CMD_COPY;
-		cmd_copy_bg2blend.src.width = disp->width;
-		cmd_copy_bg2blend.src.height = disp->height;
-		cmd_copy_bg2blend.src.format = G2D_FMT_XRGB8888;
-		cmd_copy_bg2blend.src.stride[0] = disp->width * 4;
-		cmd_copy_bg2blend.src.dma_fd = temp_dma_fd;
-		cmd_copy_bg2blend.src.crop_x = 0;
-		cmd_copy_bg2blend.src.crop_y = 0;
-		cmd_copy_bg2blend.src.crop_w = disp->width;
-		cmd_copy_bg2blend.src.crop_h = disp->height;
+		struct g2d_cmd cmd_scale_gradient = { 0 };
+		cmd_scale_gradient.cmd_type = G2D_CMD_COPY;
 
-		cmd_copy_bg2blend.dst.width = disp->width;
-		cmd_copy_bg2blend.dst.height = disp->height;
-		cmd_copy_bg2blend.dst.format = G2D_FMT_XRGB8888;
-		cmd_copy_bg2blend.dst.stride[0] = disp->width * 4;
-		cmd_copy_bg2blend.dst.dma_fd = blend_dma_fd;
-		cmd_copy_bg2blend.dst_x = 0;
-		cmd_copy_bg2blend.dst_y = 0;
-		cmd_copy_bg2blend.dst_w = disp->width;
-		cmd_copy_bg2blend.dst_h = disp->height;
-		cmd_copy_bg2blend.fence_fd_in = -1;
-		cmd_copy_bg2blend.fence_fd_out = -1;
+		/* Source: background buffer (800×480) */
+		cmd_scale_gradient.src.width = disp->width;
+		cmd_scale_gradient.src.height = disp->height;
+		cmd_scale_gradient.src.format = G2D_FMT_ARGB8888;
+		cmd_scale_gradient.src.stride[0] = disp->width * 4;
+		cmd_scale_gradient.src.dma_fd = bg_dma_fd;
+		cmd_scale_gradient.src.crop_x = 0;
+		cmd_scale_gradient.src.crop_y = 0;
+		cmd_scale_gradient.src.crop_w = disp->width;
+		cmd_scale_gradient.src.crop_h = disp->height;
 
-		ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_copy_bg2blend);
+		/* Destination: blend buffer (800×480) */
+		cmd_scale_gradient.dst.width = disp->width;
+		cmd_scale_gradient.dst.height = disp->height;
+		cmd_scale_gradient.dst.format = G2D_FMT_ARGB8888;
+		cmd_scale_gradient.dst.stride[0] = disp->width * 4;
+		cmd_scale_gradient.dst.dma_fd = blend_dma_fd;
+		cmd_scale_gradient.dst_x = 0;
+		cmd_scale_gradient.dst_y = 0;
+		cmd_scale_gradient.dst_w = disp->width;
+		cmd_scale_gradient.dst_h = disp->height;
+		cmd_scale_gradient.fence_fd_in = -1;
+		cmd_scale_gradient.fence_fd_out = -1;
+
+		ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_scale_gradient);
 		if (ret < 0) {
-			perror("G2D_IOC_CMD (COPY: temp → blend background)");
+			perror("G2D_IOC_CMD (SCALE: gradient → blend background)");
 			return -1;
 		}
-		sync_wait_and_close(cmd_copy_bg2blend.fence_fd_out, "CMD_COPY temp→blend-bg");
+		sync_wait_and_close(cmd_scale_gradient.fence_fd_out,
+				    "CMD_SCALE gradient→blend");
 	}
 
 	/* Step 2b-2: CMD_BLEND comp (scaled ball) + blend(bg) → blend (NO scaling) */
@@ -316,43 +420,52 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 	cmd_blend.cmd_type = G2D_CMD_BLEND;
 
 	/* Source (foreground): scaled ball from comp buffer */
-	cmd_blend.src.width = ball_size;
-	cmd_blend.src.height = ball_size;
-	cmd_blend.src.format = G2D_FMT_ARGB8888;
-	cmd_blend.src.stride[0] = ball_buffer_size * 4;  /* Physical buffer pitch */
+	cmd_blend.src.width = ball_size; /* Physical buffer size (radius*2) */
+	cmd_blend.src.height = ball_size; /* Physical buffer size (radius*2) */
+	cmd_blend.src.format =
+		G2D_FMT_ARGB8888; /* Match SCALE output format (no alpha) */
+	cmd_blend.src.stride[0] =
+		ball_size * 4; /* Physical stride (radius*2 * 4) */
 	cmd_blend.src.dma_fd = comp_dma_fd;
-	cmd_blend.src.crop_x = 0;
+	cmd_blend.src.crop_x = 0; /* Read from origin */
 	cmd_blend.src.crop_y = 0;
-	cmd_blend.src.crop_w = ball_size;
-	cmd_blend.src.crop_h = ball_size;
-	cmd_blend.src.alpha = 255;
-	cmd_blend.src.alpha_mode = G2D_PIXEL_ALPHA;  /* Per-pixel alpha from ARGB */
-	cmd_blend.src.premul_mode = G2D_PREMUL_ALPHA;  /* Straight alpha */
+	cmd_blend.src.crop_w = ball_size; /* Read only the scaled portion */
+	cmd_blend.src.crop_h = ball_size; /* Read only the scaled portion */
+	cmd_blend.src.alpha = 0;
+	cmd_blend.src.alpha_mode =
+		G2D_PIXEL_ALPHA; /* Per-pixel alpha from ARGB */
+	cmd_blend.src.premul_mode = G2D_PREMUL_ALPHA; /* Straight alpha */
 
-	/* Destination (background READ): blend buffer (already contains bg) */
-	cmd_blend.dst.width = disp->width;
+	/* Destination (background READ): blend buffer (full screen dimensions)
+	 * Crop to the region where ball will be composited */
+	cmd_blend.dst.width =
+		disp->width; /* Full background buffer (800×480) */
 	cmd_blend.dst.height = disp->height;
-	cmd_blend.dst.format = G2D_FMT_XRGB8888;
+	cmd_blend.dst.format = G2D_FMT_ARGB8888;
 	cmd_blend.dst.stride[0] = disp->width * 4;
-	cmd_blend.dst.dma_fd = blend_dma_fd;  /* Read from blend (bg) */
-	cmd_blend.dst.crop_x = x;  /* Read background region where ball will be */
+	cmd_blend.dst.dma_fd = blend_dma_fd; /* Read from blend (bg) */
+	cmd_blend.dst.crop_x =
+		x; /* Read background region where ball will be */
 	cmd_blend.dst.crop_y = y;
 	cmd_blend.dst.crop_w = ball_size;
 	cmd_blend.dst.crop_h = ball_size;
 	cmd_blend.dst.alpha = 255;
-	cmd_blend.dst.alpha_mode = G2D_GLOBAL_ALPHA;
-	
+	cmd_blend.dst.alpha_mode =
+		G2D_GLOBAL_ALPHA; /* Use global alpha = 255 */
+	cmd_blend.dst.premul_mode = G2D_PREMUL_NONE; /* Straight alpha */
+
 	/* Output WRITE: same blend buffer (in-place blend over copied background) */
 	cmd_blend.out.width = disp->width;
 	cmd_blend.out.height = disp->height;
-	cmd_blend.out.format = G2D_FMT_XRGB8888;
+	cmd_blend.out.format = G2D_FMT_ARGB8888;
 	cmd_blend.out.stride[0] = disp->width * 4;
-	cmd_blend.out.dma_fd = blend_dma_fd;  /* Write to separate blend buffer */
+	cmd_blend.out.dma_fd =
+		blend_dma_fd; /* Write to separate blend buffer */
 
 	/* Destination position (NO scaling, just positioning) */
 	cmd_blend.dst_x = x;
 	cmd_blend.dst_y = y;
-	cmd_blend.dst_w = ball_size;  /* Same size as source (no scaling) */
+	cmd_blend.dst_w = ball_size; /* Same size as source (no scaling) */
 	cmd_blend.dst_h = ball_size;
 
 	/* Standard Porter-Duff SRCOVER: ball (src) OVER background (dst)
@@ -368,77 +481,97 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 		return -1;
 	}
 
-	sync_wait_and_close(cmd_blend.fence_fd_out, "CMD_BLEND comp+temp→temp");
+	sync_wait_and_close(cmd_blend.fence_fd_out,
+			    "CMD_BLEND comp+blend→blend");
 
-	/* Step 3: CMD_COPY blend → framebuffer (simple full-screen copy)
-	 * NOTE: dst.height must describe the REAL height of the target surface region
-	 * we are conceptually addressing (one page). Passing double-height confused
-	 * address calculations in the driver when adding the page offset. So we use
-	 * disp->height here and rely solely on dst_y to land on the correct page. */
-	struct g2d_cmd cmd_copy = { 0 };
-	cmd_copy.cmd_type = G2D_CMD_COPY;
+do_copy:
+	{
+		/* Step 4: CMD_COPY blend → framebuffer (final scanout copy)
+		* NOTE: dst.height must describe the REAL height of the target surface region
+		* we are conceptually addressing (one page). Passing double-height confused
+		* address calculations in the driver when adding the page offset. So we use
+		* disp->height here and rely solely on dst_y to land on the correct page. */
+		struct g2d_cmd cmd_copy = { 0 };
+		cmd_copy.cmd_type = G2D_CMD_COPY;
 
-	cmd_copy.src.width = disp->width;
-	cmd_copy.src.height = disp->height;
-	cmd_copy.src.format = G2D_FMT_XRGB8888;
-	cmd_copy.src.stride[0] = disp->width * 4;
-	cmd_copy.src.dma_fd = blend_dma_fd;  /* Read from blend (bg + ball) */
-	cmd_copy.src.crop_x = 0;
-	cmd_copy.src.crop_y = 0;
-	cmd_copy.src.crop_w = disp->width;
-	cmd_copy.src.crop_h = disp->height;
+		cmd_copy.src.width = disp->width;
+		cmd_copy.src.height = disp->height;
+		cmd_copy.src.format = G2D_FMT_XRGB8888;
+		cmd_copy.src.stride[0] = disp->width * 4;
+		cmd_copy.src.dma_fd = blend_dma_fd; /* Read from blend (bg + ball) */
+		cmd_copy.src.crop_x = 0;
+		cmd_copy.src.crop_y = 0;
+		cmd_copy.src.crop_w = disp->width;
+		cmd_copy.src.crop_h = disp->height;
 
-	cmd_copy.dst.width = disp->width;
-	cmd_copy.dst.height = disp->height;  /* Only one page height; page offset via dst_y */
-	cmd_copy.dst.format = G2D_FMT_XRGB8888;
-	cmd_copy.dst.stride[0] = disp->pitch;
-	cmd_copy.dst.dma_fd = fb_dma_fd;
+		cmd_copy.dst.width = disp->width;
+		cmd_copy.dst.height =
+			disp->height *
+			2; /* CRITICAL: Total FB height (both pages) for bounds check */
+		cmd_copy.dst.format = G2D_FMT_XRGB8888;
+		cmd_copy.dst.stride[0] = disp->pitch;
+		cmd_copy.dst.dma_fd = fb_dma_fd;
 
-	cmd_copy.dst_x = 0;
-	cmd_copy.dst_y = backbuffer_y_offset;  /* Write to backbuffer */
-	cmd_copy.dst_w = disp->width;
-	cmd_copy.dst_h = disp->height;
+		cmd_copy.dst_x = 0;
+		cmd_copy.dst_y =
+			backbuffer_y_offset; /* Write to backbuffer (0 or height) */
+		cmd_copy.dst_w = disp->width;
+		cmd_copy.dst_h = disp->height;
 
-	cmd_copy.fence_fd_in = -1;
-	cmd_copy.fence_fd_out = -1;
+		cmd_copy.fence_fd_in = -1;
+		cmd_copy.fence_fd_out = -1;
 
-	ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_copy);
-	if (ret < 0) {
-		int saved_errno = errno;
-		perror("G2D_IOC_CMD (COPY: temp → framebuffer)");
-		/* Fallback CPU copy if framebuffer is non-contiguous (EOPNOTSUPP)
-		 * and we have a valid mmap() of the framebuffer pages. This validates
-		 * that the composed temp buffer is correct and scanout memory is
-		 * accessible even if G2D rejects multi-entry sg tables.
-		 */
-		if (saved_errno == EOPNOTSUPP && disp->map) {
-			uint32_t frame_bytes = disp->width * disp->height * 4;
-			uint32_t backbuffer_offset_bytes = drm_get_backbuffer_offset(disp);
-			uint8_t *fb_ptr = (uint8_t *)disp->map + backbuffer_offset_bytes;
-			uint8_t *staging = malloc(frame_bytes);
-			if (!staging) {
-				fprintf(stderr, "CPU fallback alloc failed (%u bytes)\n", frame_bytes);
-				return -1;
-			}
-			/* Read back composed frame from temp DMA buffer */
-			if (g2d_read_buffer(g2d_fd, temp_dma_fd, staging, frame_bytes, 0) < 0) {
-				fprintf(stderr, "CPU fallback: G2D_IOC_READ_BUFFER failed\n");
+		ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_copy);
+		if (ret < 0) {
+			int saved_errno = errno;
+			perror("G2D_IOC_CMD (COPY: temp → framebuffer)");
+
+			/* Fallback CPU copy if framebuffer is non-contiguous (EOPNOTSUPP)
+			* and we have a valid mmap() of the framebuffer pages. This validates
+			* that the composed temp buffer is correct and scanout memory is
+			* accessible even if G2D rejects multi-entry sg tables.
+			*/
+			if (saved_errno == EOPNOTSUPP && disp->map) {
+				uint32_t frame_bytes = disp->pitch * disp->height;
+				uint32_t backbuffer_offset_bytes =
+					drm_get_backbuffer_offset(disp);
+				uint8_t *fb_ptr =
+					(uint8_t *)disp->map + backbuffer_offset_bytes;
+
+				uint8_t *staging = malloc(frame_bytes);
+				if (!staging) {
+					fprintf(stderr,
+						"CPU fallback alloc failed (%u bytes)\n",
+						frame_bytes);
+					return -1;
+				}
+
+				/* Read back composed frame from temp DMA buffer */
+				if (g2d_read_buffer(g2d_fd, temp_dma_fd, staging,
+							frame_bytes, 0) < 0) {
+					fprintf(stderr,
+						"CPU fallback: G2D_IOC_READ_BUFFER failed\n");
+					free(staging);
+					return -1;
+				}
+
+				/* Copy into backbuffer page */
+				memcpy(fb_ptr, staging, frame_bytes);
 				free(staging);
-				return -1;
+				fprintf(stderr,
+					"CPU fallback COPY performed (frame_bytes=%u)\n",
+					frame_bytes);
+				return 0; /* Treat as success for this frame */
 			}
-			/* Copy into backbuffer page */
-			memcpy(fb_ptr, staging, frame_bytes);
-			free(staging);
-			fprintf(stderr, "CPU fallback COPY performed (frame_bytes=%u)\n", frame_bytes);
-			return 0; /* Treat as success for this frame */
+
+			return -1;
 		}
-		return -1;
+
+		sync_wait_and_close(cmd_copy.fence_fd_out, "CMD_COPY temp→fb");
+
+		/* Done! Framebuffer backbuffer now has the complete frame ready for flip */
+		return 0;
 	}
-
-	sync_wait_and_close(cmd_copy.fence_fd_out, "CMD_COPY temp→fb");
-
-	/* Done! Framebuffer backbuffer now has the complete frame ready for flip */
-	return 0;
 }
 
 int main(int argc, char **argv)
@@ -447,8 +580,19 @@ int main(int argc, char **argv)
 	int ret;
 
 	printf("G2D + DRM Bouncing Ball Demo v3.0.0 - UNIFIED CMD API (G2D_IOC_CMD)\n");
-	printf("Uses only G2D_CMD_* operations: COPY, SCALE, BLEND\n");
-	printf("Performance optimized: removed all debug printk from kernel driver\n");
+
+	if (argc > 1 && strcmp(argv[1], "--oneframe") == 0) {
+		one_frame_mode = 1;
+		printf("One Frame Mode enabled: will run a single frame and exit.\n");
+	}
+	/* Check for single-blend pipeline flag (--single-blend) among args */
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--single-blend") == 0 ||
+		    strcmp(argv[i], "--pipeline=single") == 0) {
+			use_single_blend = 1;
+			printf("Using single BLEND pipeline: scaling+blending in one command.\n");
+		}
+	}
 
 	/* Ball physics */
 	float ball_x, ball_y;
@@ -460,7 +604,8 @@ int main(int argc, char **argv)
 	const float scale_speed =
 		1.5f; /* Scaling frequency (Hz) - 1.5 cycles per second */
 	const int min_radius = 25; /* Minimum ball size (pixels) */
-	const int max_radius = 55; /* Maximum ball size (pixels) */
+	const int max_radius =
+		54; /* Maximum ball size (pixels) - MUST be < ball_buffer_size/2 to force VSU scaling */
 	const float delta_time = 0.01666f; /* ~60 FPS = 16.66ms per frame */
 
 	/* Fixed buffer size for ball texture (must be >= max_radius * 2) */
@@ -470,10 +615,6 @@ int main(int argc, char **argv)
 	/* HARDWARE SCALING ENABLED - Variable size ball with pitch/crop workaround */
 	int ball_radius = max_radius; /* Start at maximum size */
 	int ball_size; /* Will be updated each frame: ball_radius * 2 */
-
-	/* Background gradient colors (ARGB format - standard colors!) */
-	uint32_t bg_top = 0xFF00008F; /* Dark blue (A=FF, R=00, G=00, B=8F) */
-	uint32_t bg_bottom = 0xFFFF0026; /* Bright red (A=FF, R=FF, G=00, B=26) */
 
 	/* FPS tracking */
 	struct timespec frame_start, frame_end;
@@ -554,7 +695,8 @@ int main(int argc, char **argv)
 	blend_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &blend_alloc);
 	if (ret < 0) {
-		fprintf(stderr, "Failed to allocate DMA buffer for blend output\n");
+		fprintf(stderr,
+			"Failed to allocate DMA buffer for blend output\n");
 		perror("G2D_IOC_ALLOC_BUFFER (blend)");
 		close(temp_dma_fd);
 		close(bg_dma_fd);
@@ -585,9 +727,28 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	comp_dma_fd = comp_alloc.dma_fd;
-	printf("Composition DMA buffer allocated: fd=%d size=%llu bytes (%dx%d XRGB8888)\n",
+	printf("Composition DMA buffer allocated: fd=%d size=%llu bytes (%dx%d ARGB8888)\n",
 	       comp_dma_fd, comp_alloc.size, ball_buffer_size,
 	       ball_buffer_size);
+
+	/* Initialize comp buffer to fully transparent (0x00000000)
+	 * This ensures clean alpha blending - unwritten pixels are transparent */
+	{
+		uint32_t *comp_init =
+			calloc(ball_buffer_size * ball_buffer_size, 4);
+		if (comp_init) {
+			ret = g2d_write_buffer(
+				disp.g2d_fd, comp_dma_fd, comp_init,
+				ball_buffer_size * ball_buffer_size * 4, 0);
+			free(comp_init);
+			if (ret < 0) {
+				fprintf(stderr,
+					"Failed to initialize comp buffer\n");
+			} else {
+				printf("Comp buffer initialized to transparent\n");
+			}
+		}
+	}
 
 	/* Create ball pattern in userspace memory then upload using G2D_IOC_WRITE_BUFFER
 	 * This demonstrates how applications can create custom graphics/textures.
@@ -604,66 +765,69 @@ int main(int argc, char **argv)
 			return 1;
 		}
 
-		/* Create CHECKERBOARD pattern for visual scaling verification
-		 * HARDWARE INVERTS SRC ALPHA: 255=transparent, 0=opaque for src (V0 pipe)
-		 * Pattern: 4x4 checkerboard (110px / 4 = 27.5px per square)
-		 * - Black squares: alpha=0 (opaque), RGB=black
-		 * - White squares: alpha=0 (opaque), RGB=white  
-		 * - Outside circle: alpha=255 (transparent)
-		 * Larger squares (4x4 instead of 8x8) are more visible when scaled down
+		/* Create ball pattern: circular gradient with alpha on transparent background
+		 * Format: ARGB8888
 		 */
 		int center_x = ball_buffer_size / 2;
 		int center_y = ball_buffer_size / 2;
 		float pattern_max_radius = (float)(ball_buffer_size / 2);
-		int square_size = ball_buffer_size / 4;  /* 4x4 grid = ~27px per square */
-		
+		/* int square_size = ball_buffer_size / 4; 4x4 grid (unused) */
+
 		for (int y = 0; y < ball_buffer_size; y++) {
 			for (int x = 0; x < ball_buffer_size; x++) {
 				int dx = x - center_x;
 				int dy = y - center_y;
-				float dist = sqrtf(dx * dx + dy * dy);
-				
+				float dist = sqrtf((float)(dx * dx + dy * dy));
+
 				uint32_t color;
-				
-				if (dist > pattern_max_radius) {
-					/* Outside the circle: fully transparent */
-					color = 0x00000000;  /* Alpha=0 (transparent), RGB=black */
-				} else {
-				/* Inside circle: RGB COLOR GRADIENT pattern with radial alpha
-				 * Standard ALPHA interpretation:
-				 * - alpha=255: Fully OPAQUE (100% visible)
-				 * - alpha=128: Semi-transparent (50% visible)
-				 * - alpha=0:   Fully TRANSPARENT (invisible)
-				 * 
-				 * Color pattern: Full RGB spectrum to verify all channels
-				 * - Horizontal gradient: Red (left) → Green → Blue (right)
-				 * - Vertical component: adds Yellow tint
-				 */
-					float norm_x = (float)x / ball_buffer_size;  /* 0.0 (left) → 1.0 (right) */
-					float norm_y = (float)y / ball_buffer_size;  /* 0.0 (top) → 1.0 (bottom) */
-					
-					/* RGB gradient to test all color channels during scaling */
-					uint8_t r = (uint8_t)(norm_x * 255);           /* Red increases left→right */
-					uint8_t g = (uint8_t)((1.0f - norm_x) * 255);  /* Green decreases left→right */
-					uint8_t b = (uint8_t)(norm_y * 192);           /* Blue increases top→bottom */
-					
-				/* Radial alpha gradient (HW QUIRK):
-				 * El hardware invierte la semántica del alpha en el canal SRC (pipe V0):
-				 *   0 = completamente OPAQUE, 255 = completamente TRANSPARENT
-				 * Queremos centro OPAQUE y borde TRANSPARENT.
-				 * Definimos alpha_logico = 255*(1 - norm_dist) (centro 255, borde 0)
-				 * Convertimos a alpha_hw = 255 - alpha_logico.
-				 */
+
+				// Distancia normalizada [0.0, 1.0]
 				float norm_dist = dist / pattern_max_radius;
-				if (norm_dist > 1.0f) norm_dist = 1.0f;
-				uint8_t alpha_logico = (uint8_t)((1.0f - norm_dist) * 255.0f);
-				uint8_t alpha = (uint8_t)(255 - alpha_logico);
-					/* G2D_FMT_ARGB8888 expects ARGB in big-endian conceptually,
-					 * but on little-endian ARM it's stored as [B][G][R][A] in memory.
-					 * Construct as ARGB value which will be byte-swapped correctly. */
-					color = ((uint32_t)alpha << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+				if (norm_dist > 1.0f)
+					norm_dist = 1.0f;
+
+				// --- Control del degradado de alpha ---
+				// Hasta inner_radius_ratio = parte totalmente opaca
+				const float inner_radius_ratio =
+					0.98f; // prueba 0.5, 0.7, etc.
+
+				uint8_t alpha;
+
+				if (norm_dist <= inner_radius_ratio) {
+					// Núcleo opaco
+					alpha = 255;
+				} else {
+					// De inner_radius_ratio → 1.0: degradado
+					float t =
+						(norm_dist -
+						 inner_radius_ratio) /
+						(1.0f -
+						 inner_radius_ratio); // t en [0, 1]
+
+					// Curva suave: más opaco hacia el centro, más rápido a transparente al final
+					// Puedes probar t*t, t*t*t, smoothstep, etc.
+					float falloff = 1.0f - t * t; // 1 - t²
+
+					if (falloff < 0.0f)
+						falloff = 0.0f;
+					alpha = (uint8_t)(falloff * 255.0f +
+							  0.5f);
 				}
-				
+
+				// RGB de test, como ya tenías
+				float norm_x =
+					(float)x / (float)ball_buffer_size;
+				float norm_y =
+					(float)y / (float)ball_buffer_size;
+
+				uint8_t r = (uint8_t)(norm_x * 255.0f);
+				uint8_t g = (uint8_t)((1.0f - norm_x) * 255.0f);
+				uint8_t b = (uint8_t)(norm_y * 192.0f);
+
+				color = ((uint32_t)alpha << 24) |
+					((uint32_t)r << 16) |
+					((uint32_t)g << 8) | (uint32_t)b;
+
 				ball_pattern[y * ball_buffer_size + x] = color;
 			}
 		}
@@ -764,29 +928,57 @@ int main(int argc, char **argv)
 			return 1;
 		}
 
-		/* Fill gradient: each row has same color, interpolating from top to bottom */
+		/* Background gradient colors (ARGB format - standard colors!) */
+		uint32_t bg_tl =
+			0xFF00008F; /* Dark blue (A=FF, R=00, G=00, B=8F) */
+		uint32_t bg_bl =
+			0xFFFF0026; /* Bright red (A=FF, R=FF, G=00, B=26) */
+		uint32_t bg_tr =
+			0xFF00BF00; /* Bright green (A=FF, R=00, G=BF, B=00) */
+		uint32_t bg_br =
+			0xFFFFFF00; /* Bright yellow (A=FF, R=FF, G=FF, B=00) */
+
+		/* Fill gradient: interpolating to four corner colors */
 		for (int y = 0; y < gradient_height; y++) {
-			/* Interpolate between bg_top (y=0) and bg_bottom (y=gradient_height-1) */
-			float t = (float)y / (gradient_height - 1);
-
-			/* Extract RGB components from bg_top and bg_bottom */
-			uint8_t r_top = (bg_top >> 16) & 0xFF;
-			uint8_t g_top = (bg_top >> 8) & 0xFF;
-			uint8_t b_top = bg_top & 0xFF;
-
-			uint8_t r_bottom = (bg_bottom >> 16) & 0xFF;
-			uint8_t g_bottom = (bg_bottom >> 8) & 0xFF;
-			uint8_t b_bottom = bg_bottom & 0xFF;
-
-			/* Linear interpolation */
-			uint8_t r = (uint8_t)(r_top + t * (r_bottom - r_top));
-			uint8_t g = (uint8_t)(g_top + t * (g_bottom - g_top));
-			uint8_t b = (uint8_t)(b_top + t * (b_bottom - b_top));
-
-			uint32_t color = 0xFF000000 | (r << 16) | (g << 8) | b;
-
-			/* Fill entire row with this color */
+			float ty = (float)y / (gradient_height - 1);
 			for (int x = 0; x < gradient_width; x++) {
+				float tx = (float)x / (gradient_width - 1);
+
+				/* Bilinear interpolation of corner colors */
+				uint8_t r = (uint8_t)((1 - tx) * (1 - ty) *
+							      ((bg_tl >> 16) &
+							       0xFF) +
+						      tx * (1 - ty) *
+							      ((bg_tr >> 16) &
+							       0xFF) +
+						      (1 - tx) * ty *
+							      ((bg_bl >> 16) &
+							       0xFF) +
+						      tx * ty *
+							      ((bg_br >> 16) &
+							       0xFF));
+				uint8_t g = (uint8_t)((1 - tx) * (1 - ty) *
+							      ((bg_tl >> 8) &
+							       0xFF) +
+						      tx * (1 - ty) *
+							      ((bg_tr >> 8) &
+							       0xFF) +
+						      (1 - tx) * ty *
+							      ((bg_bl >> 8) &
+							       0xFF) +
+						      tx * ty *
+							      ((bg_br >> 8) &
+							       0xFF));
+				uint8_t b = (uint8_t)((1 - tx) * (1 - ty) *
+							      (bg_tl & 0xFF) +
+						      tx * (1 - ty) *
+							      (bg_tr & 0xFF) +
+						      (1 - tx) * ty *
+							      (bg_bl & 0xFF) +
+						      tx * ty * (bg_br & 0xFF));
+
+				uint32_t color = 0xFF000000 | (r << 16) |
+						 (g << 8) | b;
 				gradient_data[y * gradient_width + x] = color;
 			}
 		}
@@ -794,15 +986,16 @@ int main(int argc, char **argv)
 		/* Upload gradient pattern to DMA buffer */
 		printf("DEBUG: About to call g2d_write_buffer for gradient\n");
 		fflush(stdout);
-		
+
 		ret = g2d_write_buffer(disp.g2d_fd, gradient_dma_fd,
 				       gradient_data, gradient_alloc.size, 0);
-		
-		printf("DEBUG: g2d_write_buffer returned %d, about to free gradient_data\n", ret);
+
+		printf("DEBUG: g2d_write_buffer returned %d, about to free gradient_data\n",
+		       ret);
 		fflush(stdout);
-		
+
 		free(gradient_data);
-		
+
 		printf("DEBUG: free() completed\n");
 		fflush(stdout);
 
@@ -824,7 +1017,6 @@ int main(int argc, char **argv)
 		       (float)disp.height / gradient_height);
 	}
 
-	/* Scale gradient to full background using CMD_SCALE */
 	struct g2d_cmd cmd_scale = { 0 };
 	cmd_scale.cmd_type = G2D_CMD_SCALE;
 
@@ -854,15 +1046,16 @@ int main(int argc, char **argv)
 	cmd_scale.fence_fd_in = -1;
 	cmd_scale.fence_fd_out = -1;
 
-	printf("DEBUG: About to call G2D_IOC_CMD (SCALE) - cmd_type=%u\n", cmd_scale.cmd_type);
-	printf("DEBUG: src=%ux%u crop=%ux%u dst=%ux%u\n",
-	       cmd_scale.src.width, cmd_scale.src.height,
-	       cmd_scale.src.crop_w, cmd_scale.src.crop_h,
+	printf("DEBUG: About to call G2D_IOC_CMD (SCALE) - cmd_type=%u\n",
+	       cmd_scale.cmd_type);
+	printf("DEBUG: src=%ux%u crop=%ux%u dst=%ux%u\n", cmd_scale.src.width,
+	       cmd_scale.src.height, cmd_scale.src.crop_w, cmd_scale.src.crop_h,
 	       cmd_scale.dst_w, cmd_scale.dst_h);
-	
+
 	ret = ioctl(disp.g2d_fd, G2D_IOC_CMD, &cmd_scale);
-	printf("DEBUG: ioctl returned %d, fence_fd_out=%d\n", ret, cmd_scale.fence_fd_out);
-	
+	printf("DEBUG: ioctl returned %d, fence_fd_out=%d\n", ret,
+	       cmd_scale.fence_fd_out);
+
 	if (ret < 0) {
 		perror("G2D_IOC_CMD (SCALE: gradient → background)");
 		close(gradient_dma_fd);
@@ -874,8 +1067,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("DEBUG: About to sync_wait_and_close on fd=%d\n", cmd_scale.fence_fd_out);
-	sync_wait_and_close(cmd_scale.fence_fd_out, "CMD_SCALE gradient→background");
+	printf("DEBUG: About to sync_wait_and_close on fd=%d\n",
+	       cmd_scale.fence_fd_out);
+	sync_wait_and_close(cmd_scale.fence_fd_out,
+			    "CMD_SCALE gradient→background");
 	printf("DEBUG: sync_wait_and_close completed\n");
 
 	/* Clean up gradient source buffer (no longer needed) */
@@ -927,20 +1122,20 @@ int main(int argc, char **argv)
 			pattern_mode = 0;
 		}
 
-		/* Composition pipeline (flicker-free):
-		 *   1. COPY bg   -> temp        (background)
-		 *   2. SCALE ball -> comp       (preserve alpha)
-		 *   3. BLEND comp + temp -> blend (distinct output prevents in-place hazard)
-		 *   4. COPY blend -> framebuffer (page to scanout)
+		/* === COMPOSITION PIPELINE ===
+		 * 1. SCALE ball sprite to current size → comp_dma
+		 * 2. SCALE gradient → blend_dma (fresh background, bypass bg_dma cache issue)
+		 * 3. BLEND comp_dma (scaled ball) over blend_dma → blend_dma
+		 * 4. COPY blend_dma → framebuffer backbuffer
 		 */
-		ret = g2d_blend_ball_dma(
-			&disp, disp.g2d_fd, bg_dma_fd, ball_dma_fd,
-			temp_dma_fd, comp_dma_fd, blend_dma_fd, fb_dmabuf,
-			(int)(ball_x - ball_radius),
-			(int)(ball_y - ball_radius), ball_radius,
-			ball_buffer_size); /* ball_buffer_size is CONSTANT 110 */
+		ret = g2d_blend_ball_dma(&disp, disp.g2d_fd, bg_dma_fd,
+					 ball_dma_fd, temp_dma_fd, comp_dma_fd,
+					 blend_dma_fd, fb_dmabuf,
+					 (int)(ball_x - ball_radius),
+					 (int)(ball_y - ball_radius),
+					 ball_radius, ball_buffer_size);
 		if (ret < 0) {
-			fprintf(stderr, "Failed to blend ball\n");
+			fprintf(stderr, "Ball composition pipeline failed\n");
 			break;
 		}
 
@@ -1003,7 +1198,15 @@ int main(int argc, char **argv)
 			(frame_end.tv_nsec - frame_start.tv_nsec) / 1000L;
 
 		if (frame_time_us < 16666) {
-			usleep(16666 - frame_time_us);
+			long sleep_us = 16666 - frame_time_us;
+			struct timespec ts_sleep;
+			ts_sleep.tv_sec = sleep_us / 1000000L;
+			ts_sleep.tv_nsec = (sleep_us % 1000000L) * 1000L;
+			nanosleep(&ts_sleep, NULL);
+		}
+		/* One Frame Mode: exit after single frame */
+		if (one_frame_mode) {
+			keep_running = false;
 		}
 	}
 	printf("\n\nCleaning up...\n");

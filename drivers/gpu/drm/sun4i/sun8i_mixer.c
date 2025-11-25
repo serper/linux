@@ -524,18 +524,18 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
 	mixer->engine.ops = &sun8i_engine_ops;
 	mixer->engine.node = dev->of_node;
 
-	if (of_property_present(dev->of_node, "iommus")) {
-		/*
-		 * This assume we have the same DMA constraints for
-		 * all our the mixers in our pipeline. This sounds
-		 * bad, but it has always been the case for us, and
-		 * DRM doesn't do per-device allocation either, so we
-		 * would need to fix DRM first...
-		 */
-		ret = of_dma_configure(drm->dev, dev->of_node, true);
-		if (ret)
-			return ret;
-	}
+	// if (of_property_present(dev->of_node, "iommus")) {
+	// 	/*
+	// 	 * This assume we have the same DMA constraints for
+	// 	 * all our the mixers in our pipeline. This sounds
+	// 	 * bad, but it has always been the case for us, and
+	// 	 * DRM doesn't do per-device allocation either, so we
+	// 	 * would need to fix DRM first...
+	// 	 */
+	// 	ret = of_dma_configure(drm->dev, dev->of_node, true);
+	// 	if (ret)
+	// 		return ret;
+	// }
 
 	/*
 	 * While this function can fail, we shouldn't do anything

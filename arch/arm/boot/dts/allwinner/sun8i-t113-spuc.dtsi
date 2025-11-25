@@ -150,7 +150,7 @@
         de: display-engine {
                 compatible = "allwinner,sun20i-d1-display-engine";
                 allwinner,pipelines = <&mixer0>, <&mixer1>;
-                iommus = <&iommu 2>;
+                // iommus = <&iommu 2>;
                 status = "disabled";
         };
 
@@ -867,7 +867,7 @@
                                  <&display_clocks CLK_MIXER0>;
                         clock-names = "bus", "mod";
                         resets = <&display_clocks RST_MIXER0>;
-                        // iommus = <&iommu 2>;
+                        iommus = <&iommu 2>;
 
                         ports {
                                 #address-cells = <1>;
@@ -890,7 +890,7 @@
                                  <&display_clocks CLK_MIXER1>;
                         clock-names = "bus", "mod";
                         resets = <&display_clocks RST_MIXER1>;
-                        // iommus = <&iommu 2>;
+                        iommus = <&iommu 2>;
 
                         ports {
                                 #address-cells = <1>;
@@ -930,7 +930,7 @@
                         interconnect-names = "dma-mem";
                         allwinner,sram = <&ve_sram 1>;
                         // power-domains = <&ppu PD_VE>;
-                        iommus = <&iommu 0>;
+                        // iommus = <&iommu 0>;
                         status = "disabled";
                 };
 

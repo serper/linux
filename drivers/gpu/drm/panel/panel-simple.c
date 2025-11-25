@@ -4438,19 +4438,35 @@ static const struct panel_desc startek_kd070wvfpa = {
 };
 
 /* serper3d */
+// static const struct display_timing qt5000h40r79l_timing = {
+// 	.pixelclock = { 25200000, 27200000, 30500000 },
+// 	.hactive = { 800, 800, 800 },
+// 	.hfront_porch = { 4, 8, 48 },
+// 	.hback_porch = { 4, 8, 48 },
+// 	.hsync_len = { 4, 8, 48 },
+// 	.vactive = { 480, 480, 480 },
+// 	.vfront_porch = { 2, 4, 8 },
+// 	.vback_porch = { 4, 8, 12 },
+// 	.vsync_len = { 4, 8, 12 },
+// 	.flags = DISPLAY_FLAGS_HSYNC_LOW | DISPLAY_FLAGS_VSYNC_LOW |
+// 		 DISPLAY_FLAGS_DE_HIGH | DISPLAY_FLAGS_PIXDATA_NEGEDGE |
+// 		 DISPLAY_FLAGS_SYNC_NEGEDGE,
+// };
+
 static const struct display_timing qt5000h40r79l_timing = {
-	.pixelclock = { 25200000, 27200000, 30500000 },
-	.hactive = { 800, 800, 800 },
-	.hfront_porch = { 4, 8, 48 },
-	.hback_porch = { 4, 8, 48 },
-	.hsync_len = { 4, 8, 48 },
-	.vactive = { 480, 480, 480 },
-	.vfront_porch = { 2, 4, 8 },
-	.vback_porch = { 4, 8, 12 },
-	.vsync_len = { 4, 8, 12 },
-	.flags = DISPLAY_FLAGS_HSYNC_LOW | DISPLAY_FLAGS_VSYNC_LOW |
-		 DISPLAY_FLAGS_DE_HIGH | DISPLAY_FLAGS_PIXDATA_NEGEDGE |
-		 DISPLAY_FLAGS_SYNC_NEGEDGE,
+    .pixelclock = { 23000000, 25000000, 27000000 },
+
+    .hactive = { 800, 800, 800 },
+    .hfront_porch = { 16, 32, 64 },
+    .hback_porch  = { 16, 32, 64 },
+    .hsync_len    = { 4, 8, 16 },
+
+    .vactive = { 480, 480, 480 },
+    .vfront_porch = { 2, 4, 8 },
+    .vback_porch  = { 4, 8, 12 },
+    .vsync_len    = { 4, 8, 12 },
+
+    .flags = DISPLAY_FLAGS_DE_HIGH | DISPLAY_FLAGS_PIXDATA_POSEDGE,
 };
 
 static const struct panel_desc qt5000h40r79l_desc = {

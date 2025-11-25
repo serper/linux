@@ -839,36 +839,25 @@ static int sun50i_iommu_of_xlate(struct device *dev,
 	struct platform_device *iommu_pdev;
 	struct sun50i_iommu *iommu;
 	unsigned int id = args->args[0];
-	int ret;
 
 	iommu_pdev = of_find_device_by_node(args->np);
-	if (!iommu_pdev)
-		return -EPROBE_DEFER;
-
-	if (!device_is_bound(&iommu_pdev->dev)) {
-		put_device(&iommu_pdev->dev);
+	if (!iommu_pdev) {
+		dev_dbg(dev, "IOMMU device not found for node\n");
 		return -EPROBE_DEFER;
 	}
 
 	iommu = platform_get_drvdata(iommu_pdev);
 	if (!iommu) {
+		dev_dbg(dev, "IOMMU driver data not ready\n");
 		put_device(&iommu_pdev->dev);
 		return -EPROBE_DEFER;
 	}
 
-/* Acquire runtime PM for the IOMMU while configuring clients */
-	ret = pm_runtime_resume_and_get(&iommu_pdev->dev);
-	if (ret) {
-		put_device(&iommu_pdev->dev);
-		return ret;
-	}
-
 	dev_iommu_priv_set(dev, iommu);
-	ret = iommu_fwspec_add_ids(dev, &id, 1);
 	put_device(&iommu_pdev->dev);
-	pm_runtime_put(&iommu_pdev->dev);
 
-	return ret;
+	dev_info(dev, "IOMMU xlate: setting up domain %u\n", id);
+	return iommu_fwspec_add_ids(dev, &id, 1);
 }
 
 static const struct iommu_ops sun50i_iommu_ops = {

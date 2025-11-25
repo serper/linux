@@ -1,8 +1,0 @@
-G2D + DRM Bouncing Ball Demo v2.9.31 - CORRECT UI2+V0 ALPHA BLENDING
-drmModeSetCrtc: Permission denied
-Failed to initialize DRM display
-Single V0 layer with alpha (EXACT same pattern as working fillrect)
-==============================
-
-Display: 800x480 @ 66Hz
-Buffer: 800x960 (double height), pitch=3200, size=3072000
