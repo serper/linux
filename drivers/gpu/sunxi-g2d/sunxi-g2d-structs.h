@@ -1203,10 +1203,12 @@ struct g2d_mixer_ovl_u_reg {
 union g2d_mixer_wb_attr {
 	u32 dwval;
 	struct {
+		u32 en:1;         /* Writeback enable (bit 0) */
+		u32 res0:5;
 		u32 fmt:6;
-		u32 res0:2;
+		u32 res1:2;
 		u32 round_en:1;
-		u32 res1:23;
+		u32 res2:17;
 	} bits;
 };
 
@@ -1230,28 +1232,30 @@ union g2d_mixer_wb_data_size {
 };
 
 /**
+ * union g2d_mixer_wb_crop_coor - Writeback crop coordinate
+ * @dwval: Direct 32-bit register access
+ * @bits.xcoor: X coordinate (0-8191)
+ * @bits.ycoor: Y coordinate (0-8191)
+ */
+union g2d_mixer_wb_crop_coor {
+	u32 dwval;
+	struct {
+		u32 xcoor:16;
+		u32 ycoor:16;
+	} bits;
+};
+
+/**
  * struct g2d_mixer_write_back_reg - Complete Writeback register block
- * @wb_attr: Writeback attributes and format (0x00)
- * @data_size: Output size (0x04)
- * @pitch0: Plane 0 pitch in bytes (0x08)
- * @pitch1: Plane 1 pitch in bytes (0x0C)
- * @pitch2: Plane 2 pitch in bytes (0x10)
- * @laddr0: Plane 0 address low 32-bits (0x14)
- * @haddr0: Plane 0 address high 8-bits (0x18)
- * @laddr1: Plane 1 address low 32-bits (0x1C)
- * @haddr1: Plane 1 address high 8-bits (0x20)
- * @laddr2: Plane 2 address low 32-bits (0x24)
- * @haddr2: Plane 2 address high 8-bits (0x28)
- *
- * Complete WB register block starting at offset 0x3000.
- * Size: 0x2C bytes (11 registers).
+ * @wb_attr: Attribute control (enable, format)
+ * @data_size: Output size (width, height)
+ * @pitch0/1/2: Line stride for each plane
+ * @laddr0/1/2: Low 32-bits of DMA address for each plane
+ * @haddr0/1/2: High 32-bits of DMA address for each plane
+ * @wb_crop_coor: Crop coordinate (X,Y) for output position
  *
  * For RGB formats, only pitch0/laddr0/haddr0 are used.
  * For YUV formats, all 3 plane addresses/pitches are used.
- *
- * Note: WB does not have explicit coordinate registers.
- * To write at offset (x,y), calculate:
- *   addr = base + (y * pitch) + (x * bytes_per_pixel)
  */
 struct g2d_mixer_write_back_reg {
 	/* 0x00 */
@@ -1268,6 +1272,7 @@ struct g2d_mixer_write_back_reg {
 	u32 haddr1;
 	u32 laddr2;
 	u32 haddr2;
+	union g2d_mixer_wb_crop_coor wb_crop_coor;
 } __packed __aligned(4);
 
 /* ============================================================================

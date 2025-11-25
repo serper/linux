@@ -294,7 +294,7 @@
 // VSU (Video Scaler Unit) - Complete register map from BSP
 #define VS_CTRL           (0x000 + G2D_VSU)
 #define  VS_CTRL_EN                BIT(0)
-#define  VS_CTRL_COEF_ACCESS_SEL   BIT(1)
+#define  VS_CTRL_COEF_ACCESS_SEL   BIT(8)
 #define  VS_CTRL_FILTER_TYPE_RGB   BIT(16)  /* 1=RGB, 0=YUV */
 
 #define VS_OUT_SIZE       (0x040 + G2D_VSU)
