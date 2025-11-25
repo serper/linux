@@ -288,6 +288,13 @@ enum g2d_cmd_type {
 	G2D_CMD_FILLRECT = 6,
 };
 
+enum g2d_task_cmd {
+	G2D_TASK_CREATE = 1,
+	G2D_TASK_ADD = 2,
+	G2D_TASK_RUN = 3,
+	G2D_TASK_DEL = 4,
+};
+
 /* Unified command structure */
 struct g2d_cmd {
 	__u32 cmd_type;	/* enum g2d_cmd_type */
@@ -323,8 +330,16 @@ struct g2d_cmd {
 			__u32 color_key_mode;
 			__u32 color_key_min;
 			__u32 color_key_max;
-		} mask;
+	} mask;
 	} params;
+} __attribute__((packed));
+
+/* Task request structure for G2D_IOC_TASK */
+struct g2d_task_req {
+	__u32 task_cmd;          /* enum g2d_task_cmd */
+	__u32 task_id;           /* IN/OUT: task identifier */
+	struct g2d_cmd step;     /* Used only with G2D_TASK_ADD */
+	__s32 fence_fd_out;      /* OUT: fence for G2D_TASK_RUN */
 } __attribute__((packed));
 
 /* Buffer read/write request */
@@ -345,6 +360,7 @@ struct g2d_buffer_rw {
 #define G2D_IOC_WRITE_BUFFER	_IOW(G2D_IOC_MAGIC, 0x05, struct g2d_buffer_rw)
 #define G2D_IOC_READ_BUFFER		_IOR(G2D_IOC_MAGIC, 0x06, struct g2d_buffer_rw)
 #define G2D_IOC_SYNC			_IOW(G2D_IOC_MAGIC, 0x07, int)
+#define G2D_IOC_TASK			_IOWR(G2D_IOC_MAGIC, 0x08, struct g2d_task_req)
 
 /* New CSC Adjustment IOCTLs */
 #define G2D_IOC_SET_CSC_ADJUST   _IOW(G2D_IOC_MAGIC, 0x50, struct g2d_csc_adjust)

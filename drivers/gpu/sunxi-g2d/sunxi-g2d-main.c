@@ -91,12 +91,16 @@ MODULE_PARM_DESC(
 /* Forward declarations */
 struct sunxi_g2d_dev;
 struct sunxi_g2d_job;
+struct sunxi_g2d_ctx;
 
 /* Forward declarations for internal functions used before definition */
 static int sunxi_g2d_format_to_hw(u32 fmt, u32 *bpp);
 static void sunxi_g2d_get_yuv_plane_info(u32 fmt, u32 width, u32 height,
 					 const u32 *user_stride, u32 *stride,
 					 u32 *plane_offset);
+
+static struct dma_fence *sunxi_g2d_fence_create(struct sunxi_g2d_dev *g2d);
+static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work);
 
 static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 				 struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -106,6 +110,12 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 				 dma_addr_t dst_dma, u32 dst_width,
 				 u32 dst_height, u32 dst_pitch, u32 dst_format,
 				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h);
+
+static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
+				     struct g2d_rcq_mem *rcq,
+				     dma_addr_t dst_dma, u32 width, u32 height,
+				     u32 pitch, u32 color, u32 color_format,
+				     u32 dst_format);
 
 static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 				  struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -127,6 +137,13 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, struct g2d_csc_state *csc_state);
+
+static int sunxi_g2d_do_blit_rot(
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format,
+	u32 src_crop_x, u32 src_crop_y, u32 src_crop_w, u32 src_crop_h,
+	dma_addr_t dst_dma, u32 dst_width, u32 dst_height, u32 dst_pitch,
+	u32 dst_format, u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags);
 
 struct g2d_dma_mem {
 	void *vaddr;
@@ -558,6 +575,11 @@ struct sunxi_g2d_dev {
 	/* Pool telemetry */
 	atomic64_t job_pool_hits; /* Reused from pool */
 	atomic64_t job_pool_misses; /* Needed fresh alloc */
+
+	/* Persistent tasks */
+	struct list_head task_list;
+	u32 next_task_id;
+	struct mutex task_lock;
 };
 
 /**
@@ -682,6 +704,8 @@ struct sunxi_g2d_job {
 	/* Prebuilt RCQ buffer for this job (built in ioctl context) */
 	struct g2d_rcq_mem rcq;
 	bool rcq_ready;
+	bool rcq_external; /* true when rcq owned by persistent task */
+	bool persistent_refs; /* true when DMA-BUF refs owned by persistent task */
 
 	/* Temporary buffers for multi-step operations */
 	struct g2d_dma_mem temp_buf;
@@ -694,6 +718,52 @@ struct sunxi_g2d_job {
 	u32 temp2_height;
 	u32 temp2_pitch;
 	u32 temp2_format;
+};
+
+struct g2d_task_step {
+	struct list_head node;
+	enum g2d_job_type type;
+	struct g2d_rcq_mem rcq;
+	bool rcq_ready;
+
+	/* Persistent buffer references to keep mappings alive */
+	struct dma_buf *src_dmabuf;
+	struct dma_buf_attachment *src_attach;
+	struct sg_table *src_sgt;
+
+	struct dma_buf *dst_dmabuf;
+	struct dma_buf_attachment *dst_attach;
+	struct sg_table *dst_sgt;
+
+	struct dma_buf *out_dmabuf;
+	struct dma_buf_attachment *out_attach;
+	struct sg_table *out_sgt;
+
+	dma_addr_t src_dma;
+	dma_addr_t dst_dma;
+	dma_addr_t out_dma;
+
+	struct g2d_job_blit_data blit;
+	struct g2d_job_fillrect_data fillrect;
+	struct g2d_csc_state csc_state;
+};
+
+struct g2d_task {
+	struct list_head node;
+	u32 id;
+	struct list_head steps; /* list of g2d_task_step */
+	unsigned int step_count;
+	struct mutex lock;
+	struct sunxi_g2d_dev *g2d;
+	struct sunxi_g2d_ctx *owner;
+};
+
+/* Per-file-descriptor context */
+struct sunxi_g2d_ctx {
+	struct sunxi_g2d_dev *g2d;
+	struct g2d_csc_state csc_state;
+	bool csc_changed;
+	struct list_head tasks; /* Tasks owned by this context */
 };
 
 /* ===== Job pool helpers ===== */
@@ -759,6 +829,600 @@ static int g2d_job_prepare_rcq(struct sunxi_g2d_dev *g2d,
 		return ret;
 
 	job->rcq_ready = false;
+	return 0;
+}
+
+/* ===== Task helpers ===== */
+static void g2d_task_step_free(struct sunxi_g2d_dev *g2d,
+			       struct g2d_task_step *step)
+{
+	if (!step)
+		return;
+
+	if (step->rcq.vir_addr)
+		sunxi_g2d_rcq_free(g2d->dev, &step->rcq);
+
+	if (step->src_sgt && step->src_attach)
+		dma_buf_unmap_attachment(step->src_attach, step->src_sgt,
+					 DMA_TO_DEVICE);
+	if (step->src_attach && step->src_dmabuf)
+		dma_buf_detach(step->src_dmabuf, step->src_attach);
+	if (step->src_dmabuf)
+		dma_buf_put(step->src_dmabuf);
+
+	if (step->dst_sgt && step->dst_attach)
+		dma_buf_unmap_attachment(step->dst_attach, step->dst_sgt,
+					 DMA_FROM_DEVICE);
+	if (step->dst_attach && step->dst_dmabuf)
+		dma_buf_detach(step->dst_dmabuf, step->dst_attach);
+	if (step->dst_dmabuf)
+		dma_buf_put(step->dst_dmabuf);
+
+	if (step->out_sgt && step->out_attach)
+		dma_buf_unmap_attachment(step->out_attach, step->out_sgt,
+					 DMA_FROM_DEVICE);
+	if (step->out_attach && step->out_dmabuf)
+		dma_buf_detach(step->out_dmabuf, step->out_attach);
+	if (step->out_dmabuf)
+		dma_buf_put(step->out_dmabuf);
+
+	kfree(step);
+}
+
+static void g2d_task_destroy(struct sunxi_g2d_dev *g2d, struct g2d_task *task)
+{
+	struct g2d_task_step *step, *tmp;
+
+	if (!task)
+		return;
+
+	mutex_lock(&task->lock);
+	list_for_each_entry_safe(step, tmp, &task->steps, node) {
+		list_del(&step->node);
+		g2d_task_step_free(g2d, step);
+	}
+	task->step_count = 0;
+	mutex_unlock(&task->lock);
+
+	kfree(task);
+}
+
+static struct g2d_task *g2d_task_find(struct sunxi_g2d_dev *g2d,
+				      struct sunxi_g2d_ctx *ctx, u32 id)
+{
+	struct g2d_task *task;
+
+	list_for_each_entry(task, &g2d->task_list, node) {
+		if (task->id == id && task->owner == ctx)
+			return task;
+	}
+	return NULL;
+}
+
+static int g2d_task_run(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
+			struct g2d_task_req *req)
+{
+	struct sunxi_g2d_dev *g2d = ctx->g2d;
+	struct g2d_task_step *step;
+	int fence_fd = -1;
+	int ret = 0;
+
+	if (!task || list_empty(&task->steps))
+		return -EINVAL;
+
+	mutex_lock(&task->lock);
+	list_for_each_entry(step, &task->steps, node) {
+		struct sunxi_g2d_job *job;
+		bool is_last = (step->node.next == &task->steps);
+
+		if (!step->rcq_ready || !step->rcq.vir_addr) {
+			ret = -EINVAL;
+			break;
+		}
+
+		job = g2d_job_alloc(g2d);
+		if (IS_ERR(job) || !job) {
+			ret = IS_ERR(job) ? PTR_ERR(job) : -ENOMEM;
+			break;
+		}
+
+		INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+		job->g2d = g2d;
+		job->csc_state = step->csc_state;
+		job->type = step->type;
+
+		job->src_dmabuf = step->src_dmabuf;
+		job->src_attach = step->src_attach;
+		job->src_sgt = step->src_sgt;
+		job->dst_dmabuf = step->dst_dmabuf;
+		job->dst_attach = step->dst_attach;
+		job->dst_sgt = step->dst_sgt;
+		job->out_dmabuf = step->out_dmabuf;
+		job->out_attach = step->out_attach;
+		job->out_sgt = step->out_sgt;
+
+		job->src_dma = step->src_dma;
+		job->dst_dma = step->dst_dma;
+		job->out_dma = step->out_dma;
+
+		if (step->type == G2D_JOB_FILLRECT)
+			job->data.fillrect = step->fillrect;
+		else
+			job->data.blit = step->blit;
+
+		job->rcq = step->rcq;
+		job->rcq_ready = step->rcq_ready;
+		job->rcq_external = true;
+		job->persistent_refs = true;
+
+		job->fence = sunxi_g2d_fence_create(g2d);
+		if (!job->fence) {
+			g2d_job_free(g2d, job);
+			ret = -ENOMEM;
+			break;
+		}
+
+		if (is_last) {
+			job->sync_file = sync_file_create(job->fence);
+			if (!job->sync_file) {
+				dma_fence_put(job->fence);
+				g2d_job_free(g2d, job);
+				ret = -ENOMEM;
+				break;
+			}
+
+			fence_fd = get_unused_fd_flags(O_CLOEXEC);
+			if (fence_fd < 0) {
+				struct sync_file *sf = job->sync_file;
+				if (sf && sf->file)
+					fput(sf->file);
+				job->sync_file = NULL;
+				dma_fence_put(job->fence);
+				g2d_job_free(g2d, job);
+				ret = fence_fd;
+				break;
+			}
+
+			fd_install(fence_fd, job->sync_file->file);
+			job->fence_fd = fence_fd;
+			job->sync_file = NULL;
+		} else {
+			job->fence_fd = -1;
+			job->sync_file = NULL;
+		}
+
+		/* Enqueue job */
+		{
+			unsigned long flags;
+			spin_lock_irqsave(&g2d->job_lock, flags);
+			list_add_tail(&job->node, &g2d->job_queue);
+			spin_unlock_irqrestore(&g2d->job_lock, flags);
+		}
+		queue_work(g2d->job_wq, &g2d->job_work);
+	}
+	mutex_unlock(&task->lock);
+
+	if (ret) {
+		if (fence_fd >= 0)
+			put_unused_fd(fence_fd);
+		return ret;
+	}
+
+	req->fence_fd_out = fence_fd;
+	return 0;
+}
+
+static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
+			     struct g2d_cmd *cmd)
+{
+	struct sunxi_g2d_dev *g2d = ctx->g2d;
+	struct g2d_task_step *step;
+	int ret = 0;
+
+	step = kzalloc(sizeof(*step), GFP_KERNEL);
+	if (!step)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&step->node);
+	step->csc_state = ctx->csc_changed ? ctx->csc_state : g2d->csc_state;
+
+	ret = sunxi_g2d_rcq_alloc(g2d->dev, &step->rcq, G2D_RCQ_MAX_SIZE);
+	if (ret) {
+		kfree(step);
+		return ret;
+	}
+
+	switch (cmd->cmd_type) {
+	case G2D_CMD_FILLRECT: {
+		struct dma_buf *dst_dmabuf;
+		struct dma_buf_attachment *dst_attach;
+		struct sg_table *dst_sgt;
+		dma_addr_t dst_dma;
+		u32 dst_bpp;
+
+		if (sunxi_g2d_format_to_hw(cmd->dst.format, &dst_bpp) < 0) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+
+		dst_dmabuf = dma_buf_get(cmd->dst.dma_fd);
+		if (IS_ERR(dst_dmabuf)) {
+			ret = PTR_ERR(dst_dmabuf);
+			break;
+		}
+
+		dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+		if (IS_ERR(dst_attach)) {
+			ret = PTR_ERR(dst_attach);
+			dma_buf_put(dst_dmabuf);
+			break;
+		}
+
+		dst_sgt = dma_buf_map_attachment(dst_attach, DMA_TO_DEVICE);
+		if (IS_ERR(dst_sgt)) {
+			ret = PTR_ERR(dst_sgt);
+			dma_buf_detach(dst_dmabuf, dst_attach);
+			dma_buf_put(dst_dmabuf);
+			break;
+		}
+
+		ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma,
+					 "TASK_FILLRECT dst");
+		if (ret) {
+			dma_buf_unmap_attachment(dst_attach, dst_sgt,
+						 DMA_TO_DEVICE);
+			dma_buf_detach(dst_dmabuf, dst_attach);
+			dma_buf_put(dst_dmabuf);
+			break;
+		}
+
+		step->dst_dmabuf = dst_dmabuf;
+		step->dst_attach = dst_attach;
+		step->dst_sgt = dst_sgt;
+		step->dst_dma = dst_dma;
+
+		step->fillrect.width = cmd->dst_w;
+		step->fillrect.height = cmd->dst_h;
+		step->fillrect.pitch = cmd->dst.stride[0] ?
+					       cmd->dst.stride[0] :
+					       (cmd->dst.width * dst_bpp);
+		step->fillrect.color = cmd->params.fillrect.color;
+		step->fillrect.color_format = cmd->dst.format;
+		step->fillrect.dst_format = cmd->dst.format;
+
+		ret = sunxi_g2d_do_fillrect_rcq(
+			g2d, &step->rcq, step->dst_dma, step->fillrect.width,
+			step->fillrect.height, step->fillrect.pitch,
+			step->fillrect.color, step->fillrect.color_format,
+			step->fillrect.dst_format);
+		if (!ret)
+			step->rcq_ready = true;
+		step->type = G2D_JOB_FILLRECT;
+		break;
+	}
+
+	case G2D_CMD_COPY:
+	case G2D_CMD_SCALE:
+	case G2D_CMD_BLEND:
+	case G2D_CMD_ROTATE:
+	case G2D_CMD_MASK: {
+		struct dma_buf *src_dmabuf = NULL, *dst_dmabuf = NULL,
+			       *out_dmabuf = NULL;
+		struct dma_buf_attachment *src_attach = NULL,
+					  *dst_attach = NULL,
+					  *out_attach = NULL;
+		struct sg_table *src_sgt = NULL, *dst_sgt = NULL,
+				*out_sgt = NULL;
+		dma_addr_t src_dma = 0, dst_dma = 0, out_dma = 0;
+		u32 src_bpp = 0, dst_bpp = 0, out_bpp = 0;
+		u32 dst_stride[3] = { 0 }, dst_plane_offset[3] = { 0 };
+		u32 out_stride[3] = { 0 }, out_plane_offset[3] = { 0 };
+		u32 src_stride[3] = { 0 }, src_plane_offset[3] = { 0 };
+		bool has_out = (cmd->out.dma_fd >= 0);
+
+		if (sunxi_g2d_format_to_hw(cmd->src.format, &src_bpp) < 0) {
+			ret = -EOPNOTSUPP;
+			goto blit_cleanup;
+		}
+		if (sunxi_g2d_format_to_hw(cmd->dst.format, &dst_bpp) < 0) {
+			ret = -EOPNOTSUPP;
+			goto blit_cleanup;
+		}
+		if (has_out &&
+		    sunxi_g2d_format_to_hw(cmd->out.format, &out_bpp) < 0) {
+			ret = -EOPNOTSUPP;
+			goto blit_cleanup;
+		}
+
+		if (cmd->cmd_type == G2D_CMD_COPY &&
+		    (cmd->src.crop_w != cmd->dst_w ||
+		     cmd->src.crop_h != cmd->dst_h)) {
+			ret = -EINVAL;
+			goto blit_cleanup;
+		}
+
+		if (cmd->cmd_type == G2D_CMD_BLEND && !has_out) {
+			ret = -EINVAL;
+			goto blit_cleanup;
+		}
+
+		src_dmabuf = dma_buf_get(cmd->src.dma_fd);
+		if (IS_ERR(src_dmabuf)) {
+			ret = PTR_ERR(src_dmabuf);
+			goto blit_cleanup;
+		}
+		src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
+		if (IS_ERR(src_attach)) {
+			ret = PTR_ERR(src_attach);
+			goto blit_cleanup;
+		}
+		src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
+		if (IS_ERR(src_sgt)) {
+			ret = PTR_ERR(src_sgt);
+			goto blit_cleanup;
+		}
+
+		sunxi_g2d_get_yuv_plane_info(cmd->src.format, cmd->src.width,
+					     cmd->src.height, cmd->src.stride,
+					     src_stride, src_plane_offset);
+
+		ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma,
+					 "TASK src");
+		if (ret)
+			goto blit_cleanup;
+
+		dst_dmabuf = dma_buf_get(cmd->dst.dma_fd);
+		if (IS_ERR(dst_dmabuf)) {
+			ret = PTR_ERR(dst_dmabuf);
+			goto blit_cleanup;
+		}
+		dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
+		if (IS_ERR(dst_attach)) {
+			ret = PTR_ERR(dst_attach);
+			goto blit_cleanup;
+		}
+		dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
+		if (IS_ERR(dst_sgt)) {
+			ret = PTR_ERR(dst_sgt);
+			goto blit_cleanup;
+		}
+
+		sunxi_g2d_get_yuv_plane_info(cmd->dst.format, cmd->dst.width,
+					     cmd->dst.height, cmd->dst.stride,
+					     dst_stride, dst_plane_offset);
+
+		ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma,
+					 "TASK dst");
+		if (ret)
+			goto blit_cleanup;
+
+		if (has_out) {
+			out_dmabuf = dma_buf_get(cmd->out.dma_fd);
+			if (IS_ERR(out_dmabuf)) {
+				ret = PTR_ERR(out_dmabuf);
+				goto blit_cleanup;
+			}
+			out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
+			if (IS_ERR(out_attach)) {
+				ret = PTR_ERR(out_attach);
+				goto blit_cleanup;
+			}
+			out_sgt = dma_buf_map_attachment(out_attach,
+							 DMA_FROM_DEVICE);
+			if (IS_ERR(out_sgt)) {
+				ret = PTR_ERR(out_sgt);
+				goto blit_cleanup;
+			}
+			sunxi_g2d_get_yuv_plane_info(
+				cmd->out.format, cmd->out.width,
+				cmd->out.height, cmd->out.stride, out_stride,
+				out_plane_offset);
+			ret = g2d_sg_dma_address(g2d->dev, out_sgt, &out_dma,
+						 "TASK out");
+			if (ret)
+				goto blit_cleanup;
+		} else {
+			out_dma = dst_dma;
+			memcpy(out_stride, dst_stride, sizeof(out_stride));
+			memcpy(out_plane_offset, dst_plane_offset,
+			       sizeof(out_plane_offset));
+		}
+
+		step->src_dmabuf = src_dmabuf;
+		step->src_attach = src_attach;
+		step->src_sgt = src_sgt;
+		step->dst_dmabuf = dst_dmabuf;
+		step->dst_attach = dst_attach;
+		step->dst_sgt = dst_sgt;
+		step->out_dmabuf = out_dmabuf;
+		step->out_attach = out_attach;
+		step->out_sgt = out_sgt;
+
+		step->src_dma = src_dma;
+		step->dst_dma = dst_dma;
+		step->out_dma = out_dma;
+
+		/* Fill blit data for reuse */
+		step->blit.src_width = cmd->src.width;
+		step->blit.src_height = cmd->src.height;
+		step->blit.src_pitch = src_stride[0];
+		step->blit.src_format = cmd->src.format;
+		step->blit.src_crop_x = cmd->src.crop_x;
+		step->blit.src_crop_y = cmd->src.crop_y;
+		step->blit.src_crop_w = cmd->src.crop_w;
+		step->blit.src_crop_h = cmd->src.crop_h;
+		step->blit.src_alpha = cmd->src.alpha;
+		step->blit.src_alpha_mode = cmd->src.alpha_mode;
+		step->blit.src_premul = cmd->src.premul_mode;
+		step->blit.src_color_space = cmd->src.color_space;
+
+		step->blit.dst_width = cmd->dst.width;
+		step->blit.dst_height = cmd->dst.height;
+		step->blit.dst_pitch = dst_stride[0];
+		step->blit.dst_format = cmd->dst.format;
+		step->blit.dst_x = cmd->dst_x;
+		step->blit.dst_y = cmd->dst_y;
+		step->blit.dst_w = cmd->dst_w;
+		step->blit.dst_h = cmd->dst_h;
+		step->blit.dst_alpha = cmd->dst.alpha;
+		step->blit.dst_alpha_mode = cmd->dst.alpha_mode;
+		step->blit.dst_premul = cmd->dst.premul_mode;
+		step->blit.dst_color_space = cmd->dst.color_space;
+
+		step->blit.out_width =
+			has_out ? cmd->out.width : cmd->dst.width;
+		step->blit.out_height =
+			has_out ? cmd->out.height : cmd->dst.height;
+		step->blit.out_pitch =
+			has_out ? out_stride[0] : dst_stride[0];
+		step->blit.out_format =
+			has_out ? cmd->out.format : cmd->dst.format;
+
+		step->blit.bld_mode =
+			(cmd->cmd_type == G2D_CMD_MASK) ?
+				G2D_BLD_SRCOVER :
+				cmd->params.blend.bld_mode;
+		step->blit.color_key_enable =
+			(cmd->cmd_type == G2D_CMD_MASK);
+		step->blit.color_key_mode = cmd->params.mask.color_key_mode;
+		step->blit.color_key_min = cmd->params.mask.color_key_min;
+		step->blit.color_key_max = cmd->params.mask.color_key_max;
+		step->blit.flags = cmd->flags;
+
+		if (cmd->cmd_type == G2D_CMD_COPY) {
+			step->type = G2D_JOB_CMD_COPY;
+			ret = sunxi_g2d_do_blit_rcq(
+				g2d, &step->rcq, step->src_dma,
+				step->blit.src_width, step->blit.src_height,
+				step->blit.src_pitch, step->blit.src_format,
+				step->blit.src_crop_x, step->blit.src_crop_y,
+				step->blit.src_crop_w, step->blit.src_crop_h,
+				step->dst_dma, step->blit.dst_width,
+				step->blit.dst_height, step->blit.dst_pitch,
+				step->blit.dst_format, step->blit.dst_x,
+				step->blit.dst_y, step->blit.dst_w,
+				step->blit.dst_h);
+		} else if (cmd->cmd_type == G2D_CMD_SCALE) {
+			step->type = G2D_JOB_CMD_SCALE;
+			ret = sunxi_g2d_do_scale_rcq(
+				g2d, &step->rcq, step->src_dma,
+				step->blit.src_width, step->blit.src_height,
+				step->blit.src_pitch, step->blit.src_format,
+				step->blit.src_crop_x, step->blit.src_crop_y,
+				step->blit.src_crop_w, step->blit.src_crop_h,
+				step->dst_dma, step->blit.dst_width,
+				step->blit.dst_height, step->blit.dst_pitch,
+				step->blit.dst_format, step->blit.dst_x,
+				step->blit.dst_y, step->blit.dst_w,
+				step->blit.dst_h, step->blit.src_color_space,
+				step->blit.dst_color_space, &step->csc_state);
+		} else if (cmd->cmd_type == G2D_CMD_BLEND ||
+			   cmd->cmd_type == G2D_CMD_MASK) {
+			step->type = (cmd->cmd_type == G2D_CMD_BLEND) ?
+					     G2D_JOB_CMD_BLEND :
+					     G2D_JOB_CMD_MASK;
+			ret = sunxi_g2d_do_blend_rcq(
+				g2d, &step->rcq, step->src_dma,
+				step->blit.src_width, step->blit.src_height,
+				step->blit.src_pitch, step->blit.src_format,
+				step->blit.src_crop_x, step->blit.src_crop_y,
+				step->blit.src_crop_w, step->blit.src_crop_h,
+				step->dst_dma, step->blit.dst_width,
+				step->blit.dst_height, step->blit.dst_pitch,
+				step->blit.dst_format, step->blit.dst_x,
+				step->blit.dst_y, step->out_dma,
+				step->blit.out_width, step->blit.out_height,
+				step->blit.out_pitch, step->blit.out_format,
+				step->blit.dst_x, step->blit.dst_y,
+				step->blit.dst_w, step->blit.dst_h,
+				step->blit.bld_mode, step->blit.src_alpha_mode,
+				step->blit.src_alpha, step->blit.src_premul,
+				&step->csc_state);
+		} else if (cmd->cmd_type == G2D_CMD_ROTATE) {
+			u32 flags = 0;
+			step->type = G2D_JOB_CMD_ROTATE;
+			if (cmd->params.rotate.angle == 90)
+				flags |= G2D_BLIT_FLAG_ROTATE_90;
+			else if (cmd->params.rotate.angle == 180)
+				flags |= G2D_BLIT_FLAG_ROTATE_180;
+			else if (cmd->params.rotate.angle == 270)
+				flags |= G2D_BLIT_FLAG_ROTATE_270;
+			if (cmd->params.rotate.flip_h)
+				flags |= G2D_BLIT_FLAG_FLIP_H;
+			if (cmd->params.rotate.flip_v)
+				flags |= G2D_BLIT_FLAG_FLIP_V;
+
+			ret = sunxi_g2d_do_blit_rot(
+				g2d, &step->rcq, step->src_dma,
+				step->blit.src_width, step->blit.src_height,
+				step->blit.src_pitch, step->blit.src_format,
+				step->blit.src_crop_x, step->blit.src_crop_y,
+				step->blit.src_crop_w, step->blit.src_crop_h,
+				step->dst_dma, step->blit.dst_width,
+				step->blit.dst_height, step->blit.dst_pitch,
+				step->blit.dst_format, step->blit.dst_x,
+				step->blit.dst_y, step->blit.dst_w,
+				step->blit.dst_h, flags);
+		}
+
+blit_cleanup:
+		if (ret) {
+			if (out_sgt && !IS_ERR(out_sgt))
+				dma_buf_unmap_attachment(out_attach, out_sgt,
+							 DMA_FROM_DEVICE);
+			if (out_attach && out_dmabuf &&
+			    !IS_ERR(out_attach))
+				dma_buf_detach(out_dmabuf, out_attach);
+			if (out_dmabuf && !IS_ERR(out_dmabuf))
+				dma_buf_put(out_dmabuf);
+
+			if (dst_sgt && !IS_ERR(dst_sgt))
+				dma_buf_unmap_attachment(dst_attach, dst_sgt,
+							 DMA_FROM_DEVICE);
+			if (dst_attach && dst_dmabuf &&
+			    !IS_ERR(dst_attach))
+				dma_buf_detach(dst_dmabuf, dst_attach);
+			if (dst_dmabuf && !IS_ERR(dst_dmabuf))
+				dma_buf_put(dst_dmabuf);
+
+			if (src_sgt && !IS_ERR(src_sgt))
+				dma_buf_unmap_attachment(src_attach, src_sgt,
+							 DMA_TO_DEVICE);
+			if (src_attach && src_dmabuf &&
+			    !IS_ERR(src_attach))
+				dma_buf_detach(src_dmabuf, src_attach);
+			if (src_dmabuf && !IS_ERR(src_dmabuf))
+				dma_buf_put(src_dmabuf);
+
+			step->src_dmabuf = NULL;
+			step->src_attach = NULL;
+			step->src_sgt = NULL;
+			step->dst_dmabuf = NULL;
+			step->dst_attach = NULL;
+			step->dst_sgt = NULL;
+			step->out_dmabuf = NULL;
+			step->out_attach = NULL;
+			step->out_sgt = NULL;
+		} else {
+			step->rcq_ready = true;
+		}
+		break;
+	}
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	if (ret) {
+		g2d_task_step_free(g2d, step);
+		return ret;
+	}
+
+	mutex_lock(&task->lock);
+	list_add_tail(&step->node, &task->steps);
+	task->step_count++;
+	mutex_unlock(&task->lock);
+
 	return 0;
 }
 
@@ -1066,46 +1730,48 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 	}
 
 	/* Release imported DMA-BUFs (if any) */
-	if (job->src_sgt && job->src_attach) {
-		dma_buf_unmap_attachment(job->src_attach, job->src_sgt,
-					 DMA_TO_DEVICE);
-		job->src_sgt = NULL;
-	}
-	if (job->src_attach && job->src_dmabuf) {
-		dma_buf_detach(job->src_dmabuf, job->src_attach);
-		job->src_attach = NULL;
-	}
-	if (job->src_dmabuf) {
-		dma_buf_put(job->src_dmabuf);
-		job->src_dmabuf = NULL;
-	}
+	if (!job->persistent_refs) {
+		if (job->src_sgt && job->src_attach) {
+			dma_buf_unmap_attachment(job->src_attach, job->src_sgt,
+						 DMA_TO_DEVICE);
+			job->src_sgt = NULL;
+		}
+		if (job->src_attach && job->src_dmabuf) {
+			dma_buf_detach(job->src_dmabuf, job->src_attach);
+			job->src_attach = NULL;
+		}
+		if (job->src_dmabuf) {
+			dma_buf_put(job->src_dmabuf);
+			job->src_dmabuf = NULL;
+		}
 
-	if (job->dst_sgt && job->dst_attach) {
-		dma_buf_unmap_attachment(job->dst_attach, job->dst_sgt,
-					 DMA_FROM_DEVICE);
-		job->dst_sgt = NULL;
-	}
-	if (job->dst_attach && job->dst_dmabuf) {
-		dma_buf_detach(job->dst_dmabuf, job->dst_attach);
-		job->dst_attach = NULL;
-	}
-	if (job->dst_dmabuf) {
-		dma_buf_put(job->dst_dmabuf);
-		job->dst_dmabuf = NULL;
-	}
+		if (job->dst_sgt && job->dst_attach) {
+			dma_buf_unmap_attachment(job->dst_attach, job->dst_sgt,
+						 DMA_FROM_DEVICE);
+			job->dst_sgt = NULL;
+		}
+		if (job->dst_attach && job->dst_dmabuf) {
+			dma_buf_detach(job->dst_dmabuf, job->dst_attach);
+			job->dst_attach = NULL;
+		}
+		if (job->dst_dmabuf) {
+			dma_buf_put(job->dst_dmabuf);
+			job->dst_dmabuf = NULL;
+		}
 
-	if (job->out_sgt && job->out_attach) {
-		dma_buf_unmap_attachment(job->out_attach, job->out_sgt,
-					 DMA_FROM_DEVICE);
-		job->out_sgt = NULL;
-	}
-	if (job->out_attach && job->out_dmabuf) {
-		dma_buf_detach(job->out_dmabuf, job->out_attach);
-		job->out_attach = NULL;
-	}
-	if (job->out_dmabuf) {
-		dma_buf_put(job->out_dmabuf);
-		job->out_dmabuf = NULL;
+		if (job->out_sgt && job->out_attach) {
+			dma_buf_unmap_attachment(job->out_attach, job->out_sgt,
+						 DMA_FROM_DEVICE);
+			job->out_sgt = NULL;
+		}
+		if (job->out_attach && job->out_dmabuf) {
+			dma_buf_detach(job->out_dmabuf, job->out_attach);
+			job->out_attach = NULL;
+		}
+		if (job->out_dmabuf) {
+			dma_buf_put(job->out_dmabuf);
+			job->out_dmabuf = NULL;
+		}
 	}
 
 	/* Release temporary buffers allocated by the driver */
@@ -1126,7 +1792,7 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 				job->temp2_buf.size);
 			g2d_dma_mem_free(job->g2d->dev, &job->temp2_buf);
 		}
-		if (job->rcq.vir_addr) {
+		if (job->rcq.vir_addr && !job->rcq_external) {
 			sunxi_g2d_rcq_free(job->g2d->dev, &job->rcq);
 			job->rcq_ready = false;
 		}
@@ -2564,13 +3230,6 @@ cleanup:
 
 
 
-/* Per-file-descriptor context */
-struct sunxi_g2d_ctx {
-	struct sunxi_g2d_dev *g2d;
-	struct g2d_csc_state csc_state;
-	bool csc_changed;
-};
-
 static int sunxi_g2d_open(struct inode *inode, struct file *file)
 {
 	struct sunxi_g2d_dev *g2d =
@@ -2590,6 +3249,7 @@ static int sunxi_g2d_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	ctx->g2d = g2d;
+	INIT_LIST_HEAD(&ctx->tasks);
 	/* CSC state will be initialized from global state inside mutex */
 	ctx->csc_changed = false;
 
@@ -2629,8 +3289,19 @@ static int sunxi_g2d_release(struct inode *inode, struct file *file)
 {
 	struct sunxi_g2d_ctx *ctx = file->private_data;
 	struct sunxi_g2d_dev *g2d = ctx->g2d;
+	struct g2d_task *task, *tmp;
 
 	dev_dbg(g2d->dev, "Device released\n");
+
+	/* Destroy all tasks owned by this context */
+	mutex_lock(&g2d->task_lock);
+	list_for_each_entry_safe(task, tmp, &g2d->task_list, node) {
+		if (task->owner == ctx) {
+			list_del(&task->node);
+			g2d_task_destroy(g2d, task);
+		}
+	}
+	mutex_unlock(&g2d->task_lock);
 
 	/* Decrement user count and schedule hardware disable if last user.
 	 * We schedule a delayed work to ensure the HW is not disabled while
@@ -5874,6 +6545,7 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 {
 	struct sunxi_g2d_ctx *ctx = file->private_data;
 	struct sunxi_g2d_dev *g2d = ctx->g2d;
+	struct g2d_task_req task_req;
 
 	switch (cmd) {
 	case G2D_IOC_GET_VERSION:
@@ -5883,6 +6555,86 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		return sunxi_g2d_ioctl_cmd(ctx, arg);
 	case G2D_IOC_ALLOC_BUFFER:
 		return sunxi_g2d_ioctl_alloc_buffer(g2d, arg);
+	case G2D_IOC_TASK:
+		if (copy_from_user(&task_req, (void __user *)arg,
+				   sizeof(task_req)))
+			return -EFAULT;
+
+		switch (task_req.task_cmd) {
+		case G2D_TASK_CREATE: {
+			struct g2d_task *task;
+
+			task = kzalloc(sizeof(*task), GFP_KERNEL);
+			if (!task)
+				return -ENOMEM;
+
+			mutex_init(&task->lock);
+			INIT_LIST_HEAD(&task->steps);
+			task->g2d = g2d;
+			task->owner = ctx;
+
+			mutex_lock(&g2d->task_lock);
+			task->id = g2d->next_task_id++;
+			list_add_tail(&task->node, &g2d->task_list);
+			mutex_unlock(&g2d->task_lock);
+
+			task_req.task_id = task->id;
+			task_req.fence_fd_out = -1;
+			if (copy_to_user((void __user *)arg, &task_req,
+					 sizeof(task_req)))
+				return -EFAULT;
+			return 0;
+		}
+		case G2D_TASK_ADD: {
+			struct g2d_task *task;
+			int ret;
+
+			mutex_lock(&g2d->task_lock);
+			task = g2d_task_find(g2d, ctx, task_req.task_id);
+			mutex_unlock(&g2d->task_lock);
+			if (!task)
+				return -ENOENT;
+
+			ret = g2d_task_add_step(ctx, task, &task_req.step);
+			return ret;
+		}
+		case G2D_TASK_RUN: {
+			struct g2d_task *task;
+			int ret;
+
+			mutex_lock(&g2d->task_lock);
+			task = g2d_task_find(g2d, ctx, task_req.task_id);
+			mutex_unlock(&g2d->task_lock);
+			if (!task)
+				return -ENOENT;
+
+			task_req.fence_fd_out = -1;
+			ret = g2d_task_run(ctx, task, &task_req);
+			if (!ret) {
+				if (copy_to_user((void __user *)arg, &task_req,
+						 sizeof(task_req)))
+					return -EFAULT;
+			}
+			return ret;
+		}
+		case G2D_TASK_DEL: {
+			struct g2d_task *task;
+
+			mutex_lock(&g2d->task_lock);
+			task = g2d_task_find(g2d, ctx, task_req.task_id);
+			if (task) {
+				list_del(&task->node);
+			}
+			mutex_unlock(&g2d->task_lock);
+
+			if (!task)
+				return -ENOENT;
+			g2d_task_destroy(g2d, task);
+			return 0;
+		}
+		default:
+			return -EINVAL;
+		}
 	case G2D_IOC_SET_CSC_ADJUST: {
 		struct g2d_csc_adjust adj;
 		if (copy_from_user(&adj, (void __user *)arg, sizeof(adj)))
@@ -6639,6 +7391,11 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	atomic64_set(&g2d->vmap_failures, 0);
 	atomic64_set(&g2d->stage_wb_req_bytes, 0);
 
+	/* Initialize persistent task tracking */
+	INIT_LIST_HEAD(&g2d->task_list);
+	mutex_init(&g2d->task_lock);
+	g2d->next_task_id = 1;
+
 	/* Initialize fence context/sequence for dma-fence support */
 	g2d->fence_context = dma_fence_context_alloc(1);
 	atomic64_set(&g2d->fence_seqno, 0);
@@ -6814,6 +7571,17 @@ static void sunxi_g2d_remove(struct platform_device *pdev)
 		kmem_cache_destroy(g2d->job_cache);
 		g2d->job_cache = NULL;
 	}
+
+	/* Destroy any remaining tasks */
+	mutex_lock(&g2d->task_lock);
+	while (!list_empty(&g2d->task_list)) {
+		struct g2d_task *task =
+			list_first_entry(&g2d->task_list, struct g2d_task,
+					 node);
+		list_del(&task->node);
+		g2d_task_destroy(g2d, task);
+	}
+	mutex_unlock(&g2d->task_lock);
 
 	/* Remove sysfs telemetry attributes */
 	device_remove_file(&pdev->dev, &dev_attr_staging_src);

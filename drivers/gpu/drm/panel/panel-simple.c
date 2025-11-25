@@ -4466,7 +4466,8 @@ static const struct display_timing qt5000h40r79l_timing = {
     .vback_porch  = { 4, 8, 12 },
     .vsync_len    = { 4, 8, 12 },
 
-    .flags = DISPLAY_FLAGS_DE_HIGH | DISPLAY_FLAGS_PIXDATA_POSEDGE,
+    .flags = DISPLAY_FLAGS_HSYNC_LOW | DISPLAY_FLAGS_VSYNC_LOW |
+         DISPLAY_FLAGS_DE_HIGH | DISPLAY_FLAGS_PIXDATA_POSEDGE,
 };
 
 static const struct panel_desc qt5000h40r79l_desc = {
