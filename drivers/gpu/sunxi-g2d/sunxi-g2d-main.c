@@ -109,7 +109,8 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 				 u32 src_crop_w, u32 src_crop_h,
 				 dma_addr_t dst_dma, u32 dst_width,
 				 u32 dst_height, u32 dst_pitch, u32 dst_format,
-				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h);
+				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
+				 u8 src_color_space, u8 dst_color_space);
 
 static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 				     struct g2d_rcq_mem *rcq,
@@ -136,7 +137,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 dst_y, dma_addr_t out_dma, u32 out_width, u32 out_height,
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
-	u32 premul_mode, struct g2d_csc_state *csc_state);
+	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
+	u8 out_color_space, struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -646,6 +648,7 @@ struct g2d_job_blit_data {
 	u32 out_height;
 	u32 out_pitch;
 	u32 out_format;
+	u8 out_color_space;
 
 	/* Operation flags */
 	u32 flags;
@@ -1277,6 +1280,8 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 			has_out ? out_stride[0] : dst_stride[0];
 		step->blit.out_format =
 			has_out ? cmd->out.format : cmd->dst.format;
+		step->blit.out_color_space =
+			has_out ? cmd->out.color_space : cmd->dst.color_space;
 
 		step->blit.bld_mode =
 			(cmd->cmd_type == G2D_CMD_MASK) ?
@@ -1301,7 +1306,8 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 				step->blit.dst_height, step->blit.dst_pitch,
 				step->blit.dst_format, step->blit.dst_x,
 				step->blit.dst_y, step->blit.dst_w,
-				step->blit.dst_h);
+				step->blit.dst_h, step->blit.src_color_space,
+				step->blit.dst_color_space);
 		} else if (cmd->cmd_type == G2D_CMD_SCALE) {
 			step->type = G2D_JOB_CMD_SCALE;
 			ret = sunxi_g2d_do_scale_rcq(
@@ -1337,7 +1343,9 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 				step->blit.dst_w, step->blit.dst_h,
 				step->blit.bld_mode, step->blit.src_alpha_mode,
 				step->blit.src_alpha, step->blit.src_premul,
-				&step->csc_state);
+				step->blit.src_color_space,
+				step->blit.dst_color_space,
+				step->blit.out_color_space, &step->csc_state);
 		} else if (cmd->cmd_type == G2D_CMD_ROTATE) {
 			u32 flags = 0;
 			step->type = G2D_JOB_CMD_ROTATE;
@@ -2244,7 +2252,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 dst_y, dma_addr_t out_dma, u32 out_width, u32 out_height,
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
-	u32 premul_mode, struct g2d_csc_state *csc_state);
+	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
+	u8 out_color_space, struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -2338,8 +2347,10 @@ static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
 
 	/* Reset RCQ/mixer block before launching a new task */
 	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+	g2d_top->ahb_rst.bits.rot_ahb_rst = 0;
 	wmb();
 	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+	g2d_top->ahb_rst.bits.rot_ahb_rst = 1;
 	wmb();
 
 	/* Prepare IRQ */
@@ -2375,8 +2386,10 @@ static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
 
 	/* Reset after completion to keep mixer clean for next task */
 	g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+	g2d_top->ahb_rst.bits.rot_ahb_rst = 0;
 	wmb();
 	g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+	g2d_top->ahb_rst.bits.rot_ahb_rst = 1;
 	wmb();
 
 	return ret;
@@ -3722,6 +3735,8 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	job->data.blit.dst_w = cmd.dst_w;
 	job->data.blit.dst_h = cmd.dst_h;
 	job->data.blit.dst_color_space = cmd.dst.color_space;
+	job->data.blit.out_color_space = job->data.blit.dst_color_space;
+	job->data.blit.out_color_space = job->data.blit.dst_color_space;
 
 	ret = g2d_job_prepare_rcq(g2d, job);
 	if (ret)
@@ -4060,6 +4075,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	job->data.blit.out_height = cmd.out.height;
 	job->data.blit.out_pitch = out_stride[0];
 	job->data.blit.out_format = cmd.out.format;
+	job->data.blit.out_color_space = cmd.out.color_space;
 
 	job->data.blit.bld_mode = cmd.params.blend.bld_mode;
 
@@ -4082,7 +4098,8 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
 		job->data.blit.bld_mode, job->data.blit.src_alpha_mode,
 		job->data.blit.src_alpha, job->data.blit.src_premul,
-		&job->csc_state);
+		job->data.blit.src_color_space, job->data.blit.dst_color_space,
+		job->data.blit.out_color_space, &job->csc_state);
 	if (ret)
 		goto err_free_job;
 	job->rcq_ready = true;
@@ -4206,6 +4223,25 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		flags |= G2D_BLIT_FLAG_FLIP_H;
 	if (cmd.params.rotate.flip_v)
 		flags |= G2D_BLIT_FLAG_FLIP_V;
+
+	/* Check for scaling (not supported in ROTATE command) */
+	if (cmd.params.rotate.angle == 90 || cmd.params.rotate.angle == 270) {
+		if (cmd.src.crop_w != cmd.dst_h || cmd.src.crop_h != cmd.dst_w) {
+			dev_err(g2d->dev,
+				"G2D_CMD_ROTATE: Scaling not supported with rotation (src=%ux%u dst=%ux%u)\n",
+				cmd.src.crop_w, cmd.src.crop_h, cmd.dst_w,
+				cmd.dst_h);
+			return -EINVAL;
+		}
+	} else {
+		if (cmd.src.crop_w != cmd.dst_w || cmd.src.crop_h != cmd.dst_h) {
+			dev_err(g2d->dev,
+				"G2D_CMD_ROTATE: Scaling not supported with rotation (src=%ux%u dst=%ux%u)\n",
+				cmd.src.crop_w, cmd.src.crop_h, cmd.dst_w,
+				cmd.dst_h);
+			return -EINVAL;
+		}
+	}
 
 	/* Import source buffer */
 	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
@@ -4826,12 +4862,14 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.blit.out_height = cmd.out.height;
 		job->data.blit.out_pitch = out_stride[0];
 		job->data.blit.out_format = cmd.out.format;
+		job->data.blit.out_color_space = cmd.out.color_space;
 	} else {
 		/* In-place: out parameters = dst parameters */
 		job->data.blit.out_width = cmd.dst.width;
 		job->data.blit.out_height = cmd.dst.height;
 		job->data.blit.out_pitch = dst_stride[0];
 		job->data.blit.out_format = cmd.dst.format;
+		job->data.blit.out_color_space = cmd.dst.color_space;
 	}
 
 	/* Color keying parameters */
@@ -4861,7 +4899,8 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
 		job->data.blit.bld_mode, job->data.blit.src_alpha_mode,
 		job->data.blit.src_alpha, job->data.blit.src_premul,
-		&job->csc_state);
+		job->data.blit.src_color_space, job->data.blit.dst_color_space,
+		job->data.blit.out_color_space, &job->csc_state);
 	if (ret)
 		goto err_free_job;
 	job->rcq_ready = true;
@@ -5116,7 +5155,8 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
 		job->data.blit.dst_height, job->data.blit.dst_pitch,
 		job->data.blit.dst_format, job->data.blit.dst_x,
-		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h);
+		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
+		job->data.blit.src_color_space, job->data.blit.dst_color_space);
 	if (ret)
 		goto err_free_job;
 	job->rcq_ready = true;
@@ -5186,7 +5226,8 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 				 u32 src_crop_w, u32 src_crop_h,
 				 dma_addr_t dst_dma, u32 dst_width,
 				 u32 dst_height, u32 dst_pitch, u32 dst_format,
-				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h)
+				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
+				 u8 src_color_space, u8 dst_color_space)
 {
 	struct sunxi_g2d_rcq_frame_layout layout;
 	int src_fmt_val, dst_fmt_val;
@@ -5400,12 +5441,12 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 	 * - VSU processes V0 data if enabled, but it still feeds Pipe 0.
 	 * - Pipe 1 (UI2) is NOT used for simple blit/copy.
 	 */
-	ret = g2d_rcq_build_bld(dst_w, dst_h, dst_w, dst_h, dst_w, dst_h, src_fmt_val,
-				src_fmt_val, dst_fmt_val,
-				true, false, 0, 0, 0, 0,
+	ret = g2d_rcq_build_bld(dst_w, dst_h, dst_w, dst_h, dst_w, dst_h,
+				src_fmt_val, src_fmt_val, dst_fmt_val,
+				src_color_space, src_color_space,
+				dst_color_space, true, false, 0, 0, 0, 0,
 				G2D_BLD_COPY, 0, false, &g2d->csc_state,
-				(u32 **)&bld_regs,
-				&bld_size);
+				(u32 **)&bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build BLD block: %d\n", ret);
 		goto cleanup;
@@ -5762,11 +5803,11 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 	if (ret)
 		goto cleanup;
 
-	ret = g2d_rcq_build_bld(dst_w, dst_h, dst_w, dst_h, dst_width, dst_height,
-				src_fmt_val, src_fmt_val, dst_fmt_val,
-				true, false, dst_x,
-				dst_y, dst_x, dst_y, G2D_BLD_COPY, 0, false,
-				csc_state,
+	ret = g2d_rcq_build_bld(dst_w, dst_h, dst_w, dst_h, dst_width,
+				dst_height, src_fmt_val, src_fmt_val,
+				dst_fmt_val, src_colorspace, src_colorspace,
+				dst_colorspace, true, false, dst_x, dst_y, dst_x,
+				dst_y, G2D_BLD_COPY, 0, false, csc_state,
 				(u32 **)&bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build BLD block: %d\n", ret);
@@ -5949,7 +5990,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 dst_y, dma_addr_t out_dma, u32 out_width, u32 out_height,
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
-	u32 premul_mode, struct g2d_csc_state *csc_state)
+	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
+	u8 out_color_space, struct g2d_csc_state *csc_state)
 {
 	struct g2d_mixer_ovl_u_reg *ui2_regs = NULL; /* Foreground (src) */
 	struct g2d_mixer_ovl_v_reg *v0_regs = NULL; /* Background (dst) */
@@ -6158,18 +6200,18 @@ static int sunxi_g2d_do_blend_rcq(
 	 */
 	u32 fmt_p0 = swap_layers ? dst_hw_fmt : src_hw_fmt;
 	u32 fmt_p1 = swap_layers ? src_hw_fmt : dst_hw_fmt;
+	u8 cs_p0 = swap_layers ? dst_color_space : src_color_space;
+	u8 cs_p1 = swap_layers ? src_color_space : dst_color_space;
 	
 	/* Fix: Pass blend_w/h for both pipes.
 	 * If scaling is active, VSU scales Pipe 0 to blend_w.
 	 * Pipe 1 (V0) is configured to blend_w ROI.
 	 */
-	ret = g2d_rcq_build_bld(blend_w, blend_h, blend_w, blend_h,
-				blend_w, blend_h,
-				fmt_p0, fmt_p1, out_hw_fmt,
-				true, true, 0, 0, 0, 0,
+	ret = g2d_rcq_build_bld(blend_w, blend_h, blend_w, blend_h, blend_w,
+				blend_h, fmt_p0, fmt_p1, out_hw_fmt, cs_p0,
+				cs_p1, out_color_space, true, true, 0, 0, 0, 0,
 				bld_mode, premul_mode, false, csc_state,
-				(u32 **)&bld_regs,
-				&bld_size);
+				(u32 **)&bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "BLEND_RCQ: failed to build BLD block: %d\n",
 			ret);
@@ -6350,11 +6392,14 @@ void g2d_csc_init(struct g2d_csc_state *state)
 
 	state->base_601 = Ycbcr2rgb_601;
 	state->base_709 = Ycbcr2rgb_709;
+	state->base_2020 = Ycbcr2rgb_2020;
 
 	/* Initialize current tables with base values */
 	/* Offset 36 (Limit->Full) is what we use for YUV->RGB */
 	memcpy(state->current_601, Ycbcr2rgb_601, sizeof(state->current_601));
 	memcpy(state->current_709, Ycbcr2rgb_709, sizeof(state->current_709));
+	memcpy(state->current_2020, Ycbcr2rgb_2020,
+	       sizeof(state->current_2020));
 
 	/* Default adjustments */
 	state->adj.brightness = 0;
@@ -6363,6 +6408,7 @@ void g2d_csc_init(struct g2d_csc_state *state)
 
 	state->dirty_601 = false;
 	state->dirty_709 = false;
+	state->dirty_2020 = false;
 }
 
 /**
@@ -6422,6 +6468,22 @@ void g2d_csc_update(struct g2d_csc_state *state)
 		curr[r * 4 + 3] = (base[r * 4 + 3] * state->adj.contrast) / 100 +
 				  (state->adj.brightness << 10);
 	}
+
+	/* Update 2020 table */
+	curr = state->current_2020 + offset;
+	base = state->base_2020 + offset;
+
+	for (r = 0; r < 3; r++) {
+		curr[r * 4 + 0] = (base[r * 4 + 0] * state->adj.contrast) / 100;
+		curr[r * 4 + 1] =
+			(base[r * 4 + 1] * state->adj.contrast * state->adj.saturation) /
+			10000;
+		curr[r * 4 + 2] =
+			(base[r * 4 + 2] * state->adj.contrast * state->adj.saturation) /
+			10000;
+		curr[r * 4 + 3] = (base[r * 4 + 3] * state->adj.contrast) / 100 +
+				  (state->adj.brightness << 10);
+	}
 }
 
 /*
@@ -6467,7 +6529,7 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 	struct g2d_dma_buffer *buf;
 	struct dma_buf *dmabuf;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
-	int fd, ret;
+	int fd, ret;<
 
 	if (copy_from_user(&alloc, (void __user *)arg, sizeof(alloc))) {
 		dev_err(g2d->dev, "ALLOC_BUFFER: copy_from_user failed\n");
