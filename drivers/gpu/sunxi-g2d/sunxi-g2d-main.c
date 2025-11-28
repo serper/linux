@@ -2284,6 +2284,13 @@ static int sunxi_g2d_do_blit_rot(
 	else
 		return -EINVAL;
 
+	/* DEBUG: Verify ROT register access and buffer addresses */
+	{
+		u32 rot_ctl = readl(g2d->base + G2D_ROT);
+		dev_info(g2d->dev, "DEBUG: ROT_CTL=0x%08x src_dma=%pad dst_dma=%pad\n",
+			 rot_ctl, &src_dma, &dst_dma);
+	}
+
 	/* Build ROT block */
 	/* Use src_crop_w/h as input size to ROT */
 	ret = g2d_rcq_build_rot(src_crop_w, src_crop_h, src_pitch, src_dma,

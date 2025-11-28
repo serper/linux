@@ -358,6 +358,8 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 				blk = "MIXER";
 			else if (roff >= G2D_VSU && roff < (G2D_VSU + 0x2000))
 				blk = "SCAL";
+			else if (roff >= G2D_ROT && roff < (G2D_ROT + 0x1000))
+				blk = "ROT";
 
 			pr_debug("RCQ CPU hdr[%u]: low=0x%08x len=0x%08x high=0x%02x reg_off=0x%08x (%s)\n",
 				  i, low, len, high, roff, blk);
