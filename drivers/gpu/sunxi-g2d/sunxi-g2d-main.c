@@ -2308,15 +2308,14 @@ static int sunxi_g2d_do_blit_rot(
 	sunxi_g2d_rcq_reset(rcq);
 
 	/* Configure RCQ buffer with TWO blocks:
-	 * 1. Main ROT block (config, addresses, size) - START bit CLEARED
+	 * 1. Main ROT block (INT, SIZE, ADDR, etc.) - Skipping ROT_CTL (offset 0)
 	 * 2. Trigger block (ROT_CTL only) - START bit SET
 	 *
-	 * CRITICAL: RCQ headers must be contiguous at the start of the buffer!
-	 * The hardware (or at least the standard driver logic) expects a list of headers
-	 * followed by data blocks.
+	 * This ensures ROT_CTL is written LAST and ONLY ONCE, preventing any
+	 * premature latching or reset caused by writing it with start=0 first.
 	 *
 	 * Layout:
-	 * [Header 1 (16B)] [Header 2 (16B)] [Data 1 (rot_size)] [Data 2 (4B)]
+	 * [Header 1 (16B)] [Header 2 (16B)] [Data 1 (rot_size-4)] [Data 2 (4B)]
 	 */
 	{
 		struct g2d_rcq_header *header1, *header2;
@@ -2325,33 +2324,29 @@ static int sunxi_g2d_do_blit_rot(
 		u32 trigger_val;
 		struct g2d_rot_reg *rot_reg_ptr = (struct g2d_rot_reg *)rot_regs;
 		u32 header_size = sizeof(struct g2d_rcq_header);
+		u32 body_size = rot_size - 4; /* Skip ROT_CTL (4 bytes) */
 
 		/* Extract the start value we want to write last */
 		trigger_val = rot_reg_ptr->rot_ctrl.dwval | (1u << 31); /* Set START bit */
 
 		memset(cmd_buf, 0, rcq->size);
 
-		/* --- Header 1: Main Configuration --- */
+		/* --- Header 1: Main Configuration (Skip ROT_CTL) --- */
 		header1 = (struct g2d_rcq_header *)cmd_buf;
 		/* Data 1 starts after both headers (2 * 16 = 32 bytes offset) */
 		u32 data1_offset = 2 * header_size;
 		
 		header1->low_addr = lower_32_bits(cmd_dma + data1_offset);
-		header1->dw0.bits.len = rot_size;
+		header1->dw0.bits.len = body_size;
 		header1->dw0.bits.high_addr = upper_32_bits(cmd_dma + data1_offset);
 		header1->dirty.bits.dirty = 1;
-		/* n_header_len seems to be offset to next header or length of current header?
-		 * In standard packing, it's set to 0 for the last block.
-		 * For chained blocks, let's try setting it to header_size (16).
-		 * UPDATE: Standard builder sets it to 0. Let's stick to 0.
-		 */
 		header1->dirty.bits.n_header_len = 0; 
-		header1->reg_offset = G2D_ROT;
+		header1->reg_offset = G2D_ROT + 4; /* Start at ROT_INT */
 
-		/* --- Header 2: Trigger --- */
+		/* --- Header 2: Trigger (ROT_CTL) --- */
 		header2 = (struct g2d_rcq_header *)((u8 *)cmd_buf + header_size);
 		/* Data 2 starts after Data 1, MUST BE 32-BYTE ALIGNED */
-		u32 data2_offset = ALIGN(data1_offset + rot_size, 32);
+		u32 data2_offset = ALIGN(data1_offset + body_size, 32);
 
 		header2->low_addr = lower_32_bits(cmd_dma + data2_offset);
 		header2->dw0.bits.len = 4; /* 4 bytes */
@@ -2360,8 +2355,8 @@ static int sunxi_g2d_do_blit_rot(
 		header2->dirty.bits.n_header_len = 0; /* Last block */
 		header2->reg_offset = G2D_ROT; /* ROT_CTL offset 0 */
 
-		/* --- Data 1: Main Block --- */
-		memcpy((u8 *)cmd_buf + data1_offset, rot_regs, rot_size);
+		/* --- Data 1: Main Block (Skip ROT_CTL) --- */
+		memcpy((u8 *)cmd_buf + data1_offset, (u8 *)rot_regs + 4, body_size);
 
 		/* --- Data 2: Trigger Value --- */
 		*((u32 *)((u8 *)cmd_buf + data2_offset)) = trigger_val;
