@@ -70,6 +70,21 @@ static u32 g2d_rcq_get_bld_mode(u32 mode)
  * Uses "Full -> Limit" range for RGB->YUV (encoding/saving).
  * Uses "Limit -> Full" range for YUV->RGB (playback/display).
  */
+static enum g2d_rcq_csc_mode g2d_rcq_select_mode(u8 color_space,
+						 bool yuv_to_rgb)
+{
+	switch (color_space) {
+	case G2D_COLOR_SPACE_BT709:
+		return yuv_to_rgb ? G2D_CSC_YUV2RGB_709 : G2D_CSC_RGB2YUV_709;
+	case G2D_COLOR_SPACE_BT2020:
+		return yuv_to_rgb ? G2D_CSC_YUV2RGB_2020 :
+				    G2D_CSC_RGB2YUV_2020;
+	case G2D_COLOR_SPACE_BT601:
+	default:
+		return yuv_to_rgb ? G2D_CSC_YUV2RGB_601 : G2D_CSC_RGB2YUV_601;
+	}
+}
+
 static void g2d_rcq_bld_csc_set(struct g2d_mixer_bld_reg *bld, u32 csc_no,
 				enum g2d_rcq_csc_mode mode,
 				struct g2d_csc_state *csc_state)
@@ -77,6 +92,8 @@ static void g2d_rcq_bld_csc_set(struct g2d_mixer_bld_reg *bld, u32 csc_no,
 	void *csc_base_addr;
 	const s32 *coeff_table;
 	int offset = 0;
+	bool swap_rb = false;
+	s32 coeff_swizzled[12];
 	
 	if (!bld)
 		return;
@@ -103,6 +120,7 @@ static void g2d_rcq_bld_csc_set(struct g2d_mixer_bld_reg *bld, u32 csc_no,
 			coeff_table = Ycbcr2rgb_601;
 		}
 		offset = 36; /* Limit -> Full (0x24) */
+		swap_rb = true;
 		break;
 	case G2D_CSC_YUV2RGB_709:
 		/* Use dynamic table if available and initialized */
@@ -111,6 +129,19 @@ static void g2d_rcq_bld_csc_set(struct g2d_mixer_bld_reg *bld, u32 csc_no,
 		else
 			coeff_table = Ycbcr2rgb_709;
 		offset = 36; /* Limit -> Full (0x24) */
+		swap_rb = true;
+		break;
+	case G2D_CSC_RGB2YUV_2020:
+		coeff_table = rgb2Ycbcr_2020;
+		offset = 0;
+		break;
+	case G2D_CSC_YUV2RGB_2020:
+		if (csc_state && csc_state->base_2020)
+			coeff_table = csc_state->current_2020;
+		else
+			coeff_table = Ycbcr2rgb_2020;
+		offset = 36;
+		swap_rb = true;
 		break;
 	default:
 		return;
@@ -141,7 +172,20 @@ static void g2d_rcq_bld_csc_set(struct g2d_mixer_bld_reg *bld, u32 csc_no,
 	 * My dynamic tables are 48 ints too.
 	 * g2d_csc_update should update the block at offset 36.
 	 */
-	memcpy(csc_base_addr, coeff_table + offset, 12 * sizeof(u32));
+	/* Optionally swap R/B rows for hardware quirk */
+	if (swap_rb) {
+		/* Rows are in order R,G,B; swap row0 and row2 */
+		memcpy(coeff_swizzled + 0, coeff_table + offset + 8,
+		       4 * sizeof(s32)); /* B -> R slot */
+		memcpy(coeff_swizzled + 4, coeff_table + offset + 4,
+		       4 * sizeof(s32)); /* G stays */
+		memcpy(coeff_swizzled + 8, coeff_table + offset + 0,
+		       4 * sizeof(s32)); /* R -> B slot */
+		memcpy(csc_base_addr, coeff_swizzled, sizeof(coeff_swizzled));
+	} else {
+		memcpy(csc_base_addr, coeff_table + offset,
+		       12 * sizeof(u32));
+	}
 }
 
 /**
@@ -479,20 +523,16 @@ int g2d_rcq_build_bld_fillcolor(u32 width, u32 height, u32 fill_color,
  * Automatically configures CSC based on input/output formats.
  */
 int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
-		      u32 out_width, u32 out_height,
-		      u32 fmt_p0, u32 fmt_p1, u32 out_fmt,
-		      bool p0_en, bool p1_en,
-		      u32 p0_x, u32 p0_y,
-		      u32 p1_x, u32 p1_y,
-		      u32 bld_mode,
-		      u32 premul_mode,
-		      bool p1_is_copy_src,
-		      struct g2d_csc_state *csc_state,
-		      u32 **out_block, u32 *out_size)
+		      u32 out_width, u32 out_height, u32 fmt_p0, u32 fmt_p1,
+		      u32 out_fmt, u8 cs_p0, u8 cs_p1, u8 cs_out, bool p0_en,
+		      bool p1_en, u32 p0_x, u32 p0_y, u32 p1_x, u32 p1_y,
+		      u32 bld_mode, u32 premul_mode, bool p1_is_copy_src,
+		      struct g2d_csc_state *csc_state, u32 **out_block,
+		      u32 *out_size)
 {
 	struct g2d_mixer_bld_reg *bld;
 	bool p0_is_yuv, p1_is_yuv, out_is_yuv;
-	bool use_709;
+	enum g2d_rcq_csc_mode csc_p0, csc_p1, csc_out;
 
 	if (!out_block || !out_size)
 		return -EINVAL;
@@ -506,8 +546,9 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 	p1_is_yuv = (fmt_p1 > G2D_FORMAT_BGRA1010102);
 	out_is_yuv = (out_fmt > G2D_FORMAT_BGRA1010102);
 	
-	/* Select BT.601 vs BT.709 based on resolution (BSP logic) */
-	use_709 = (out_width > 1280) || (out_height > 720);
+	csc_p0 = g2d_rcq_select_mode(cs_p0, true);
+	csc_p1 = g2d_rcq_select_mode(cs_p1, true);
+	csc_out = g2d_rcq_select_mode(cs_out, false);
 
 	/* Configure Pipe Enable and Fetch Control
 	 * CRITICAL: fcen=1 means "Fill Color Enable" (ignore layer data).
@@ -553,14 +594,14 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 	/* Configure CSC for input pipes (YUV -> RGB) */
 	if (p0_en) {
 		if (p0_is_yuv)
-			g2d_rcq_bld_csc_set(bld, 0, use_709 ? G2D_CSC_YUV2RGB_709 : G2D_CSC_YUV2RGB_601, csc_state);
+			g2d_rcq_bld_csc_set(bld, 0, csc_p0, csc_state);
 		else
 			bld->cs_ctrl.bits.cs0_en = 0;
 	}
 
 	if (p1_en) {
 		if (p1_is_yuv)
-			g2d_rcq_bld_csc_set(bld, 1, use_709 ? G2D_CSC_YUV2RGB_709 : G2D_CSC_YUV2RGB_601, csc_state);
+			g2d_rcq_bld_csc_set(bld, 1, csc_p1, csc_state);
 		else
 			bld->cs_ctrl.bits.cs1_en = 0;
 	}
@@ -568,7 +609,7 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 	/* CSC2 (Output) - Enable for RGB -> YUV */
 	if (out_is_yuv) {
 		/* If output is YUV, we need to convert from Blender's RGB space to YUV */
-		g2d_rcq_bld_csc_set(bld, 2, use_709 ? G2D_CSC_RGB2YUV_709 : G2D_CSC_RGB2YUV_601, NULL);
+		g2d_rcq_bld_csc_set(bld, 2, csc_out, NULL);
 	} else {
 		bld->cs_ctrl.bits.cs2_en = 0;
 	}
@@ -1304,13 +1345,29 @@ int g2d_rcq_build_rot(u32 src_w, u32 src_h, u32 src_pitch,
 	if (rot_mode & G2D_ROT_V)
 		rot->rot_ctrl.bits.vflip_en = 1;
 
-	rot->rot_ctrl.bits.start = 1; /* Start bit */
-	
 	/* Interrupt Enable */
 	rot->rot_int.bits.finish_irq = 1; /* Enable interrupt */
 
 	/* Timeout */
 	rot->time_ctrl.dwval = 0xFFFFFFFF; /* Max timeout */
+
+	/* Start bit - MUST be set last in the block if possible, but RCQ writes sequentially.
+	 * However, since RCQ writes the whole block, and rot_ctrl is at offset 0x00,
+	 * it gets written FIRST. This is problematic if the hardware latches the start
+	 * bit immediately and ignores subsequent writes to INT/SIZE/ADDR registers
+	 * for the current operation.
+	 *
+	 * BUT, the BSP driver writes INT then CTL.
+	 *
+	 * If we use RCQ, we are stuck with the struct layout order.
+	 * UNLESS the hardware buffers the config until some trigger?
+	 * No, G2D usually triggers on register write.
+	 *
+	 * WORKAROUND: Do NOT set start bit in the main block.
+	 * Instead, add a SECOND small block just for ROT_CTL with start bit set.
+	 * This ensures all other registers (INT, SIZE, ADDR) are written first.
+	 */
+	rot->rot_ctrl.bits.start = 0;
 
 	*out_block = rot;
 	*out_size = size;

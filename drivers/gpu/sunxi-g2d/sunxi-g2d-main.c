@@ -2300,30 +2300,62 @@ static int sunxi_g2d_do_blit_rot(
 
 	sunxi_g2d_rcq_reset(rcq);
 
-	/* Configure RCQ buffer with single ROT block */
+	/* Configure RCQ buffer with TWO blocks:
+	 * 1. Main ROT block (config, addresses, size) - START bit CLEARED
+	 * 2. Trigger block (ROT_CTL only) - START bit SET
+	 *
+	 * This ensures that all configuration registers (including INT enable) are written
+	 * BEFORE the start bit is triggered. Writing the main block first (which includes
+	 * ROT_CTL at offset 0x00) would trigger the operation immediately with potentially
+	 * unconfigured registers if we set the start bit there.
+	 */
 	{
-		struct g2d_rcq_header *header;
+		struct g2d_rcq_header *header1, *header2;
 		u32 *cmd_buf = rcq->vir_addr;
 		dma_addr_t cmd_dma = rcq->phy_addr;
+		u32 trigger_val;
+		struct g2d_rot_reg *rot_reg_ptr = (struct g2d_rot_reg *)rot_regs;
+
+		/* Extract the start value we want to write last */
+		trigger_val = rot_reg_ptr->rot_ctrl.dwval | (1u << 31); /* Set START bit */
 
 		memset(cmd_buf, 0, rcq->size);
 
-		header = (struct g2d_rcq_header *)cmd_buf;
-		header->low_addr =
+		/* --- Block 1: Main Configuration (START bit is 0 from builder) --- */
+		header1 = (struct g2d_rcq_header *)cmd_buf;
+		header1->low_addr =
 			lower_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
-		header->dw0.bits.len = rot_size;
-		header->dw0.bits.high_addr =
+		header1->dw0.bits.len = rot_size;
+		header1->dw0.bits.high_addr =
 			upper_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
-		header->dirty.bits.dirty = 1;
-		header->dirty.bits.n_header_len = 0; /* Last block */
-		header->reg_offset = G2D_ROT; /* ROT base offset */
+		header1->dirty.bits.dirty = 1;
+		header1->dirty.bits.n_header_len = sizeof(struct g2d_rcq_header); /* Next header follows */
+		header1->reg_offset = G2D_ROT; /* ROT base offset */
 
+		/* Copy main block data */
 		memcpy(cmd_buf + (sizeof(struct g2d_rcq_header) / 4), rot_regs,
 		       rot_size);
 
-		rcq->header_count = 1;
-		rcq->header_len_bytes = sizeof(struct g2d_rcq_header);
-		rcq->used = rcq->header_len_bytes + rot_size;
+		/* --- Block 2: Trigger (ROT_CTL write) --- */
+		u32 offset_to_header2 = sizeof(struct g2d_rcq_header) + rot_size;
+		header2 = (struct g2d_rcq_header *)((u8 *)cmd_buf + offset_to_header2);
+		
+		/* Data for block 2 is just the 32-bit trigger value */
+		u32 *trigger_data_ptr = (u32 *)((u8 *)header2 + sizeof(struct g2d_rcq_header));
+		*trigger_data_ptr = trigger_val;
+
+		header2->low_addr =
+			lower_32_bits(cmd_dma + offset_to_header2 + sizeof(struct g2d_rcq_header));
+		header2->dw0.bits.len = 4; /* 4 bytes (one register) */
+		header2->dw0.bits.high_addr =
+			upper_32_bits(cmd_dma + offset_to_header2 + sizeof(struct g2d_rcq_header));
+		header2->dirty.bits.dirty = 1;
+		header2->dirty.bits.n_header_len = 0; /* Last block */
+		header2->reg_offset = G2D_ROT; /* ROT_CTL is at offset 0 of G2D_ROT */
+
+		rcq->header_count = 2;
+		rcq->header_len_bytes = 2 * sizeof(struct g2d_rcq_header);
+		rcq->used = offset_to_header2 + sizeof(struct g2d_rcq_header) + 4;
 	}
 
 	kfree(rot_regs);
@@ -6529,7 +6561,7 @@ static long sunxi_g2d_ioctl_alloc_buffer(struct sunxi_g2d_dev *g2d,
 	struct g2d_dma_buffer *buf;
 	struct dma_buf *dmabuf;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
-	int fd, ret;<
+	int fd, ret;
 
 	if (copy_from_user(&alloc, (void __user *)arg, sizeof(alloc))) {
 		dev_err(g2d->dev, "ALLOC_BUFFER: copy_from_user failed\n");
