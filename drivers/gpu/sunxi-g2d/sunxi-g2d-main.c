@@ -2304,10 +2304,12 @@ static int sunxi_g2d_do_blit_rot(
 	 * 1. Main ROT block (config, addresses, size) - START bit CLEARED
 	 * 2. Trigger block (ROT_CTL only) - START bit SET
 	 *
-	 * This ensures that all configuration registers (including INT enable) are written
-	 * BEFORE the start bit is triggered. Writing the main block first (which includes
-	 * ROT_CTL at offset 0x00) would trigger the operation immediately with potentially
-	 * unconfigured registers if we set the start bit there.
+	 * CRITICAL: RCQ headers must be contiguous at the start of the buffer!
+	 * The hardware (or at least the standard driver logic) expects a list of headers
+	 * followed by data blocks.
+	 *
+	 * Layout:
+	 * [Header 1 (16B)] [Header 2 (16B)] [Data 1 (rot_size)] [Data 2 (4B)]
 	 */
 	{
 		struct g2d_rcq_header *header1, *header2;
@@ -2315,47 +2317,50 @@ static int sunxi_g2d_do_blit_rot(
 		dma_addr_t cmd_dma = rcq->phy_addr;
 		u32 trigger_val;
 		struct g2d_rot_reg *rot_reg_ptr = (struct g2d_rot_reg *)rot_regs;
+		u32 header_size = sizeof(struct g2d_rcq_header);
 
 		/* Extract the start value we want to write last */
 		trigger_val = rot_reg_ptr->rot_ctrl.dwval | (1u << 31); /* Set START bit */
 
 		memset(cmd_buf, 0, rcq->size);
 
-		/* --- Block 1: Main Configuration (START bit is 0 from builder) --- */
+		/* --- Header 1: Main Configuration --- */
 		header1 = (struct g2d_rcq_header *)cmd_buf;
-		header1->low_addr =
-			lower_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
-		header1->dw0.bits.len = rot_size;
-		header1->dw0.bits.high_addr =
-			upper_32_bits(cmd_dma + sizeof(struct g2d_rcq_header));
-		header1->dirty.bits.dirty = 1;
-		header1->dirty.bits.n_header_len = sizeof(struct g2d_rcq_header); /* Next header follows */
-		header1->reg_offset = G2D_ROT; /* ROT base offset */
-
-		/* Copy main block data */
-		memcpy(cmd_buf + (sizeof(struct g2d_rcq_header) / 4), rot_regs,
-		       rot_size);
-
-		/* --- Block 2: Trigger (ROT_CTL write) --- */
-		u32 offset_to_header2 = sizeof(struct g2d_rcq_header) + rot_size;
-		header2 = (struct g2d_rcq_header *)((u8 *)cmd_buf + offset_to_header2);
+		/* Data 1 starts after both headers (2 * 16 = 32 bytes offset) */
+		u32 data1_offset = 2 * header_size;
 		
-		/* Data for block 2 is just the 32-bit trigger value */
-		u32 *trigger_data_ptr = (u32 *)((u8 *)header2 + sizeof(struct g2d_rcq_header));
-		*trigger_data_ptr = trigger_val;
+		header1->low_addr = lower_32_bits(cmd_dma + data1_offset);
+		header1->dw0.bits.len = rot_size;
+		header1->dw0.bits.high_addr = upper_32_bits(cmd_dma + data1_offset);
+		header1->dirty.bits.dirty = 1;
+		/* n_header_len seems to be offset to next header or length of current header?
+		 * In standard packing, it's set to 0 for the last block.
+		 * For chained blocks, let's try setting it to header_size (16).
+		 */
+		header1->dirty.bits.n_header_len = header_size; 
+		header1->reg_offset = G2D_ROT;
 
-		header2->low_addr =
-			lower_32_bits(cmd_dma + offset_to_header2 + sizeof(struct g2d_rcq_header));
-		header2->dw0.bits.len = 4; /* 4 bytes (one register) */
-		header2->dw0.bits.high_addr =
-			upper_32_bits(cmd_dma + offset_to_header2 + sizeof(struct g2d_rcq_header));
+		/* --- Header 2: Trigger --- */
+		header2 = (struct g2d_rcq_header *)((u8 *)cmd_buf + header_size);
+		/* Data 2 starts after Data 1 */
+		u32 data2_offset = data1_offset + rot_size;
+
+		header2->low_addr = lower_32_bits(cmd_dma + data2_offset);
+		header2->dw0.bits.len = 4; /* 4 bytes */
+		header2->dw0.bits.high_addr = upper_32_bits(cmd_dma + data2_offset);
 		header2->dirty.bits.dirty = 1;
 		header2->dirty.bits.n_header_len = 0; /* Last block */
-		header2->reg_offset = G2D_ROT; /* ROT_CTL is at offset 0 of G2D_ROT */
+		header2->reg_offset = G2D_ROT; /* ROT_CTL offset 0 */
+
+		/* --- Data 1: Main Block --- */
+		memcpy((u8 *)cmd_buf + data1_offset, rot_regs, rot_size);
+
+		/* --- Data 2: Trigger Value --- */
+		*((u32 *)((u8 *)cmd_buf + data2_offset)) = trigger_val;
 
 		rcq->header_count = 2;
-		rcq->header_len_bytes = 2 * sizeof(struct g2d_rcq_header);
-		rcq->used = offset_to_header2 + sizeof(struct g2d_rcq_header) + 4;
+		rcq->header_len_bytes = 2 * header_size;
+		rcq->used = data2_offset + 4;
 	}
 
 	kfree(rot_regs);
