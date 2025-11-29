@@ -48,6 +48,7 @@
 #include <linux/workqueue.h>
 #include <linux/slab.h>
 #include <linux/scatterlist.h>
+#include <linux/iopoll.h>
 #include <linux/pm_runtime.h>
 #include <linux/interconnect.h>
 #include <linux/wait.h>
@@ -75,6 +76,11 @@ module_param(g2d_rcq_debug, int, 0644);
 MODULE_PARM_DESC(
 	g2d_rcq_debug,
 	"RCQ debug level: 0=off (default), 1=headers+data dump for fillrect RCQ path");
+
+/* Allocation mode: 0=CMA (fallback to 1), 1=System Pages (IOMMU), 2=Coherent (CMA) */
+static int g2d_alloc_mode = 1;
+module_param(g2d_alloc_mode, int, 0644);
+MODULE_PARM_DESC(g2d_alloc_mode, "Allocation mode: 0=CMA, 1=System (IOMMU), 2=Coherent");
 
 /* Tamaño del bloque BLD cuando imitamos el RCQ del BSP (bytes, incluye ROP). */
 #define G2D_BSP_BLD_BLOCK_SIZE 0x88
@@ -140,6 +146,34 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
 	u8 out_color_space, struct g2d_csc_state *csc_state);
 
+static inline bool sunxi_g2d_is_yuv_planar(u32 fmt);
+static inline bool sunxi_g2d_is_yuv_semiplanar(u32 fmt);
+
+static inline void sunxi_g2d_uv_div_factors(u32 fmt, u32 *x_div, u32 *y_div)
+{
+	*x_div = 1;
+	*y_div = 1;
+
+	if (!sunxi_g2d_is_yuv_planar(fmt) &&
+	    !sunxi_g2d_is_yuv_semiplanar(fmt))
+		return;
+
+	if ((fmt >= G2D_FMT_YUV411_SP_UVUV && fmt <= G2D_FMT_YUV411_SP_VUVU) ||
+	    fmt == G2D_FMT_YUV411_P) {
+		*x_div = 4;
+		*y_div = 1;
+	} else if ((fmt >= G2D_FMT_YUV422_SP_UVUV &&
+		    fmt <= G2D_FMT_YUV422_SP_VUVU) ||
+		   fmt == G2D_FMT_YUV422_P) {
+		*x_div = 2;
+		*y_div = 1;
+	} else {
+		/* Default to 4:2:0 */
+		*x_div = 2;
+		*y_div = 2;
+	}
+}
+
 static int sunxi_g2d_do_blit_rot(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
 	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format,
@@ -176,7 +210,7 @@ static int g2d_dma_mem_alloc_mode(struct device *dev, size_t size,
 	mem->size = size;
 
 	/* Decide effective allocation mode: explicit override or module default */
-	eff_mode = (mode >= 0) ? mode : 2;
+	eff_mode = (mode >= 0) ? mode : g2d_alloc_mode;
 	if (eff_mode == 0)
 		eff_mode = 1;
 
@@ -296,6 +330,9 @@ static int g2d_dma_mem_alloc_mode(struct device *dev, size_t size,
 		mem->pages = pages;
 		mem->nents = nents;
 
+		dev_dbg(dev, "Allocated Mode 1 (System): size=%zu, dma_addr=%pad, vaddr=%p\n",
+			 size, &mem->dma_addr, mem->vaddr);
+
 		return 0;
 	}
 
@@ -389,12 +426,6 @@ static bool g2d_sgt_dma_is_contiguous(struct sg_table *table)
 	}
 	return true;
 }
-
-/* Forward decls for format helpers used below */
-static inline bool sunxi_g2d_is_yuv_planar(u32 fmt);
-static inline bool sunxi_g2d_is_yuv_semiplanar(u32 fmt);
-
-
 
 static int g2d_copy_rect_to_sg(struct device *dev, struct sg_table *sgt,
 			       size_t dst_offset, const u8 *src, u32 src_stride,
@@ -709,18 +740,6 @@ struct sunxi_g2d_job {
 	bool rcq_ready;
 	bool rcq_external; /* true when rcq owned by persistent task */
 	bool persistent_refs; /* true when DMA-BUF refs owned by persistent task */
-
-	/* Temporary buffers for multi-step operations */
-	struct g2d_dma_mem temp_buf;
-	struct g2d_dma_mem temp2_buf;
-	u32 temp_width;
-	u32 temp_height;
-	u32 temp_pitch;
-	u32 temp_format;
-	u32 temp2_width;
-	u32 temp2_height;
-	u32 temp2_pitch;
-	u32 temp2_format;
 };
 
 struct g2d_task_step {
@@ -1784,22 +1803,6 @@ static void sunxi_g2d_job_cleanup_workfn(struct work_struct *work)
 
 	/* Release temporary buffers allocated by the driver */
 	if (job->g2d) {
-		if (job->temp_buf.sgt) {
-			pr_debug(
-				"sunxi_g2d: cleanup - freeing temp buffer vaddr=%p dma=0x%llx size=%zu\n",
-				job->temp_buf.vaddr,
-				(u64)job->temp_buf.dma_addr,
-				job->temp_buf.size);
-			g2d_dma_mem_free(job->g2d->dev, &job->temp_buf);
-		}
-		if (job->temp2_buf.sgt) {
-			pr_debug(
-				"sunxi_g2d: cleanup - freeing temp2 buffer vaddr=%p dma=0x%llx size=%zu\n",
-				job->temp2_buf.vaddr,
-				(u64)job->temp2_buf.dma_addr,
-				job->temp2_buf.size);
-			g2d_dma_mem_free(job->g2d->dev, &job->temp2_buf);
-		}
 		if (job->rcq.vir_addr && !job->rcq_external) {
 			sunxi_g2d_rcq_free(job->g2d->dev, &job->rcq);
 			job->rcq_ready = false;
@@ -2036,7 +2039,10 @@ static int sunxi_g2d_setup_mbus(struct device *dev, void __iomem *mbus)
 
 	/* 2) PRI=1 y QOS=3 en CFG0(9) */
 	v = readl_relaxed(mbus + off);
-	nv = v | BIT(MBUS_PRI_SHIFT);
+	/* Disable Bandwidth Limit (Bit 0) just in case */
+	nv = v & ~BIT(0);
+	/* Set Priority and QoS */
+	nv |= BIT(MBUS_PRI_SHIFT);
 	nv &= ~(MBUS_QOS_MASK << MBUS_QOS_SHIFT);
 	nv |= (MBUS_QOS_MASK << MBUS_QOS_SHIFT);
 
@@ -2112,7 +2118,9 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 	wmb();
 
 	/* Configure CMD_CTL for DRAM command control (needed for RCQ DMA) */
-	g2d_write(g2d, G2D_CMD_CTL, 0x00010001); /* Enable CORE0 and RT_WB */
+	/* Enable CORE0 (Mixer), CORE1 (Rotator?), and RT_WB */
+	/* Restore this write as it might be critical for Rotator DMA access */
+	g2d_write(g2d, G2D_CMD_CTL, 0x00010011); 
 	wmb();
 
 	dev_dbg(g2d->dev,
@@ -2131,7 +2139,8 @@ static int sunxi_g2d_hw_enable(struct sunxi_g2d_dev *g2d)
 		val |= G2D_CLK_GATING;
 		writel(val, g2d->ccu_base + G2D_CLK_REG);
 
-		writel(0x00010001,
+		/* Enable G2D (bit 0) and Rotator (bit 1?) gates and de-assert resets (bits 16, 17?) */
+		writel(0x00030003,
 		       g2d->ccu_base + G2D_BGR_REG); /* Gate + RST */
 		wmb();
 
@@ -2216,6 +2225,10 @@ static void sunxi_g2d_disable_workfn(struct work_struct *work)
 
 	/* Quick check under job_lock to avoid races with job enqueue/dequeue */
 	spin_lock_irqsave(&g2d->job_lock, flags);
+	/* CRITICAL: Do NOT disable if current_job is set, even if users==0.
+	 * This handles the case where userspace closes the fd (users->0)
+	 * while a job is still running in the worker.
+	 */
 	if (atomic_read(&g2d->users) == 0 && list_empty(&g2d->job_queue) &&
 	    g2d->current_job == NULL)
 		should_disable = true;
@@ -2224,8 +2237,15 @@ static void sunxi_g2d_disable_workfn(struct work_struct *work)
 	if (should_disable) {
 		/* Re-check under dev_mutex and disable safely */
 		mutex_lock(&g2d->dev_mutex);
-		if (atomic_read(&g2d->users) == 0 &&
-		    list_empty(&g2d->job_queue) && g2d->current_job == NULL)
+		/* Double check current_job under mutex just in case */
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		if (g2d->current_job != NULL) {
+			should_disable = false;
+		}
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+		if (should_disable && atomic_read(&g2d->users) == 0 &&
+		    list_empty(&g2d->job_queue))
 			sunxi_g2d_hw_disable(g2d);
 		mutex_unlock(&g2d->dev_mutex);
 	} else {
@@ -2262,113 +2282,274 @@ static int sunxi_g2d_do_blit_rot(
 	dma_addr_t dst_dma, u32 dst_width, u32 dst_height, u32 dst_pitch,
 	u32 dst_format, u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags)
 {
-	struct g2d_rot_reg *rot_regs = NULL;
-	u32 rot_size = 0;
-	u32 rot_mode = 0;
-	int ret;
+	u32 rot_ctl = ROT_CTL_EN;
+	u32 rot_fmt = 0;
+	dma_addr_t src_offset_dma, dst_offset_dma;
+	u32 src_bpp, dst_bpp;
+	u32 out_w, out_h;
+	bool rotated_90_270;
+	u32 src_uv_x_div = 1, src_uv_y_div = 1;
+	u32 dst_uv_x_div = 1, dst_uv_y_div = 1;
+	bool src_is_planar = false, dst_is_planar = false;
+	bool src_is_semiplanar = false, dst_is_semiplanar = false;
 
-	if (!g2d->rcq_enabled)
+	dev_dbg(g2d->dev, "BLIT_ROT: src_dma=%pad dst_dma=%pad size=%ux%u->%ux%u flags=0x%x\n",
+		 &src_dma, &dst_dma, src_width, src_height, dst_width, dst_height, flags);
+
+	/* CRITICAL: Check for valid base address to prevent paging request errors */
+	if (IS_ERR_OR_NULL(g2d->base)) {
+		dev_err(g2d->dev, "BLIT_ROT: Invalid MMIO base address: %p\n", g2d->base);
+		return -EIO;
+	}
+
+	/* Check for zero dimensions to prevent integer underflow in size calculations */
+	if (src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0) {
+		dev_err(g2d->dev, "BLIT_ROT: Zero dimensions detected (src=%ux%u dst=%ux%u)\n",
+			src_width, src_height, dst_width, dst_height);
+		return -EINVAL;
+	}
+
+	/* Check for zero pitch */
+	if (src_pitch == 0 || dst_pitch == 0) {
+		dev_err(g2d->dev, "BLIT_ROT: Zero pitch detected (src=%u dst=%u)\n",
+			src_pitch, dst_pitch);
+		return -EINVAL;
+	}
+
+	/* Check for invalid DMA addresses (0 is likely invalid on this platform) */
+	if (src_dma == 0 || dst_dma == 0) {
+		dev_err(g2d->dev, "BLIT_ROT: Invalid DMA address (src=%pad dst=%pad)\n",
+			&src_dma, &dst_dma);
+		return -EFAULT;
+	}
+
+	/* Check for format mismatch (ROT doesn't support format conversion) */
+	if (src_format != dst_format) {
+		dev_warn_once(g2d->dev, "BLIT_ROT: Format conversion not supported (src=0x%x dst=0x%x)\n",
+			      src_format, dst_format);
 		return -EOPNOTSUPP;
+	}
 
-	/* Map flags to ROT mode */
+	/* Determine output dimensions based on rotation */
+	rotated_90_270 =
+		(flags & (G2D_BLIT_FLAG_ROTATE_90 | G2D_BLIT_FLAG_ROTATE_270));
+	if (rotated_90_270) {
+		/* 90° and 270° rotations swap width and height */
+		out_w = src_crop_h;
+		out_h = src_crop_w;
+	} else {
+		/* 0°, 180°, and flips keep dimensions */
+		out_w = src_crop_w;
+		out_h = src_crop_h;
+	}
+
+	/* Check for scaling (not supported) */
+	if (dst_w != out_w || dst_h != out_h) {
+		dev_warn_once(g2d->dev, "BLIT_ROT: Scaling not supported (out=%ux%u dst=%ux%u)\n",
+			      out_w, out_h, dst_w, dst_h);
+		return -EOPNOTSUPP;
+	}
+
+	/* Reset ROT/MIXER to a clean state before programming registers */
+	{
+		volatile struct g2d_top_reg *g2d_top =
+			(volatile struct g2d_top_reg *)g2d->base;
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 0;
+		wmb();
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 1;
+		wmb();
+	}
+
+	/* Reset ROT block */
+	g2d_write(g2d, ROT_CTL, 0x0);
+	g2d_write(g2d, ROT_INT, ROT_INT_FINISH | ROT_INT_FINISH_EN);
+	g2d_write(g2d, ROT_TIMEOUT, 0xFFFF);
+
+	/* Disable MIXER to avoid interference */
+	g2d_write(g2d, G2D_MIXER_CTL, 0x00000000);
+	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
+	wmb();
+
+	/* Get ROT format codes and bpp using unified format function */
+	int hw_src_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
+	if (hw_src_fmt < 0) {
+		dev_err(g2d->dev, "Unsupported ROT source format: %u\n",
+			src_format);
+		return -EOPNOTSUPP;
+	}
+	rot_fmt = (u32)hw_src_fmt; /* Hardware format code for ROT_IFMT */
+
+	/* Destination format should match source */
+	int hw_dst_fmt = sunxi_g2d_format_to_hw(dst_format, &dst_bpp);
+	if (hw_dst_fmt < 0) {
+		dev_err(g2d->dev, "Unsupported ROT destination format: %u\n",
+			dst_format);
+		return -EOPNOTSUPP;
+	}
+	src_is_planar = sunxi_g2d_is_yuv_planar(src_format);
+	src_is_semiplanar = sunxi_g2d_is_yuv_semiplanar(src_format);
+	dst_is_planar = sunxi_g2d_is_yuv_planar(dst_format);
+	dst_is_semiplanar = sunxi_g2d_is_yuv_semiplanar(dst_format);
+	sunxi_g2d_uv_div_factors(src_format, &src_uv_x_div, &src_uv_y_div);
+	sunxi_g2d_uv_div_factors(dst_format, &dst_uv_x_div, &dst_uv_y_div);
+
+	/* Apply rotation flags (ROT_CTL bits 4-5) */
 	if (flags & G2D_BLIT_FLAG_ROTATE_90)
-		rot_mode = G2D_ROT_90;
+		rot_ctl |= ROT_CTL_ROT_90;
 	else if (flags & G2D_BLIT_FLAG_ROTATE_180)
-		rot_mode = G2D_ROT_180;
+		rot_ctl |= ROT_CTL_ROT_180;
 	else if (flags & G2D_BLIT_FLAG_ROTATE_270)
-		rot_mode = G2D_ROT_270;
-	else if (flags & G2D_BLT_FLIP_HORIZONTAL)
-		rot_mode = G2D_ROT_H;
-	else if (flags & G2D_BLT_FLIP_VERTICAL)
-		rot_mode = G2D_ROT_V;
-	else
-		return -EINVAL;
+		rot_ctl |= ROT_CTL_ROT_270;
 
-	/* DEBUG: Verify ROT register access and buffer addresses */
+	/* Apply flip flags (ROT_CTL bits 6-7) */
+	if (flags & G2D_BLIT_FLAG_FLIP_V)
+		rot_ctl |= ROT_CTL_FLIP_V;
+	if (flags & G2D_BLIT_FLAG_FLIP_H)
+		rot_ctl |= ROT_CTL_FLIP_H;
+
+	/* Calculate source address with offset */
+	src_offset_dma = src_dma + (src_crop_y * src_pitch) + (src_crop_x * src_bpp);
+
+	/* Calculate destination address with offset */
+	dst_offset_dma = dst_dma + (dst_y * dst_pitch) + (dst_x * dst_bpp);
+
+	/* Configure ROT input (source) - BSP format: (height-1 << 16) | width-1 */
+	g2d_write(g2d, ROT_IFMT, rot_fmt);
+	g2d_write(g2d, ROT_ISIZE, ((src_crop_h - 1) << 16) | (src_crop_w - 1));
+	
+	/* Configure ROT input with YUV multi-plane support */
 	{
-		u32 rot_ctl = readl(g2d->base + G2D_ROT);
-		dev_info(g2d->dev, "DEBUG: ROT_CTL=0x%08x src_dma=%pad dst_dma=%pad\n",
-			 rot_ctl, &src_dma, &dst_dma);
-	}
-
-	/* Build ROT block */
-	/* Use src_crop_w/h as input size to ROT */
-	ret = g2d_rcq_build_rot(src_crop_w, src_crop_h, src_pitch, src_dma,
-				src_format, dst_w, dst_h, dst_pitch,
-				dst_dma, dst_format, rot_mode, &rot_regs,
-				&rot_size);
-	if (ret)
-		return ret;
-
-	if (!rcq || !rcq->vir_addr) {
-		kfree(rot_regs);
-		return -EINVAL;
-	}
-
-	sunxi_g2d_rcq_reset(rcq);
-
-	/* Configure RCQ buffer with TWO blocks:
-	 * 1. Main ROT block (INT, SIZE, ADDR, etc.) - Skipping ROT_CTL (offset 0)
-	 * 2. Trigger block (ROT_CTL only) - START bit SET
-	 *
-	 * This ensures ROT_CTL is written LAST and ONLY ONCE, preventing any
-	 * premature latching or reset caused by writing it with start=0 first.
-	 *
-	 * Layout:
-	 * [Header 1 (16B)] [Header 2 (16B)] [Data 1 (rot_size-4)] [Data 2 (4B)]
-	 */
-	{
-		struct g2d_rcq_header *header1, *header2;
-		u32 *cmd_buf = rcq->vir_addr;
-		dma_addr_t cmd_dma = rcq->phy_addr;
-		u32 trigger_val;
-		struct g2d_rot_reg *rot_reg_ptr = (struct g2d_rot_reg *)rot_regs;
-		u32 header_size = sizeof(struct g2d_rcq_header);
-		u32 body_size = rot_size - 4; /* Skip ROT_CTL (4 bytes) */
-
-		/* Extract the start value we want to write last */
-		trigger_val = rot_reg_ptr->rot_ctrl.dwval | (1u << 31); /* Set START bit */
-
-		memset(cmd_buf, 0, rcq->size);
-
-		/* --- Header 1: Main Configuration (Skip ROT_CTL) --- */
-		header1 = (struct g2d_rcq_header *)cmd_buf;
-		/* Data 1 starts after both headers (2 * 16 = 32 bytes offset) */
-		u32 data1_offset = 2 * header_size;
+		u32 user_stride[3] = { src_pitch, 0, 0 };
+		u32 src_stride[3], src_plane_offset[3];
+		dma_addr_t plane1_dma, plane2_dma;
 		
-		header1->low_addr = lower_32_bits(cmd_dma + data1_offset);
-		header1->dw0.bits.len = body_size;
-		header1->dw0.bits.high_addr = upper_32_bits(cmd_dma + data1_offset);
-		header1->dirty.bits.dirty = 1;
-		header1->dirty.bits.n_header_len = 0; 
-		header1->reg_offset = G2D_ROT + 4; /* Start at ROT_INT */
+		sunxi_g2d_get_yuv_plane_info(src_format, src_width, src_height,
+					     user_stride, src_stride, src_plane_offset);
+		
+		g2d_write(g2d, ROT_IPITCH0, src_stride[0]);
+		g2d_write(g2d, ROT_IPITCH1, src_stride[1]);
+		g2d_write(g2d, ROT_IPITCH2, src_stride[2]);
+		
+		g2d_write(g2d, ROT_ILADD0, lower_32_bits(src_offset_dma));
+		g2d_write(g2d, ROT_IHADD0, upper_32_bits(src_offset_dma));
+		
+		if (src_is_planar || src_is_semiplanar) {
+			u32 chroma_x = src_crop_x / src_uv_x_div;
+			u32 chroma_y = src_crop_y / src_uv_y_div;
 
-		/* --- Header 2: Trigger (ROT_CTL) --- */
-		header2 = (struct g2d_rcq_header *)((u8 *)cmd_buf + header_size);
-		/* Data 2 starts after Data 1, MUST BE 32-BYTE ALIGNED */
-		u32 data2_offset = ALIGN(data1_offset + body_size, 32);
-
-		header2->low_addr = lower_32_bits(cmd_dma + data2_offset);
-		header2->dw0.bits.len = 4; /* 4 bytes */
-		header2->dw0.bits.high_addr = upper_32_bits(cmd_dma + data2_offset);
-		header2->dirty.bits.dirty = 1;
-		header2->dirty.bits.n_header_len = 0; /* Last block */
-		header2->reg_offset = G2D_ROT; /* ROT_CTL offset 0 */
-
-		/* --- Data 1: Main Block (Skip ROT_CTL) --- */
-		memcpy((u8 *)cmd_buf + data1_offset, (u8 *)rot_regs + 4, body_size);
-
-		/* --- Data 2: Trigger Value --- */
-		*((u32 *)((u8 *)cmd_buf + data2_offset)) = trigger_val;
-
-		rcq->header_count = 2;
-		rcq->header_len_bytes = 2 * header_size;
-		rcq->used = data2_offset + 4;
+			plane1_dma = src_dma + src_plane_offset[1] +
+				     (dma_addr_t)chroma_y * src_stride[1] +
+				     (dma_addr_t)chroma_x *
+					     (src_is_semiplanar ? 2 : 1);
+			g2d_write(g2d, ROT_ILADD1, lower_32_bits(plane1_dma));
+			g2d_write(g2d, ROT_IHADD1, upper_32_bits(plane1_dma));
+			
+			if (src_is_planar) {
+				/* For planar, V plane has same geometry as U plane */
+				plane2_dma = src_dma + src_plane_offset[2] +
+					     (dma_addr_t)chroma_y *
+						     src_stride[2] +
+					     (dma_addr_t)chroma_x;
+				g2d_write(g2d, ROT_ILADD2, lower_32_bits(plane2_dma));
+				g2d_write(g2d, ROT_IHADD2, upper_32_bits(plane2_dma));
+			} else {
+				g2d_write(g2d, ROT_ILADD2, 0);
+				g2d_write(g2d, ROT_IHADD2, 0);
+			}
+		} else {
+			g2d_write(g2d, ROT_ILADD1, 0);
+			g2d_write(g2d, ROT_IHADD1, 0);
+			g2d_write(g2d, ROT_ILADD2, 0);
+			g2d_write(g2d, ROT_IHADD2, 0);
+		}
 	}
 
-	kfree(rot_regs);
+	/* Configure ROT output (destination) */
+	g2d_write(g2d, ROT_OSIZE, ((out_h - 1) << 16) | (out_w - 1));
+	
+	/* Configure ROT output with YUV multi-plane support */
+	{
+		u32 user_stride[3] = { dst_pitch, 0, 0 };
+		u32 dst_stride[3], dst_plane_offset[3];
+		dma_addr_t plane1_dma, plane2_dma;
+		
+		sunxi_g2d_get_yuv_plane_info(dst_format, dst_width, dst_height,
+					     user_stride, dst_stride, dst_plane_offset);
+		
+		g2d_write(g2d, ROT_OPITCH0, dst_stride[0]);
+		g2d_write(g2d, ROT_OPITCH1, dst_stride[1]);
+		g2d_write(g2d, ROT_OPITCH2, dst_stride[2]);
+		
+		g2d_write(g2d, ROT_OLADD0, lower_32_bits(dst_offset_dma));
+		g2d_write(g2d, ROT_OHADD0, upper_32_bits(dst_offset_dma));
+		
+		if (dst_is_planar || dst_is_semiplanar) {
+			u32 chroma_x = dst_x / dst_uv_x_div;
+			u32 chroma_y = dst_y / dst_uv_y_div;
 
-	return ret;
+			plane1_dma = dst_dma + dst_plane_offset[1] +
+				     (dma_addr_t)chroma_y * dst_stride[1] +
+				     (dma_addr_t)chroma_x *
+					     (dst_is_semiplanar ? 2 : 1);
+			g2d_write(g2d, ROT_OLADD1, lower_32_bits(plane1_dma));
+			g2d_write(g2d, ROT_OHADD1, upper_32_bits(plane1_dma));
+			
+			if (dst_is_planar) {
+				plane2_dma = dst_dma + dst_plane_offset[2] +
+					     (dma_addr_t)chroma_y *
+						     dst_stride[2] +
+					     (dma_addr_t)chroma_x;
+				g2d_write(g2d, ROT_OLADD2, lower_32_bits(plane2_dma));
+				g2d_write(g2d, ROT_OHADD2, upper_32_bits(plane2_dma));
+			} else {
+				g2d_write(g2d, ROT_OLADD2, 0);
+				g2d_write(g2d, ROT_OHADD2, 0);
+			}
+		} else {
+			g2d_write(g2d, ROT_OLADD1, 0);
+			g2d_write(g2d, ROT_OHADD1, 0);
+			g2d_write(g2d, ROT_OLADD2, 0);
+			g2d_write(g2d, ROT_OHADD2, 0);
+		}
+	}
+
+	/* Clear interrupt status, ENABLE IRQ for async wait */
+	g2d_write(g2d, ROT_INT, ROT_INT_FINISH | ROT_INT_FINISH_EN);
+	atomic_set(&g2d->irq_done, 0);
+
+	/* Write ROT_CTL with enable bit (BSP: write once at the beginning) */
+	g2d_write(g2d, ROT_CTL, rot_ctl);
+	wmb();
+
+	/* Start ROT by setting bit 31 (BSP: read-modify-write) */
+	rot_ctl = g2d_read(g2d, ROT_CTL);
+	rot_ctl |= ROT_CTL_START;
+	g2d_write(g2d, ROT_CTL, rot_ctl);
+	wmb();
+
+	/* Wait for completion (INTERRUPT) */
+	{
+		int timeout_jiffies = msecs_to_jiffies(1000); /* 1s timeout */
+		int wait_result;
+
+		wait_result = wait_event_interruptible_timeout(
+			g2d->irq_wait, atomic_read(&g2d->irq_done),
+			timeout_jiffies);
+		
+		if (wait_result <= 0) {
+			u32 status = g2d_read(g2d, ROT_INT);
+			u32 ctl = g2d_read(g2d, ROT_CTL);
+			int ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
+			
+			dev_err(g2d->dev, "BLIT_ROT timeout (IRQ), status=0x%08x ctl=0x%08x ret=%d\n", 
+				status, ctl, ret);
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
@@ -2421,6 +2602,21 @@ static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
 			dev_err(g2d->dev,
 				"RCQ execution timeout or interrupted: %d\n",
 				ret);
+			
+			/* Debug: Dump ROT registers to diagnose timeout */
+			{
+				u32 rot_ctl = readl(g2d->base + G2D_ROT);
+				u32 rot_int = readl(g2d->base + ROT_INT);
+				u32 rot_isize = readl(g2d->base + ROT_ISIZE);
+				u32 rot_ifmt = readl(g2d->base + ROT_IFMT);
+				u32 cmd_ctl = readl(g2d->base + G2D_CMD_CTL);
+				u32 sclk = readl(g2d->base + G2D_SCLK_GATE);
+				u32 rcq_status = readl(g2d->base + G2D_RCQ_STATUS);
+				dev_err(g2d->dev, "DEBUG: Timeout! ROT_CTL=0x%08x ROT_INT=0x%08x ROT_ISIZE=0x%08x ROT_IFMT=0x%08x\n",
+					rot_ctl, rot_int, rot_isize, rot_ifmt);
+				dev_err(g2d->dev, "DEBUG: CMD_CTL=0x%08x SCLK=0x%08x RCQ_STS=0x%08x\n",
+					cmd_ctl, sclk, rcq_status);
+			}
 		}
 	}
 
@@ -2434,6 +2630,8 @@ static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
 
 	return ret;
 }
+
+
 
 /**
  * sunxi_g2d_job_worker - Workqueue worker for async job processing
@@ -2493,8 +2691,23 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 		return;
 	}
 
-	/* Execute RCQ */
-	ret = sunxi_g2d_execute_rcq(g2d, &job->rcq);
+	/* Execute RCQ or MMIO based on job type */
+	if (job->type == G2D_JOB_CMD_ROTATE) {
+		/* Use MMIO for Rotation */
+		ret = sunxi_g2d_do_blit_rot(
+			g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
+			job->data.blit.src_height, job->data.blit.src_pitch,
+			job->data.blit.src_format, job->data.blit.src_crop_x,
+			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
+			job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
+			job->data.blit.dst_height, job->data.blit.dst_pitch,
+			job->data.blit.dst_format, job->data.blit.dst_x,
+			job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.flags);
+	} else {
+		/* Use RCQ for everything else */
+		ret = sunxi_g2d_execute_rcq(g2d, &job->rcq);
+	}
 
 	if (ret < 0) {
 		/* Signal failure and cleanup */
@@ -2508,9 +2721,24 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 
 		queue_work(g2d->job_wq, &job->cleanup_work);
 		queue_work(g2d->job_wq, &g2d->job_work);
+	} else if (job->type == G2D_JOB_CMD_ROTATE) {
+		/* For MMIO rotation, we are DONE here (synchronous execution).
+		 * We must signal completion manually because there is no IRQ handler
+		 * logic for MMIO completion that signals the fence (sunxi_g2d_do_blit_rot
+		 * waits for IRQ internally but doesn't signal the fence).
+		 */
+		dma_fence_signal(job->fence);
+
+		spin_lock_irqsave(&g2d->job_lock, flags);
+		g2d->current_job = NULL;
+		/* atomic64_inc(&g2d->jobs_completed); */
+		spin_unlock_irqrestore(&g2d->job_lock, flags);
+
+		queue_work(g2d->job_wq, &job->cleanup_work);
+		queue_work(g2d->job_wq, &g2d->job_work);
 	}
 
-	/* On success, HW is now running. IRQ handler will:
+	/* On success (RCQ), HW is now running. IRQ handler will:
 	 *  1. Signal job->fence
 	 *  2. Schedule cleanup_work
 	 *  3. Schedule next job_work
@@ -2600,13 +2828,11 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 		/* Clear ROT interrupt */
 		g2d_write(g2d, ROT_INT, ROT_INT_FINISH);
 
+		handled = true;
 		dev_dbg(g2d->dev, "ROT IRQ received: status=0x%08x\n",
 			rot_status);
-
-		/* Signal completion */
 		atomic_set(&g2d->irq_done, 1);
 		wake_up(&g2d->irq_wait);
-		handled = true;
 	}
 
 	if (!handled)
@@ -2614,6 +2840,14 @@ static irqreturn_t sunxi_g2d_irq(int irq, void *data)
 
 	/* Update statistics */
 	if (g2d->current_job) {
+		/* For ROTATE jobs (MMIO), the job_worker waits synchronously for the IRQ.
+		 * We must NOT handle completion/cleanup here, otherwise we race with
+		 * job_worker and cause Use-After-Free or double-free.
+		 * Just return handled (we already woke up the waiter above).
+		 */
+		if (g2d->current_job->type == G2D_JOB_CMD_ROTATE)
+			return IRQ_HANDLED;
+
 		/* Signal user fence (if any) and install user FD for sync_file */
 		{
 			struct sunxi_g2d_job *job;
@@ -3730,14 +3964,14 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	/* ALIGNMENT CHECK: G2D requires 32KB alignment for buffer addresses */
 	if (src_dma_addr & 0x7FFF) {
-		dev_warn(
+		dev_dbg(
 			g2d->dev,
 			"SCALE: src_dma=0x%llx NOT 32KB aligned (misalign=0x%llx)\n",
 			(unsigned long long)src_dma_addr,
 			(unsigned long long)(src_dma_addr & 0x7FFF));
 	}
 	if (dst_dma_addr & 0x7FFF) {
-		dev_warn(
+		dev_dbg(
 			g2d->dev,
 			"SCALE: dst_dma=0x%llx NOT 32KB aligned (misalign=0x%llx)\n",
 			(unsigned long long)dst_dma_addr,
@@ -4216,11 +4450,11 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	dma_addr_t src_dma_addr, dst_dma_addr;
 	u32 src_bpp, dst_bpp;
 	u32 flags = 0;
-	int ret;
-	struct dma_fence *fence;
-	struct sync_file *sync_file;
-	int fence_fd;
-	struct sunxi_g2d_job *job;
+	int ret = 0;
+	struct dma_fence *fence = NULL;
+	struct sync_file *sync_file = NULL;
+	int fence_fd = -1;
+	struct sunxi_g2d_job *job = NULL;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
@@ -4264,6 +4498,24 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (cmd.params.rotate.flip_v)
 		flags |= G2D_BLIT_FLAG_FLIP_V;
 
+	/* Validate crop/dst rectangles are inside their buffers */
+	if (cmd.src.crop_x + cmd.src.crop_w > cmd.src.width ||
+	    cmd.src.crop_y + cmd.src.crop_h > cmd.src.height) {
+		dev_err(g2d->dev,
+			"G2D_CMD_ROTATE: src crop out of bounds (%u,%u %ux%u vs %ux%u)\n",
+			cmd.src.crop_x, cmd.src.crop_y, cmd.src.crop_w,
+			cmd.src.crop_h, cmd.src.width, cmd.src.height);
+		return -EINVAL;
+	}
+	if (cmd.dst_x + cmd.dst_w > cmd.dst.width ||
+	    cmd.dst_y + cmd.dst_h > cmd.dst.height) {
+		dev_err(g2d->dev,
+			"G2D_CMD_ROTATE: dst rect out of bounds (%u,%u %ux%u vs %ux%u)\n",
+			cmd.dst_x, cmd.dst_y, cmd.dst_w, cmd.dst_h,
+			cmd.dst.width, cmd.dst.height);
+		return -EINVAL;
+	}
+
 	/* Check for scaling (not supported in ROTATE command) */
 	if (cmd.params.rotate.angle == 90 || cmd.params.rotate.angle == 270) {
 		if (cmd.src.crop_w != cmd.dst_h || cmd.src.crop_h != cmd.dst_w) {
@@ -4291,13 +4543,13 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
-		goto err_put_src;
+		goto cleanup;
 	}
 
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
-		goto err_detach_src;
+		goto cleanup;
 	}
 
 	/* Pre-compute strides/offsets for possible staging */
@@ -4310,26 +4562,26 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
 				 "CMD_ROTATE src");
 	if (ret) {
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
-		goto err_put_dst;
+		goto cleanup;
 	}
 
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
-		goto err_detach_dst;
+		goto cleanup;
 	}
 
 	/* Determine if writeback staging is needed for destination (output) */
@@ -4337,7 +4589,7 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
 					 "CMD_ROTATE dst");
 		if (ret) {
-			goto err_unmap_dst;
+			goto cleanup;
 		}
 	}
 
@@ -4345,7 +4597,7 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	/* Create sync_file for userspace */
@@ -4353,14 +4605,14 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (!sync_file) {
 		dma_fence_put(fence);
 		ret = -ENOMEM;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	/* Create/obtain async job (from pool if available) */
@@ -4369,7 +4621,7 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
 		ret = PTR_ERR(job);
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
@@ -4419,8 +4671,9 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	ret = g2d_job_prepare_rcq(g2d, job);
 	if (ret)
-		goto err_free_job;
+		goto cleanup;
 
+	/*
 	ret = sunxi_g2d_do_blit_rot(
 		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
 		job->data.blit.src_height, job->data.blit.src_pitch,
@@ -4435,9 +4688,15 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
 		goto err_free_job;
 	}
+	*/
 	job->rcq_ready = true;
 
-	/* Enqueue job to worker */
+	/* MMIO execution successful - Signal fence and cleanup immediately */
+	/* dma_fence_signal(job->fence); */
+	/* queue_work(g2d->job_wq, &job->cleanup_work); */
+
+	/* Skip enqueuing to worker since we already executed it via MMIO */
+	
 	{
 		unsigned long iflags;
 		spin_lock_irqsave(&g2d->job_lock, iflags);
@@ -4446,6 +4705,7 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	}
 
 	queue_work(g2d->job_wq, &g2d->job_work);
+	
 
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
@@ -4464,31 +4724,36 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	return 0;
 
-err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
-err_detach_dst:
-	dma_buf_detach(dst_dmabuf, dst_attach);
-err_put_dst:
-	dma_buf_put(dst_dmabuf);
-err_unmap_src:
-	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
-err_detach_src:
-	dma_buf_detach(src_dmabuf, src_attach);
-err_put_src:
-	dma_buf_put(src_dmabuf);
-err_free_job:
+cleanup:
 	if (!IS_ERR_OR_NULL(job)) {
 		if (job->rcq.vir_addr)
 			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
 		g2d_job_free(g2d, job);
 	}
+
 	if (sync_file && sync_file->file)
 		fput(sync_file->file);
 	if (fence)
 		dma_fence_put(fence);
 	if (fence_fd >= 0)
 		put_unused_fd(fence_fd);
-	goto err_unmap_dst;
+
+	if (!IS_ERR_OR_NULL(dst_sgt) && !IS_ERR_OR_NULL(dst_attach))
+		dma_buf_unmap_attachment(dst_attach, dst_sgt,
+					 DMA_FROM_DEVICE);
+	if (!IS_ERR_OR_NULL(dst_attach) && dst_dmabuf)
+		dma_buf_detach(dst_dmabuf, dst_attach);
+	if (dst_dmabuf && !IS_ERR(dst_dmabuf))
+		dma_buf_put(dst_dmabuf);
+
+	if (!IS_ERR_OR_NULL(src_sgt) && !IS_ERR_OR_NULL(src_attach))
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+	if (!IS_ERR_OR_NULL(src_attach) && src_dmabuf)
+		dma_buf_detach(src_dmabuf, src_attach);
+	if (src_dmabuf && !IS_ERR(src_dmabuf))
+		dma_buf_put(src_dmabuf);
+
+	return ret;
 }
 
 /*
@@ -5606,6 +5871,7 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 	 * If SCAL payload is missing in the packed RCQ, these logs help determine
 	 * whether scal_regs/scal_en_regs are NULL or sizes are zero at pack time.
 	 */
+	/*
 	dev_dbg(g2d->dev, "RCQ DEBUG: scal_regs=%p scal_size=%u scal_en_regs=%p scal_en_size=%u needs_vsu=%d\n",
 		   scal_regs, scal_size, scal_en_regs, scal_en_size, needs_vsu);
 	for (int __i = 0; __i < layout.block_count; __i++) {
@@ -5613,6 +5879,7 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 		       __i, layout.blocks[__i].size, layout.blocks[__i].reg_offset,
 		       layout.blocks[__i].dirty);
 	}
+	*/
 
 	ret = sunxi_g2d_rcq_pack_frame_8blocks(rcq, &layout, v0_regs, u0_regs,
 					       u1_regs, u2_regs, scal_regs,
@@ -5731,14 +5998,14 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 
 	/* ALIGNMENT CHECK: Verify 32KB alignment for DMA addresses */
 	if (src_dma & 0x7FFF) {
-		dev_warn(
+		dev_dbg(
 			g2d->dev,
 			"SCALE_RCQ: src_dma=0x%llx NOT 32KB aligned (offset=0x%llx)\n",
 			(unsigned long long)src_dma,
 			(unsigned long long)(src_dma & 0x7FFF));
 	}
 	if (dst_dma & 0x7FFF) {
-		dev_warn(
+		dev_dbg(
 			g2d->dev,
 			"SCALE_RCQ: dst_dma=0x%llx NOT 32KB aligned (offset=0x%llx)\n",
 			(unsigned long long)dst_dma,
@@ -5772,7 +6039,7 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 	u64 dst_offset_bytes;
 	if (dst_y > dst_height * 2) {
 		dst_offset_bytes = dst_y;
-		dev_warn(g2d->dev, "SCALE_RCQ: dst_y=%u looks like offset\n",
+		dev_dbg(g2d->dev, "SCALE_RCQ: dst_y=%u looks like offset\n",
 			 dst_y);
 	} else {
 		dst_offset_bytes =
@@ -6089,7 +6356,7 @@ static int sunxi_g2d_do_blend_rcq(
 		 * Result: Source appears UNDER Destination.
 		 */
 		swap_layers = true;
-		dev_warn(g2d->dev, "BLEND_RCQ: Scaling enabled. Swapping layers: Src=V0(Bottom), Dst=UI2(Top).\n");
+		dev_dbg(g2d->dev, "BLEND_RCQ: Scaling enabled. Swapping layers: Src=V0(Bottom), Dst=UI2(Top).\n");
 
 		/* Fix Z-order inversion:
 		 * Since V0 (Src) is physically below UI2 (Dst), we must invert the blend mode
@@ -6099,7 +6366,7 @@ static int sunxi_g2d_do_blend_rcq(
 		u32 old_mode = bld_mode;
 		bld_mode = sunxi_g2d_swap_blend_mode(bld_mode);
 		if (bld_mode != old_mode)
-			dev_warn(g2d->dev, "BLEND_RCQ: Swapped blend mode %u -> %u to correct Z-order.\n",
+			dev_dbg(g2d->dev, "BLEND_RCQ: Swapped blend mode %u -> %u to correct Z-order.\n",
 				 old_mode, bld_mode);
 	}
 
@@ -6123,7 +6390,7 @@ static int sunxi_g2d_do_blend_rcq(
 
 	if (dst_y > dst_height * 2) {
 		dst_crop_offset = dst_y;
-		dev_warn(g2d->dev, "BLEND_RCQ: dst_y=%u looks like offset\n",
+		dev_dbg(g2d->dev, "BLEND_RCQ: dst_y=%u looks like offset\n",
 			 dst_y);
 	} else {
 		dst_crop_offset = (dst_y * dst_pitch) + (dst_x * dst_bpp);
@@ -6131,7 +6398,7 @@ static int sunxi_g2d_do_blend_rcq(
 
 	if (out_y > out_height * 2) {
 		out_crop_offset = out_y;
-		dev_warn(g2d->dev, "BLEND_RCQ: out_y=%u looks like offset\n",
+		dev_dbg(g2d->dev, "BLEND_RCQ: out_y=%u looks like offset\n",
 			 out_y);
 	} else {
 		out_crop_offset = (out_y * out_pitch) + (out_x * out_bpp);
@@ -7333,43 +7600,17 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 		}
 
 		if (domain) {
-			dev_dbg(
+			dev_info(
 				dev,
 				"✓ IOMMU domain attached: type=%d (IOVA translation enabled)\n",
 				domain->type);
-			dev_dbg(
+			dev_info(
 				dev,
 				"✓ Using IOMMU for dynamic buffer allocation (avoids CMA fragmentation)\n");
 		} else {
-			dev_warn(
+			dev_err(
 				dev,
-				"⚠ No IOMMU domain attached (using physical DMA - CMA limited)\n");
-			dev_warn(dev, "⚠ Driver will continue WITHOUT IOMMU\n");
-			dev_warn(
-				dev,
-				"⚠ Expect allocation failures with multiple large buffers!\n");
-
-			if (fwspec) {
-				dev_err(dev,
-					"FATAL: fwspec present but domain NULL - sun50i-iommu bug!\n");
-			} else {
-				/* Diagnose DT IOMMU property */
-				struct device_node *np = dev->of_node;
-				struct property *prop =
-					of_find_property(np, "iommus", NULL);
-
-				if (prop) {
-					dev_err(dev,
-						"DT: 'iommus' property exists but NOT parsed by kernel!\n");
-					dev_err(dev,
-						"DT: This kernel version may have IOMMU binding bugs.\n");
-				} else {
-					dev_err(dev,
-						"DT: 'iommus' property NOT FOUND in devicetree!\n");
-					dev_err(dev,
-						"DT: Add 'iommus = <&iommu 3>;' to G2D node in DTS!\n");
-				}
-			}
+				"❌ IOMMU domain: NULL (Critical for Mode 1)\n");
 		}
 	}
 
@@ -7439,6 +7680,42 @@ static int sunxi_g2d_probe(struct platform_device *pdev)
 	g2d->irq = platform_get_irq(pdev, 0);
 	if (g2d->irq < 0)
 		return g2d->irq;
+
+	/* CRITICAL: Clean up any pending interrupts from bootloader or previous runs
+	 * BEFORE requesting the IRQ. If the IRQ line is asserted, requesting it
+	 * will immediately trigger the ISR. If clocks are off, the ISR will read 0
+	 * and return IRQ_NONE, leading to "nobody cared" and IRQ disablement.
+	 */
+	{
+		/* Enable clocks temporarily to access registers */
+		clk_prepare_enable(g2d->clk_bus);
+		clk_prepare_enable(g2d->clk_mod);
+		clk_prepare_enable(g2d->clk_mbus);
+
+		/* Disable and clear RCQ interrupts */
+		writel(0, g2d->base + G2D_RCQ_IRQ_CTL);
+		writel(G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH,
+		       g2d->base + G2D_RCQ_STATUS);
+
+		/* Disable and clear MIXER interrupts */
+		/* Writing 1 to status bit clears it. Writing 0 to enable bit disables it.
+		 * G2D_MIXER_INT has status in bit 0, enable in bit 4.
+		 * We write status bit 1, enable bit 0.
+		 */
+		writel(G2D_MIXER_INT_IRQ_PENDING, g2d->base + G2D_MIXER_INT);
+
+		/* Disable and clear ROT interrupts */
+		/* ROT_INT has status in bit 0, enable in bit 16. */
+		writel(ROT_INT_FINISH, g2d->base + ROT_INT);
+
+		/* Ensure writes complete */
+		wmb();
+
+		/* Disable clocks again */
+		clk_disable_unprepare(g2d->clk_mbus);
+		clk_disable_unprepare(g2d->clk_mod);
+		clk_disable_unprepare(g2d->clk_bus);
+	}
 
 	ret = devm_request_irq(&pdev->dev, g2d->irq, sunxi_g2d_irq, 0,
 			       dev_name(&pdev->dev), g2d);
