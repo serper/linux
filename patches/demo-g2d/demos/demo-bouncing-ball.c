@@ -37,6 +37,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <linux/dma-buf.h>
 #include <linux/sunxi_g2d.h>
 #include "demo-drm-base.h"
 
@@ -486,13 +487,13 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 
 do_copy:
 	{
-		/* Step 4: CMD_COPY blend → framebuffer (final scanout copy)
-		* NOTE: dst.height must describe the REAL height of the target surface region
-		* we are conceptually addressing (one page). Passing double-height confused
-		* address calculations in the driver when adding the page offset. So we use
-		* disp->height here and rely solely on dst_y to land on the correct page. */
+		/* Step 4: CMD_ROTATE blend → framebuffer (final scanout copy with 180 rotation)
+		 * NOTE: dst.height must describe the REAL height of the target surface region
+		 * we are conceptually addressing (one page). Passing double-height confused
+		 * address calculations in the driver when adding the page offset. So we use
+		 * disp->height here and rely solely on dst_y to land on the correct page. */
 		struct g2d_cmd cmd_copy = { 0 };
-		cmd_copy.cmd_type = G2D_CMD_COPY;
+		cmd_copy.cmd_type = G2D_CMD_ROTATE;
 
 		cmd_copy.src.width = disp->width;
 		cmd_copy.src.height = disp->height;
@@ -514,9 +515,13 @@ do_copy:
 
 		cmd_copy.dst_x = 0;
 		cmd_copy.dst_y =
-			backbuffer_y_offset; /* Write to backbuffer (0 or height) */
+			backbuffer_y_offset / (disp->width * 4); /* Offset to backbuffer page */
 		cmd_copy.dst_w = disp->width;
 		cmd_copy.dst_h = disp->height;
+
+		cmd_copy.params.rotate.angle = 180;
+		cmd_copy.params.rotate.flip_h = 0;
+		cmd_copy.params.rotate.flip_v = 0;
 
 		cmd_copy.fence_fd_in = -1;
 		cmd_copy.fence_fd_out = -1;
@@ -524,7 +529,7 @@ do_copy:
 		ret = ioctl(g2d_fd, G2D_IOC_CMD, &cmd_copy);
 		if (ret < 0) {
 			int saved_errno = errno;
-			perror("G2D_IOC_CMD (COPY: temp → framebuffer)");
+			perror("G2D_IOC_CMD (ROTATE: temp → framebuffer)");
 
 			/* Fallback CPU copy if framebuffer is non-contiguous (EOPNOTSUPP)
 			* and we have a valid mmap() of the framebuffer pages. This validates
@@ -640,8 +645,11 @@ int main(int argc, char **argv)
 
 	/* Create DMA buffer for ball sprite (120x120 ARGB8888 - large enough for max scaling) */
 	struct g2d_alloc_buffer ball_alloc = { 0 };
-	ball_alloc.size = ball_buffer_size * ball_buffer_size *
-			  4; /* ARGB8888 = 4 bytes per pixel */
+	/* Align allocation size to page boundary to ensure mmap() succeeds */
+	long page_size = sysconf(_SC_PAGESIZE);
+	size_t ball_raw_size = ball_buffer_size * ball_buffer_size * 4;
+	ball_alloc.size = (ball_raw_size + page_size - 1) & ~(page_size - 1);
+
 	ball_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &ball_alloc);
 	if (ret < 0) {
@@ -750,19 +758,36 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Create ball pattern in userspace memory then upload using G2D_IOC_WRITE_BUFFER
-	 * This demonstrates how applications can create custom graphics/textures.
+	/* Create ball pattern directly inside the DMA-BUF mapping (no malloc + WRITE_BUFFER).
+	 * We mmap() the exported dma-buf fd and write the ARGB pixels in place.
+	 * This demonstrates zero-copy buffer initialization by applications.
 	 */
 	{
-		/* Allocate local buffer for ball pattern */
-		uint32_t *ball_pattern = malloc(ball_alloc.size);
-		if (!ball_pattern) {
-			perror("malloc (ball pattern)");
+		/* mmap length matches the page-aligned allocation size */
+		size_t map_size = ball_alloc.size;
+		void *ball_map = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+					MAP_SHARED, ball_dma_fd, 0);
+		if (ball_map == MAP_FAILED) {
+			perror("mmap (ball dma-buf)");
+			close(comp_dma_fd);
 			close(temp_dma_fd);
 			close(bg_dma_fd);
 			close(ball_dma_fd);
 			drm_display_cleanup(&disp);
 			return 1;
+		}
+
+		uint32_t *ball_pattern = (uint32_t *)ball_map;
+
+		/* If supported by kernel driver, use DMA_BUF_IOCTL_SYNC to synchronize
+		 * CPU writes with device access. START before CPU write, END after.
+		 */
+		struct dma_buf_sync db_sync;
+		memset(&db_sync, 0, sizeof(db_sync));
+		db_sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+		if (ioctl(ball_dma_fd, DMA_BUF_IOCTL_SYNC, &db_sync) < 0) {
+			perror("DMA_BUF_IOCTL_SYNC START");
+			/* Not fatal: continue and try msync as fallback */
 		}
 
 		/* Create ball pattern: circular gradient with alpha on transparent background
@@ -771,7 +796,6 @@ int main(int argc, char **argv)
 		int center_x = ball_buffer_size / 2;
 		int center_y = ball_buffer_size / 2;
 		float pattern_max_radius = (float)(ball_buffer_size / 2);
-		/* int square_size = ball_buffer_size / 4; 4x4 grid (unused) */
 
 		for (int y = 0; y < ball_buffer_size; y++) {
 			for (int x = 0; x < ball_buffer_size; x++) {
@@ -781,45 +805,26 @@ int main(int argc, char **argv)
 
 				uint32_t color;
 
-				// Distancia normalizada [0.0, 1.0]
+				/* Normalized distance [0.0, 1.0] */
 				float norm_dist = dist / pattern_max_radius;
 				if (norm_dist > 1.0f)
 					norm_dist = 1.0f;
 
-				// --- Control del degradado de alpha ---
-				// Hasta inner_radius_ratio = parte totalmente opaca
-				const float inner_radius_ratio =
-					0.98f; // prueba 0.5, 0.7, etc.
-
+				const float inner_radius_ratio = 0.98f;
 				uint8_t alpha;
-
 				if (norm_dist <= inner_radius_ratio) {
-					// Núcleo opaco
 					alpha = 255;
 				} else {
-					// De inner_radius_ratio → 1.0: degradado
-					float t =
-						(norm_dist -
-						 inner_radius_ratio) /
-						(1.0f -
-						 inner_radius_ratio); // t en [0, 1]
-
-					// Curva suave: más opaco hacia el centro, más rápido a transparente al final
-					// Puedes probar t*t, t*t*t, smoothstep, etc.
-					float falloff = 1.0f - t * t; // 1 - t²
-
+					float t = (norm_dist - inner_radius_ratio) /
+						(1.0f - inner_radius_ratio);
+					float falloff = 1.0f - t * t;
 					if (falloff < 0.0f)
 						falloff = 0.0f;
-					alpha = (uint8_t)(falloff * 255.0f +
-							  0.5f);
+					alpha = (uint8_t)(falloff * 255.0f + 0.5f);
 				}
 
-				// RGB de test, como ya tenías
-				float norm_x =
-					(float)x / (float)ball_buffer_size;
-				float norm_y =
-					(float)y / (float)ball_buffer_size;
-
+				float norm_x = (float)x / (float)ball_buffer_size;
+				float norm_y = (float)y / (float)ball_buffer_size;
 				uint8_t r = (uint8_t)(norm_x * 255.0f);
 				uint8_t g = (uint8_t)((1.0f - norm_x) * 255.0f);
 				uint8_t b = (uint8_t)(norm_y * 192.0f);
@@ -832,41 +837,18 @@ int main(int argc, char **argv)
 			}
 		}
 
-		printf("Ball pattern created: circular white ball on transparent background\n");
-		printf("DEBUG: ball_pattern pointer=%p\n", ball_pattern);
-		printf("DEBUG: Corner pixels (should be 0x00000000): 0x%08X 0x%08X 0x%08X 0x%08X\n",
-		       ball_pattern[0], ball_pattern[1], ball_pattern[2],
-		       ball_pattern[3]);
-		int center_idx = center_y * ball_buffer_size + center_x;
-		printf("DEBUG: Center pixel at [%d,%d] idx=%d (should be 0xFFFFFFFF): 0x%08X\n",
-		       center_x, center_y, center_idx,
-		       ball_pattern[center_idx]);
-
-		/* Upload pattern to DMA buffer using WRITE_BUFFER ioctl */
-		printf("DEBUG: About to call g2d_write_buffer with ball_pattern=%p, first word=0x%08X\n",
-		       ball_pattern, ball_pattern[0]);
-
-		/* Flush CPU cache to ensure pattern data is visible to kernel copy_from_user() */
-		__builtin___clear_cache((char *)ball_pattern,
-					(char *)ball_pattern + ball_alloc.size);
-
-		ret = g2d_write_buffer(disp.g2d_fd, ball_dma_fd, ball_pattern,
-				       ball_alloc.size, 0);
-		printf("DEBUG: g2d_write_buffer returned %d\n", ret);
-
-		if (ret < 0) {
-			fprintf(stderr,
-				"Failed to write ball pattern to DMA buffer\n");
-			free(ball_pattern);
-			close(comp_dma_fd);
-			close(temp_dma_fd);
-			close(bg_dma_fd);
-			close(ball_dma_fd);
-			drm_display_cleanup(&disp);
-			return 1;
+		/* END sync for CPU write
+		 * Prefer DMA_BUF_IOCTL_SYNC if supported; msync is kept as a fallback.
+		 */
+		db_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+		if (ioctl(ball_dma_fd, DMA_BUF_IOCTL_SYNC, &db_sync) < 0) {
+			perror("DMA_BUF_IOCTL_SYNC END");
+			if (msync(ball_map, map_size, MS_SYNC) < 0)
+				perror("msync (ball_map)");
 		}
 
-		printf("Ball pattern uploaded to DMA buffer successfully via G2D_IOC_WRITE_BUFFER\n");
+		printf("Ball pattern written directly into DMA-BUF via mmap: ptr=%p size=%zu\n",
+			   ball_map, map_size);
 	}
 
 	/* NOTE: ball_scaled buffer is no longer needed

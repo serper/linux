@@ -7416,7 +7416,7 @@ static long sunxi_g2d_ioctl(struct file *file, unsigned int cmd,
 		if (copy_from_user(&adj, (void __user *)arg, sizeof(adj)))
 			return -EFAULT;
 		
-		dev_err(g2d->dev, "IOC_SET_CSC_ADJUST: B=%d C=%d S=%d\n",
+		dev_dbg(g2d->dev, "IOC_SET_CSC_ADJUST: B=%d C=%d S=%d\n",
 			adj.brightness, adj.contrast, adj.saturation);
 
 		mutex_lock(&g2d->dev_mutex);

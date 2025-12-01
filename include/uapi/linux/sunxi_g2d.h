@@ -127,7 +127,7 @@ enum g2d_bld_mode {
 };
 
 /* G2D buffer description 
- * Note: Fields are ordered to minimize padding in packed structures.
+ * Note: Fields are ordered to minimize padding with natural alignment.
  * __u64 fields first, then __u32, then smaller types.
  */
 struct g2d_buf {
@@ -149,7 +149,7 @@ struct g2d_buf {
 	__u8 alpha_mode;	/* enum g2d_alpha_mode */
 	__u8 premul_mode;	/* enum g2d_premul_mode - alpha premultiplication */
 	__u8 color_space;	/* enum g2d_color_space - YUV→RGB conversion (YUV formats only) */
-} __attribute__((packed));
+};
 
 /* G2D blit operation - UNIFIED operation for all blitting needs
  * 
@@ -199,7 +199,7 @@ struct g2d_blit {
 	/* Sync fence support */
 	__s32 fence_fd_in;	/* Wait on this fence before blit, or -1 */
 	__s32 fence_fd_out;	/* OUT: fence that signals when done */
-} __attribute__((packed));
+};
 
 /* Blit flags 
  * Note: ALPHA_BLEND flag is deprecated - alpha blending is now automatic
@@ -234,7 +234,7 @@ struct g2d_fillrect {
 	
 	__s32 fence_fd_in;
 	__s32 fence_fd_out;	/* OUT */
-} __attribute__((packed));
+};
 
 /* G2D version info */
 struct g2d_version {
@@ -332,7 +332,7 @@ struct g2d_cmd {
 			__u32 color_key_max;
 	} mask;
 	} params;
-} __attribute__((packed));
+};
 
 /* Task request structure for G2D_IOC_TASK */
 struct g2d_task_req {
@@ -340,7 +340,7 @@ struct g2d_task_req {
 	__u32 task_id;           /* IN/OUT: task identifier */
 	struct g2d_cmd step;     /* Used only with G2D_TASK_ADD */
 	__s32 fence_fd_out;      /* OUT: fence for G2D_TASK_RUN */
-} __attribute__((packed));
+};
 
 /* Buffer read/write request */
 struct g2d_buffer_rw {

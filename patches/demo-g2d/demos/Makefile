@@ -16,7 +16,7 @@ LDFLAGS = --sysroot=$(ALPINE_ROOTFS) -ldrm -lm
 DRM_BASE = demo-drm-base.c
 
 # Demo programs
-DEMOS = demo-bouncing-ball demo-fillrect-rcq-simple
+DEMOS = demo-bouncing-ball demo-fillrect-rcq-simple test_timing
 
 # Build directory (optional, for cross-compilation output)
 BUILD_DIR = .
@@ -42,6 +42,11 @@ demo-fillrect-rcq-simple: demo-fillrect-rcq-simple.c $(DRM_BASE)
 
 # Scale + Rotate test demo
 demo-scale-rotate: demo-scale-rotate.c $(DRM_BASE)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@"
+
+# Test timing, display adjustment
+test_timing: test_timing.c $(DRM_BASE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built: $@"
 

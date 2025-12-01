@@ -7,5 +7,3 @@ obj-$(CONFIG_IMX_IPUV3_CORE)	+= ipu-v3/
 obj-$(CONFIG_TRACE_GPU_MEM)		+= trace/
 obj-$(CONFIG_NOVA_CORE)		+= nova-core/
 obj-$(CONFIG_DRM_SUN8I_G2D)	+= sunxi-g2d/
-obj-$(CONFIG_SUNXI_G2D_M2M)	+= sunxi-g2d-m2m/
-obj-$(CONFIG_SUNXI_G2D_M2M)	+= sunxi-g2d-fillrect/

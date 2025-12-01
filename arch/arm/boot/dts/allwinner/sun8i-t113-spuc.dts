@@ -429,7 +429,25 @@
         i2s2_pb_control_pins: i2s2-pb-control-pins {
                 pins = "PB5", "PB6";
                 function = "i2s2";
-        };    
+        };
+
+        de_force_low: de-force-low {
+                pins = "PD19"; /* El pin que era DE */
+                function = "gpio_in";
+                bias-pull-down; /* Forzamos a 0V */
+        };
+        
+        // vsync_force_low: de-force-low {
+        //         pins = "PD20"; /* El pin que era VSync */
+        //         function = "gpio_in";
+        //         bias-pull-down; /* Forzamos a 0V */
+        // };
+        
+        // hsync_force_low: de-force-low {
+        //         pins = "PD21"; /* El pin que era HSync */
+        //         function = "gpio_in";
+        //         bias-pull-down; /* Forzamos a 0V */
+        // };
 };
 
 &uart0 {

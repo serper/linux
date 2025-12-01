@@ -218,7 +218,7 @@
                                 pins = "PD0", "PD1", "PD2", "PD3", "PD4", "PD5",
                                        "PD6", "PD7", "PD8", "PD9", "PD10", "PD11",
                                        "PD12", "PD13", "PD14", "PD15", "PD16", "PD17",
-                                       "PD18", "PD19", "PD20", "PD21";
+                                       "PD18", "PD20", "PD21"; // "PD19"
                                 function = "lcd0";
                         };
 
@@ -929,8 +929,7 @@
                         interconnects = <&mbus 4>;
                         interconnect-names = "dma-mem";
                         allwinner,sram = <&ve_sram 1>;
-                        // power-domains = <&ppu PD_VE>;
-                        // iommus = <&iommu 0>;
+                        iommus = <&iommu 0>;
                         status = "disabled";
                 };
 
@@ -1148,6 +1147,7 @@
 
                                         tcon_tv0_out_tcon_top_hdmi: endpoint {
                                                 remote-endpoint = <&tcon_top_hdmi_in_tcon_tv0>;
+                                                bus-width = <24>;
                                         };
                                 };
                         };
