@@ -876,13 +876,16 @@ int g2d_rcq_build_scaler_passthrough(u32 width, u32 height, u32 fmt,
 	if (!out_block || !out_size)
 		return -EINVAL;
 	
-	/* Scaler block: 1152 bytes (BSP measured) */
-	regs = kzalloc(1152, GFP_KERNEL);
+	/* Scaler block: Needs to cover up to VS_C_VCOEF31 (0x57C)
+	 * Size = 0x580 bytes = 1408 bytes.
+	 * Previous value of 1152 was insufficient (0x480), causing heap overflow.
+	 */
+	regs = kzalloc(1408, GFP_KERNEL);
 	if (!regs)
 		return -ENOMEM;
 	
 	/* Initialize to zeros */
-	memset(regs, 0, 1152);
+	memset(regs, 0, 1408);
 	
 	/* Configure passthrough mode (1:1 scaling)
 	 * Register layout matches struct g2d_mixer_video_scaler_reg from BSP
@@ -961,7 +964,7 @@ int g2d_rcq_build_scaler_passthrough(u32 width, u32 height, u32 fmt,
 	}
 	
 	*out_block = regs;
-	*out_size = 1152;
+	*out_size = 1408;
 
 	pr_debug("SCAL_BUILDER: returning regs=%p size=%u\n", regs, *out_size);
 
@@ -986,16 +989,16 @@ int g2d_rcq_build_scaler_dummy(u32 **out_block, u32 *out_size)
 	if (!out_block || !out_size)
 		return -EINVAL;
 	
-	/* Scaler block: 1152 bytes (BSP measured) */
-	regs = kzalloc(1152, GFP_KERNEL);
+	/* Scaler block: 1408 bytes */
+	regs = kzalloc(1408, GFP_KERNEL);
 	if (!regs)
 		return -ENOMEM;
 	
 	/* All zeros - inactive scaler */
-	memset(regs, 0, 1152);
+	memset(regs, 0, 1408);
 	
 	*out_block = regs;
-	*out_size = 1152;
+	*out_size = 1408;
 	
 	return 0;
 }
@@ -1087,8 +1090,8 @@ u32 fmt, u8 alpha, u32 **out_block, u32 *out_size)
 	else
 		format = VSU_FORMAT_RGB;
 	
-	/* Allocate scaler block: 1152 bytes (BSP measured) */
-	regs = kzalloc(1152, GFP_KERNEL);
+	/* Allocate scaler block: 1408 bytes (0x580) to cover up to VS_C_VCOEF31 */
+	regs = kzalloc(1408, GFP_KERNEL);
 	if (!regs)
 		return -ENOMEM;
 	
@@ -1246,7 +1249,7 @@ u32 fmt, u8 alpha, u32 **out_block, u32 *out_size)
 	}
 	
 	*out_block = regs;
-	*out_size = 1152;
+	*out_size = 1408;
 	
 	return 0;
 }
@@ -1293,6 +1296,9 @@ int g2d_rcq_build_rot(u32 src_w, u32 src_h, u32 src_pitch,
 	if (!rot)
 		return -ENOMEM;
 
+	/* Set timeout to 0 (disabled) to avoid premature timeouts with 0xFFFF */
+	rot->time_ctrl.dwval = 0;
+
 	/* Input Size (value = pixels - 1) */
 	rot->insize.bits.width = src_w - 1;
 	rot->insize.bits.height = src_h - 1;
@@ -1330,6 +1336,8 @@ int g2d_rcq_build_rot(u32 src_w, u32 src_h, u32 src_pitch,
 	rot->out_haddr0 = upper_32_bits(dst_addr);
 
 	/* Rotation Control */
+	rot->rot_ctrl.bits.en = 1; /* Enable Rotator */
+
 	if (rot_mode & G2D_ROT_90)
 		rot->rot_ctrl.bits.degree = 1;
 	else if (rot_mode & G2D_ROT_180)
@@ -1349,7 +1357,7 @@ int g2d_rcq_build_rot(u32 src_w, u32 src_h, u32 src_pitch,
 	rot->rot_int.bits.finish_irq = 1; /* Enable interrupt */
 
 	/* Timeout */
-	rot->time_ctrl.dwval = 0xFFFFFFFF; /* Max timeout */
+	rot->time_ctrl.dwval = 0xFFFF; /* Max timeout */
 
 	/* Start bit - MUST be set last in the block if possible, but RCQ writes sequentially.
 	 * However, since RCQ writes the whole block, and rot_ctrl is at offset 0x00,

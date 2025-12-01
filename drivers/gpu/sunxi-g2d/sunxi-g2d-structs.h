@@ -1500,7 +1500,8 @@ struct g2d_mixer_video_scaler_reg {
 union g2d_rot_ctrl {
 	u32 dwval;
 	struct {
-		u32 mode_sel:2;
+		u32 en:1;
+		u32 res_mode:1;
 		u32 res0:2;
 		u32 degree:2;
 		u32 vflip_en:1;

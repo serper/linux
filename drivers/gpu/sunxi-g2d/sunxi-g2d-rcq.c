@@ -281,7 +281,7 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 	        readl(base + G2D_RCQ_CTRL),
 	        readl(base + G2D_RCQ_STATUS));
 	
-	pr_debug("RCQ setup: CMD_CTL=0x%08x (should be 0x00010001 for DMA)\n",
+	pr_debug("RCQ setup: CMD_CTL=0x%08x (should be 0x00010011 for DMA)\n",
 	        readl(base + G2D_CMD_CTL));
 	
 	/* v2.1.7: DON'T clear STATUS here - BSP doesn't do it!
@@ -559,7 +559,8 @@ void sunxi_g2d_rcq_start(void __iomem *base, bool use_en_bit, bool enable_irq)
 	/* Trigger UPDATE - follow BSP: only update=1, ignore EN */
 	ctrl.dwval = readl(base + G2D_RCQ_CTRL);
 	ctrl.bits.update = 1;   /* Trigger RCQ execution */
-	pr_debug("RCQ writing CTRL=0x%08x (update=1, use_en_bit ignored)\n",
+	ctrl.bits.en = 1;       /* Force EN bit for T113 */
+	pr_debug("RCQ writing CTRL=0x%08x (update=1, en=1)\n",
 	        ctrl.dwval);
 	writel(ctrl.dwval, base + G2D_RCQ_CTRL);
 	wmb();  /* Ensure all writes are committed before checking status */

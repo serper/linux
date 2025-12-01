@@ -25,10 +25,12 @@ struct g2d_csc_state {
 	/* Base tables (static/default) */
 	const s32 *base_601;
 	const s32 *base_709;
+	const s32 *base_2020;
 	
 	/* Current tables (possibly modified) */
 	s32 current_601[48];
 	s32 current_709[48];
+	s32 current_2020[48];
 	
 	/* Current adjustment values */
 	struct g2d_csc_adjust adj;
@@ -36,6 +38,7 @@ struct g2d_csc_state {
 	/* Dirty flags */
 	bool dirty_601;
 	bool dirty_709;
+	bool dirty_2020;
 };
 
 /* RCQ alignment requirements from hardware */
@@ -202,16 +205,12 @@ int g2d_rcq_build_bld_fillcolor(u32 width, u32 height, u32 fill_color,
                                  struct g2d_mixer_bld_reg **out_block,
                                  u32 *out_size);
 int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
-		      u32 out_width, u32 out_height,
-		      u32 fmt_p0, u32 fmt_p1, u32 out_fmt,
-		      bool p0_en, bool p1_en,
-		      u32 p0_x, u32 p0_y,
-		      u32 p1_x, u32 p1_y,
-		      u32 bld_mode,
-		      u32 premul_mode,
-		      bool p1_is_copy_src,
-		      struct g2d_csc_state *csc_state,
-		      u32 **out_block, u32 *out_size);
+		      u32 out_width, u32 out_height, u32 fmt_p0, u32 fmt_p1,
+		      u32 out_fmt, u8 cs_p0, u8 cs_p1, u8 cs_out, bool p0_en,
+		      bool p1_en, u32 p0_x, u32 p0_y, u32 p1_x, u32 p1_y,
+		      u32 bld_mode, u32 premul_mode, bool p1_is_copy_src,
+		      struct g2d_csc_state *csc_state, u32 **out_block,
+		      u32 *out_size);
 int g2d_rcq_build_ui2_memory(u32 width, u32 height, u32 pitch,
 			     dma_addr_t dma_addr, u32 crop_offset, u32 src_fmt,
 			     u32 win_x, u32 win_y, u32 win_w, u32 win_h,

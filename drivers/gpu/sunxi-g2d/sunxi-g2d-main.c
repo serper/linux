@@ -146,6 +146,16 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
 	u8 out_color_space, struct g2d_csc_state *csc_state);
 
+static int sunxi_g2d_do_blit_rot_rcq(
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format,
+	u32 src_crop_x, u32 src_crop_y, u32 src_crop_w, u32 src_crop_h,
+	dma_addr_t dst_dma, u32 dst_width, u32 dst_height, u32 dst_pitch,
+	u32 dst_format, u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags);
+
+static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
+				 struct g2d_rcq_mem *rcq);
+
 static inline bool sunxi_g2d_is_yuv_planar(u32 fmt);
 static inline bool sunxi_g2d_is_yuv_semiplanar(u32 fmt);
 
@@ -175,6 +185,13 @@ static inline void sunxi_g2d_uv_div_factors(u32 fmt, u32 *x_div, u32 *y_div)
 }
 
 static int sunxi_g2d_do_blit_rot(
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format,
+	u32 src_crop_x, u32 src_crop_y, u32 src_crop_w, u32 src_crop_h,
+	dma_addr_t dst_dma, u32 dst_width, u32 dst_height, u32 dst_pitch,
+	u32 dst_format, u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags);
+
+static int sunxi_g2d_do_blit_rot_rcq(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
 	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format,
 	u32 src_crop_x, u32 src_crop_y, u32 src_crop_w, u32 src_crop_h,
@@ -1379,7 +1396,7 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 			if (cmd->params.rotate.flip_v)
 				flags |= G2D_BLIT_FLAG_FLIP_V;
 
-			ret = sunxi_g2d_do_blit_rot(
+			ret = sunxi_g2d_do_blit_rot_rcq(
 				g2d, &step->rcq, step->src_dma,
 				step->blit.src_width, step->blit.src_height,
 				step->blit.src_pitch, step->blit.src_format,
@@ -2292,6 +2309,8 @@ static int sunxi_g2d_do_blit_rot(
 	u32 dst_uv_x_div = 1, dst_uv_y_div = 1;
 	bool src_is_planar = false, dst_is_planar = false;
 	bool src_is_semiplanar = false, dst_is_semiplanar = false;
+	bool restore_mixer_irq = false;
+	int ret = 0;
 
 	dev_dbg(g2d->dev, "BLIT_ROT: src_dma=%pad dst_dma=%pad size=%ux%u->%ux%u flags=0x%x\n",
 		 &src_dma, &dst_dma, src_width, src_height, dst_width, dst_height, flags);
@@ -2299,35 +2318,47 @@ static int sunxi_g2d_do_blit_rot(
 	/* CRITICAL: Check for valid base address to prevent paging request errors */
 	if (IS_ERR_OR_NULL(g2d->base)) {
 		dev_err(g2d->dev, "BLIT_ROT: Invalid MMIO base address: %p\n", g2d->base);
-		return -EIO;
+		ret = -EIO;
+		goto out;
 	}
 
 	/* Check for zero dimensions to prevent integer underflow in size calculations */
 	if (src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0) {
 		dev_err(g2d->dev, "BLIT_ROT: Zero dimensions detected (src=%ux%u dst=%ux%u)\n",
 			src_width, src_height, dst_width, dst_height);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
+	}
+	if (src_crop_w == 0 || src_crop_h == 0 || dst_w == 0 || dst_h == 0) {
+		dev_err(g2d->dev,
+			"BLIT_ROT: Zero crop/output size (crop=%ux%u dst=%ux%u)\n",
+			src_crop_w, src_crop_h, dst_w, dst_h);
+		ret = -EINVAL;
+		goto out;
 	}
 
 	/* Check for zero pitch */
 	if (src_pitch == 0 || dst_pitch == 0) {
 		dev_err(g2d->dev, "BLIT_ROT: Zero pitch detected (src=%u dst=%u)\n",
 			src_pitch, dst_pitch);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	/* Check for invalid DMA addresses (0 is likely invalid on this platform) */
 	if (src_dma == 0 || dst_dma == 0) {
 		dev_err(g2d->dev, "BLIT_ROT: Invalid DMA address (src=%pad dst=%pad)\n",
 			&src_dma, &dst_dma);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto out;
 	}
 
 	/* Check for format mismatch (ROT doesn't support format conversion) */
 	if (src_format != dst_format) {
 		dev_warn_once(g2d->dev, "BLIT_ROT: Format conversion not supported (src=0x%x dst=0x%x)\n",
 			      src_format, dst_format);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto out;
 	}
 
 	/* Determine output dimensions based on rotation */
@@ -2347,7 +2378,8 @@ static int sunxi_g2d_do_blit_rot(
 	if (dst_w != out_w || dst_h != out_h) {
 		dev_warn_once(g2d->dev, "BLIT_ROT: Scaling not supported (out=%ux%u dst=%ux%u)\n",
 			      out_w, out_h, dst_w, dst_h);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto out;
 	}
 
 	/* Reset ROT/MIXER to a clean state before programming registers */
@@ -2371,13 +2403,15 @@ static int sunxi_g2d_do_blit_rot(
 	g2d_write(g2d, G2D_MIXER_CTL, 0x00000000);
 	g2d_write(g2d, G2D_MIXER_INT, 0x00000000);
 	wmb();
+	restore_mixer_irq = true;
 
 	/* Get ROT format codes and bpp using unified format function */
 	int hw_src_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
 	if (hw_src_fmt < 0) {
 		dev_err(g2d->dev, "Unsupported ROT source format: %u\n",
 			src_format);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto out;
 	}
 	rot_fmt = (u32)hw_src_fmt; /* Hardware format code for ROT_IFMT */
 
@@ -2386,7 +2420,8 @@ static int sunxi_g2d_do_blit_rot(
 	if (hw_dst_fmt < 0) {
 		dev_err(g2d->dev, "Unsupported ROT destination format: %u\n",
 			dst_format);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto out;
 	}
 	src_is_planar = sunxi_g2d_is_yuv_planar(src_format);
 	src_is_semiplanar = sunxi_g2d_is_yuv_semiplanar(src_format);
@@ -2541,15 +2576,220 @@ static int sunxi_g2d_do_blit_rot(
 		if (wait_result <= 0) {
 			u32 status = g2d_read(g2d, ROT_INT);
 			u32 ctl = g2d_read(g2d, ROT_CTL);
-			int ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
+			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
 			
 			dev_err(g2d->dev, "BLIT_ROT timeout (IRQ), status=0x%08x ctl=0x%08x ret=%d\n", 
 				status, ctl, ret);
-			return ret;
+			goto out;
 		}
 	}
 
-	return 0;
+out:
+	/* Restore mixer IRQ enable so RCQ path keeps receiving completion interrupts */
+	if (restore_mixer_irq && !IS_ERR_OR_NULL(g2d->base)) {
+		g2d_write(g2d, G2D_MIXER_INT,
+			  G2D_MIXER_INT_FINISH_IRQ_EN |
+				  G2D_MIXER_INT_IRQ_PENDING);
+		wmb();
+	}
+
+	/* After MMIO rotation, fully reset mixer/rot to avoid corrupting next RCQ jobs.
+	 * Do this even on error to keep hardware in a known state.
+	 */
+	if (!IS_ERR_OR_NULL(g2d->base)) {
+		volatile struct g2d_top_reg *g2d_top =
+			(volatile struct g2d_top_reg *)g2d->base;
+
+		/* Clear RCQ interrupt/status just in case */
+		writel(0, g2d->base + G2D_RCQ_IRQ_CTL);
+		writel(G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH,
+		       g2d->base + G2D_RCQ_STATUS);
+		/* Clear RCQ head registers to remove stale configuration */
+		writel(0, g2d->base + G2D_RCQ_HEAD_LOW);
+		writel(0, g2d->base + G2D_RCQ_HEAD_HIGH);
+		writel(0, g2d->base + G2D_RCQ_HEAD_LEN);
+		writel(0, g2d->base + G2D_RCQ_CTRL);
+
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 0;
+		wmb();
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 1;
+		wmb();
+
+		/* Restore DRAM command control for RCQ DMA access */
+		g2d_write(g2d, G2D_CMD_CTL, 0x00010011);
+
+		/* Re-enable mixer finish IRQ */
+		g2d_write(g2d, G2D_MIXER_INT,
+			  G2D_MIXER_INT_FINISH_IRQ_EN |
+				  G2D_MIXER_INT_IRQ_PENDING);
+		wmb();
+	}
+
+	return ret;
+}
+
+/* RCQ-based ROT implementation to keep pipeline consistent with other ops */
+static int sunxi_g2d_do_blit_rot_rcq(
+	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
+	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format,
+	u32 src_crop_x, u32 src_crop_y, u32 src_crop_w, u32 src_crop_h,
+	dma_addr_t dst_dma, u32 dst_width, u32 dst_height, u32 dst_pitch,
+	u32 dst_format, u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h, u32 flags)
+{
+	struct g2d_rot_reg *rot_regs = NULL;
+	u32 rot_size = 0;
+	u32 src_bpp, dst_bpp;
+	u32 rot_mode = 0;
+	u32 rot_hw_fmt;
+	dma_addr_t src_offset_dma, dst_offset_dma;
+	u32 out_w, out_h;
+	int ret;
+
+	/* Hardware on T113 ignores ROT writes through RCQ; fall back to MMIO */
+	return -EOPNOTSUPP;
+
+	dev_dbg(g2d->dev, "BLIT_ROT_RCQ: src_dma=%pad dst_dma=%pad size=%ux%u->%ux%u flags=0x%x\n",
+		 &src_dma, &dst_dma, src_width, src_height, dst_width, dst_height, flags);
+
+	if (!g2d || !rcq || !rcq->vir_addr || !g2d->rcq_enabled)
+		return -EOPNOTSUPP;
+
+	/* Validate basic params (mirror MMIO path) */
+	if (src_format != dst_format)
+		return -EOPNOTSUPP;
+	if (!src_width || !src_height || !dst_width || !dst_height ||
+	    !src_crop_w || !src_crop_h || !dst_w || !dst_h)
+		return -EINVAL;
+	if (!src_pitch || !dst_pitch)
+		return -EINVAL;
+	if (!src_dma || !dst_dma)
+		return -EFAULT;
+
+	/* Rotated output dimensions */
+	if (flags & (G2D_BLIT_FLAG_ROTATE_90 | G2D_BLIT_FLAG_ROTATE_270)) {
+		out_w = src_crop_h;
+		out_h = src_crop_w;
+	} else {
+		out_w = src_crop_w;
+		out_h = src_crop_h;
+	}
+	if (dst_w != out_w || dst_h != out_h)
+		return -EOPNOTSUPP; /* no scaling */
+
+	rot_hw_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
+	if ((int)rot_hw_fmt < 0)
+		return -EOPNOTSUPP;
+	if (sunxi_g2d_format_to_hw(dst_format, &dst_bpp) < 0)
+		return -EOPNOTSUPP;
+
+	/* Limit RCQ ROT to packed formats for now */
+	if (sunxi_g2d_is_yuv_planar(src_format) ||
+	    sunxi_g2d_is_yuv_semiplanar(src_format))
+		return -EOPNOTSUPP;
+
+	/* Address with crop offsets */
+	src_offset_dma = src_dma +
+			 (dma_addr_t)src_crop_y * src_pitch +
+			 (dma_addr_t)src_crop_x * src_bpp;
+	dst_offset_dma = dst_dma +
+			 (dma_addr_t)dst_y * dst_pitch +
+			 (dma_addr_t)dst_x * dst_bpp;
+
+	/* Build rot_mode flags for RCQ builder */
+	if (flags & G2D_BLIT_FLAG_ROTATE_90)
+		rot_mode |= G2D_ROT_90;
+	else if (flags & G2D_BLIT_FLAG_ROTATE_180)
+		rot_mode |= G2D_ROT_180;
+	else if (flags & G2D_BLIT_FLAG_ROTATE_270)
+		rot_mode |= G2D_ROT_270;
+	if (flags & G2D_BLIT_FLAG_FLIP_H)
+		rot_mode |= G2D_ROT_H;
+	if (flags & G2D_BLIT_FLAG_FLIP_V)
+		rot_mode |= G2D_ROT_V;
+
+	sunxi_g2d_rcq_reset(rcq);
+
+	ret = g2d_rcq_build_rot(src_crop_w, src_crop_h, src_pitch,
+				src_offset_dma, src_format, dst_w, dst_h,
+				dst_pitch, dst_offset_dma, dst_format, rot_mode,
+				&rot_regs, &rot_size);
+	if (ret)
+		goto out;
+
+	/* Program ROT registers block (start bit is 0 inside) */
+	ret = sunxi_g2d_rcq_add_block(rcq, ROT_CTL, rot_regs, rot_size);
+	if (ret)
+		goto out;
+
+	/* Add start write as a separate small block so start is last */
+	{
+		u32 rot_start = rot_regs->rot_ctrl.dwval | ROT_CTL_START;
+		ret = sunxi_g2d_rcq_add_block(rcq, ROT_CTL, &rot_start,
+					      sizeof(rot_start));
+		if (ret)
+			goto out;
+	}
+
+	/* Execute RCQ with polling on ROT_INT/task_end to avoid mixing MMIO path */
+	{
+		volatile struct g2d_top_reg *g2d_top =
+			(volatile struct g2d_top_reg *)g2d->base;
+		unsigned long timeout = jiffies + msecs_to_jiffies(200);
+		u32 sts;
+
+		/* Reset RCQ/mixer/rot blocks before launch */
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 0;
+		wmb();
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 1;
+		wmb();
+
+		atomic_set(&g2d->irq_done, 0);
+		g2d_write(g2d, G2D_RCQ_IRQ_CTL, G2D_RCQ_IRQ_TASK_END_EN);
+		wmb();
+
+		sunxi_g2d_rcq_setup_hw(g2d->base, rcq);
+		sunxi_g2d_rcq_start(g2d->base, false, true);
+		wmb();
+
+		/* Poll for completion via ROT_INT or RCQ task_end */
+		while (time_before(jiffies, timeout)) {
+			u32 rot_int = g2d_read(g2d, ROT_INT);
+			sts = g2d_read(g2d, G2D_RCQ_STATUS);
+
+			if (rot_int & ROT_INT_FINISH) {
+				g2d_write(g2d, ROT_INT, ROT_INT_FINISH);
+				ret = 0;
+				break;
+			}
+			if (sts & G2D_RCQ_STATUS_TASK_END) {
+				/* Clear task_end */
+				writel(G2D_RCQ_STATUS_TASK_END,
+				       g2d->base + G2D_RCQ_STATUS);
+				ret = 0;
+				break;
+			}
+			cpu_relax();
+		}
+
+		if (time_after_eq(jiffies, timeout))
+			ret = -ETIMEDOUT;
+
+		/* Reset blocks after completion/timeout */
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 0;
+		wmb();
+		g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+		g2d_top->ahb_rst.bits.rot_ahb_rst = 1;
+		wmb();
+	}
+
+out:
+	kfree(rot_regs);
+	return ret;
 }
 
 static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
@@ -2584,6 +2824,11 @@ static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
 		wmb();
 	}
 
+	/* Ensure MIXER finish IRQ is enabled (rotation path temporarily disables it) */
+	g2d_write(g2d, G2D_MIXER_INT,
+		  G2D_MIXER_INT_FINISH_IRQ_EN | G2D_MIXER_INT_IRQ_PENDING);
+	wmb();
+
 	/* Program RCQ HEAD/LEN and start */
 	sunxi_g2d_rcq_setup_hw(g2d->base, rcq);
 	sunxi_g2d_rcq_start(g2d->base, false, true);
@@ -2599,6 +2844,14 @@ static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
 			timeout_jiffies);
 		if (wait_result <= 0) {
 			ret = wait_result ? -ERESTARTSYS : -ETIMEDOUT;
+			/* Fallback: if task_end already set, treat as success */
+			if (g2d_read(g2d, G2D_RCQ_STATUS) &
+			    G2D_RCQ_STATUS_TASK_END) {
+				/* Clear task_end and continue */
+				writel(G2D_RCQ_STATUS_TASK_END,
+				       g2d->base + G2D_RCQ_STATUS);
+				ret = 0;
+			}
 			dev_err(g2d->dev,
 				"RCQ execution timeout or interrupted: %d\n",
 				ret);
@@ -2617,6 +2870,28 @@ static int sunxi_g2d_execute_rcq(struct sunxi_g2d_dev *g2d,
 				dev_err(g2d->dev, "DEBUG: CMD_CTL=0x%08x SCLK=0x%08x RCQ_STS=0x%08x\n",
 					cmd_ctl, sclk, rcq_status);
 			}
+
+			/* Try to recover from a hung RCQ so subsequent jobs don't get stuck */
+			g2d_write(g2d, G2D_RCQ_CTRL, 0);
+			g2d_write(g2d, G2D_RCQ_IRQ_CTL, 0);
+			g2d_write(g2d, G2D_RCQ_STATUS,
+				  G2D_RCQ_STATUS_TASK_END | G2D_RCQ_STATUS_CFG_FINISH);
+			g2d_write(g2d, G2D_MIXER_INT, G2D_MIXER_INT_IRQ_PENDING);
+			g2d_write(g2d, G2D_MIXER_CTL, G2D_MIXER_CTL_RESET);
+			wmb();
+
+			g2d_top->ahb_rst.bits.mixer_ahb_rst = 0;
+			g2d_top->ahb_rst.bits.rot_ahb_rst = 0;
+			wmb();
+			g2d_top->ahb_rst.bits.mixer_ahb_rst = 1;
+			g2d_top->ahb_rst.bits.rot_ahb_rst = 1;
+			wmb();
+
+			/* Re-arm DMA and mixer IRQ after recovery */
+			g2d_write(g2d, G2D_CMD_CTL, 0x00010011);
+			g2d_write(g2d, G2D_MIXER_INT,
+				  G2D_MIXER_INT_FINISH_IRQ_EN | G2D_MIXER_INT_IRQ_PENDING);
+			wmb();
 		}
 	}
 
@@ -2693,17 +2968,37 @@ static void sunxi_g2d_job_worker(struct work_struct *work)
 
 	/* Execute RCQ or MMIO based on job type */
 	if (job->type == G2D_JOB_CMD_ROTATE) {
-		/* Use MMIO for Rotation */
-		ret = sunxi_g2d_do_blit_rot(
+		/* Prefer RCQ rotation; fallback to MMIO if not supported */
+		ret = sunxi_g2d_do_blit_rot_rcq(
 			g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
 			job->data.blit.src_height, job->data.blit.src_pitch,
 			job->data.blit.src_format, job->data.blit.src_crop_x,
 			job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-			job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
-			job->data.blit.dst_height, job->data.blit.dst_pitch,
-			job->data.blit.dst_format, job->data.blit.dst_x,
-			job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
+			job->data.blit.src_crop_h, job->dst_dma,
+			job->data.blit.dst_width, job->data.blit.dst_height,
+			job->data.blit.dst_pitch, job->data.blit.dst_format,
+			job->data.blit.dst_x, job->data.blit.dst_y,
+			job->data.blit.dst_w, job->data.blit.dst_h,
 			job->data.blit.flags);
+		if (ret == -EOPNOTSUPP) {
+			ret = sunxi_g2d_do_blit_rot(
+				g2d, &job->rcq, job->src_dma,
+				job->data.blit.src_width,
+				job->data.blit.src_height,
+				job->data.blit.src_pitch,
+				job->data.blit.src_format,
+				job->data.blit.src_crop_x,
+				job->data.blit.src_crop_y,
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h, job->dst_dma,
+				job->data.blit.dst_width,
+				job->data.blit.dst_height,
+				job->data.blit.dst_pitch,
+				job->data.blit.dst_format,
+				job->data.blit.dst_x, job->data.blit.dst_y,
+				job->data.blit.dst_w, job->data.blit.dst_h,
+				job->data.blit.flags);
+		}
 	} else {
 		/* Use RCQ for everything else */
 		ret = sunxi_g2d_execute_rcq(g2d, &job->rcq);
@@ -3802,11 +4097,13 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr;
 	u32 src_bpp, dst_bpp;
-	int ret;
-	struct dma_fence *fence;
-	struct sync_file *sync_file;
-	int fence_fd;
-	struct sunxi_g2d_job *job;
+	int ret = 0;
+	struct dma_fence *fence = NULL;
+	struct sync_file *sync_file = NULL;
+	int fence_fd = -1;
+	bool fd_installed = false;
+	struct sunxi_g2d_job *job = NULL;
+	u64 dst_offset_bytes;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd))) {
@@ -3839,6 +4136,67 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		return -EOPNOTSUPP;
 	}
 
+	/* Enforce 32-byte aligned destination offset/width to avoid HW lockups */
+	{
+		u32 align_px = max(1U, 32 / dst_bpp);
+		u64 dst_offset_bytes = (u64)cmd.dst_y * cmd.dst.stride[0] +
+				       (u64)cmd.dst_x * dst_bpp;
+		if (dst_offset_bytes & 0x1F) {
+			dev_err(g2d->dev,
+				"SCALE: dst offset not 32-byte aligned (0x%llx)\n",
+				dst_offset_bytes);
+			return -EINVAL;
+		}
+		if (cmd.dst_w % align_px) {
+			dev_err(g2d->dev,
+				"SCALE: dst width %u not aligned to %u pixels\n",
+				cmd.dst_w, align_px);
+			return -EINVAL;
+		}
+	}
+
+	/* Validate rectangles and sizes */
+	if (!cmd.src.width || !cmd.src.height || !cmd.dst.width ||
+	    !cmd.dst.height || !cmd.dst_w || !cmd.dst_h || !cmd.src.crop_w ||
+	    !cmd.src.crop_h) {
+		dev_err(g2d->dev,
+			"SCALE: zero dimension (src=%ux%u crop=%ux%u dst=%ux%u rect=%ux%u)\n",
+			cmd.src.width, cmd.src.height, cmd.src.crop_w,
+			cmd.src.crop_h, cmd.dst.width, cmd.dst.height,
+			cmd.dst_w, cmd.dst_h);
+		return -EINVAL;
+	}
+	if (cmd.src.crop_x + cmd.src.crop_w > cmd.src.width ||
+	    cmd.src.crop_y + cmd.src.crop_h > cmd.src.height) {
+		dev_err(g2d->dev,
+			"SCALE: src crop out of bounds (%u,%u %ux%u vs %ux%u)\n",
+			cmd.src.crop_x, cmd.src.crop_y, cmd.src.crop_w,
+			cmd.src.crop_h, cmd.src.width, cmd.src.height);
+		return -EINVAL;
+	}
+	if (cmd.dst_x + cmd.dst_w > cmd.dst.width ||
+	    cmd.dst_y + cmd.dst_h > cmd.dst.height) {
+		dev_err(g2d->dev,
+			"SCALE: dst rect out of bounds (%u,%u %ux%u vs %ux%u)\n",
+			cmd.dst_x, cmd.dst_y, cmd.dst_w, cmd.dst_h,
+			cmd.dst.width, cmd.dst.height);
+		return -EINVAL;
+	}
+
+	/* Hardware stability quirk: WB base must be 32-byte aligned.
+	 * If the destination rectangle offset is not 32-byte aligned,
+	 * reject to avoid RCQ hangs.
+	 */
+	dst_offset_bytes =
+		((u64)cmd.dst_y * cmd.dst.stride[0]) +
+		((u64)cmd.dst_x * dst_bpp);
+	if (dst_offset_bytes & 0x1F) {
+		dev_err(g2d->dev,
+			"SCALE: dst offset not 32-byte aligned (offset=0x%llx)\n",
+			dst_offset_bytes);
+		return -EINVAL;
+	}
+
 	/* Import source buffer */
 	src_dmabuf = dma_buf_get(cmd.src.dma_fd);
 	if (IS_ERR(src_dmabuf)) {
@@ -3852,7 +4210,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		dev_err(g2d->dev, "SCALE: dma_buf_attach(src) failed: %ld\n",
 			PTR_ERR(src_attach));
 		ret = PTR_ERR(src_attach);
-		goto err_put_src;
+		goto cleanup;
 	}
 
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
@@ -3861,7 +4219,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 			"SCALE: dma_buf_map_attachment(src) failed: %ld\n",
 			PTR_ERR(src_sgt));
 		ret = PTR_ERR(src_sgt);
-		goto err_detach_src;
+		goto cleanup;
 	}
 
 	/* Pre-compute strides/offsets for possible staging */
@@ -3870,6 +4228,18 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 				     cmd.src.height, cmd.src.stride, src_stride,
 				     src_plane_offset);
 
+	/* Basic stride sanity (packed formats) */
+	if (!sunxi_g2d_is_yuv_planar(cmd.src.format) &&
+	    !sunxi_g2d_is_yuv_semiplanar(cmd.src.format)) {
+		if (src_stride[0] < cmd.src.crop_w * src_bpp) {
+			dev_err(g2d->dev,
+				"SCALE: src stride too small (%u < %u)\n",
+				src_stride[0], cmd.src.crop_w * src_bpp);
+			ret = -EINVAL;
+			goto cleanup;
+		}
+	}
+
 	/* If force_staging is enabled, stage source only if buffer exceeds threshold.
 	 * Small intermediate buffers should use direct DMA path.
 	 */
@@ -3877,7 +4247,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
 				 "SCALE src");
 	if (ret) {
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	/* Import destination buffer */
@@ -3886,7 +4256,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		dev_err(g2d->dev, "SCALE: dma_buf_get(dst) failed: %ld\n",
 			PTR_ERR(dst_dmabuf));
 		ret = PTR_ERR(dst_dmabuf);
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
@@ -3894,7 +4264,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		dev_err(g2d->dev, "SCALE: dma_buf_attach(dst) failed: %ld\n",
 			PTR_ERR(dst_attach));
 		ret = PTR_ERR(dst_attach);
-		goto err_put_dst;
+		goto cleanup;
 	}
 
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
@@ -3903,13 +4273,13 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 			"SCALE: dma_buf_map_attachment(dst) failed: %ld\n",
 			PTR_ERR(dst_sgt));
 		ret = PTR_ERR(dst_sgt);
-		goto err_detach_dst;
+		goto cleanup;
 	}
 
 	/* Determine destination DMA */
 	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr, "SCALE dst");
 	if (ret) {
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	/* Create fence for async operation */
@@ -3917,7 +4287,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (!fence) {
 		dev_err(g2d->dev, "SCALE: fence_create failed\n");
 		ret = -ENOMEM;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	/* Create sync_file for userspace */
@@ -3926,7 +4296,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		dev_err(g2d->dev, "SCALE: sync_file_create failed\n");
 		dma_fence_put(fence);
 		ret = -ENOMEM;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
@@ -3934,7 +4304,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		dev_err(g2d->dev, "SCALE: get_unused_fd failed\n");
 		fput(sync_file->file);
 		ret = fence_fd;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	/* Create/obtain async job (from pool if available) */
@@ -3943,7 +4313,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
 		ret = PTR_ERR(job);
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
@@ -3985,6 +4355,17 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 				     cmd.dst.height, cmd.dst.stride, dst_stride,
 				     dst_plane_offset);
 
+	if (!sunxi_g2d_is_yuv_planar(cmd.dst.format) &&
+	    !sunxi_g2d_is_yuv_semiplanar(cmd.dst.format)) {
+		if (dst_stride[0] < cmd.dst_w * dst_bpp) {
+			dev_err(g2d->dev,
+				"SCALE: dst stride too small (%u < %u)\n",
+				dst_stride[0], cmd.dst_w * dst_bpp);
+			ret = -EINVAL;
+			goto cleanup;
+		}
+	}
+
 	/* Fill blit data structure */
 	job->data.blit.src_width = cmd.src.width;
 	job->data.blit.src_height = cmd.src.height;
@@ -4014,7 +4395,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	ret = g2d_job_prepare_rcq(g2d, job);
 	if (ret)
-		goto err_free_job;
+		goto cleanup;
 
 	ret = sunxi_g2d_do_scale_rcq(
 		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
@@ -4029,7 +4410,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		&job->csc_state);
 	if (ret) {
 		sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
-		goto err_free_job;
+		goto cleanup;
 	}
 	job->rcq_ready = true;
 
@@ -4045,6 +4426,7 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
+	fd_installed = true;
 
 	dev_dbg(g2d->dev, "G2D_CMD_SCALE: enqueued job, fence_fd=%d\n",
 		 fence_fd);
@@ -4058,31 +4440,34 @@ static long sunxi_g2d_cmd_scale(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	return 0;
 
-err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
-err_detach_dst:
-	dma_buf_detach(dst_dmabuf, dst_attach);
-err_put_dst:
-	dma_buf_put(dst_dmabuf);
-err_unmap_src:
-	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
-err_detach_src:
-	dma_buf_detach(src_dmabuf, src_attach);
-err_put_src:
-	dma_buf_put(src_dmabuf);
-err_free_job:
+cleanup:
 	if (!IS_ERR_OR_NULL(job)) {
 		if (job->rcq.vir_addr)
 			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
 		g2d_job_free(g2d, job);
 	}
-	if (sync_file && sync_file->file)
+
+	if (!fd_installed && fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	if (!fd_installed && sync_file && sync_file->file)
 		fput(sync_file->file);
 	if (fence)
 		dma_fence_put(fence);
-	if (fence_fd >= 0)
-		put_unused_fd(fence_fd);
-	goto err_unmap_dst;
+
+	if (dst_sgt && dst_attach)
+		dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
+	if (dst_attach && dst_dmabuf)
+		dma_buf_detach(dst_dmabuf, dst_attach);
+	if (dst_dmabuf && !IS_ERR(dst_dmabuf))
+		dma_buf_put(dst_dmabuf);
+	if (src_sgt && src_attach)
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+	if (src_attach && src_dmabuf)
+		dma_buf_detach(src_dmabuf, src_attach);
+	if (src_dmabuf && !IS_ERR(src_dmabuf))
+		dma_buf_put(src_dmabuf);
+
+	return ret;
 }
 
 /*
@@ -4100,11 +4485,12 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
 	u32 src_bpp, dst_bpp, out_bpp;
-	int ret;
-	struct dma_fence *fence;
-	struct sync_file *sync_file;
-	int fence_fd;
-	struct sunxi_g2d_job *job;
+	int ret = 0;
+	struct dma_fence *fence = NULL;
+	struct sync_file *sync_file = NULL;
+	int fence_fd = -1;
+	bool fd_installed = false;
+	struct sunxi_g2d_job *job = NULL;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
@@ -4171,13 +4557,13 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
-		goto err_put_src;
+		goto cleanup;
 	}
 
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
-		goto err_detach_src;
+		goto cleanup;
 	}
 
 	/* Pre-compute strides/offsets for possible staging */
@@ -4192,26 +4578,26 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
 				 "CMD_BLEND src");
 	if (ret) {
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
-		goto err_put_dst;
+		goto cleanup;
 	}
 
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_TO_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
-		goto err_detach_dst;
+		goto cleanup;
 	}
 
 	/* Allow staging for DST (background) if non-linear or when forced */
@@ -4225,7 +4611,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 					 &dst_dma_addr,
 					 "CMD_BLEND dst");
 		if (ret) {
-			goto err_unmap_dst;
+			goto cleanup;
 		}
 	}
 
@@ -4233,31 +4619,31 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	out_dmabuf = dma_buf_get(cmd.out.dma_fd);
 	if (IS_ERR(out_dmabuf)) {
 		ret = PTR_ERR(out_dmabuf);
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
 	if (IS_ERR(out_attach)) {
 		ret = PTR_ERR(out_attach);
-		goto err_put_out;
+		goto cleanup;
 	}
 
 	out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
 	if (IS_ERR(out_sgt)) {
 		ret = PTR_ERR(out_sgt);
-		goto err_detach_out;
+		goto cleanup;
 	}
 
 	ret = g2d_sg_dma_address(g2d->dev, out_sgt, &out_dma_addr,
 				 "CMD_BLEND out");
 	if (ret)
-		goto err_unmap_out;
+		goto cleanup;
 
 	/* Create fence for async operation */
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	/* Create sync_file for userspace */
@@ -4265,14 +4651,14 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (!sync_file) {
 		dma_fence_put(fence);
 		ret = -ENOMEM;
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	/* Create/obtain async job (from pool if available) */
@@ -4281,7 +4667,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
 		ret = PTR_ERR(job);
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
@@ -4355,7 +4741,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	ret = g2d_job_prepare_rcq(g2d, job);
 	if (ret) {
-		goto err_free_job;
+		goto cleanup;
 	}
 
 	ret = sunxi_g2d_do_blend_rcq(
@@ -4375,7 +4761,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.blit.src_color_space, job->data.blit.dst_color_space,
 		job->data.blit.out_color_space, &job->csc_state);
 	if (ret)
-		goto err_free_job;
+		goto cleanup;
 	job->rcq_ready = true;
 
 	/* Enqueue job to worker */
@@ -4390,6 +4776,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
+	fd_installed = true;
 
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
@@ -4403,37 +4790,43 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	return 0;
 
-err_unmap_out:
-	dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
-err_detach_out:
-	dma_buf_detach(out_dmabuf, out_attach);
-err_put_out:
-	dma_buf_put(out_dmabuf);
-err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_TO_DEVICE);
-err_detach_dst:
-	dma_buf_detach(dst_dmabuf, dst_attach);
-err_put_dst:
-	dma_buf_put(dst_dmabuf);
-err_unmap_src:
-	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
-err_detach_src:
-	dma_buf_detach(src_dmabuf, src_attach);
-err_put_src:
-	dma_buf_put(src_dmabuf);
-err_free_job:
+cleanup:
 	if (!IS_ERR_OR_NULL(job)) {
 		if (job->rcq.vir_addr)
 			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
 		g2d_job_free(g2d, job);
 	}
-	if (sync_file && sync_file->file)
+
+	if (!fd_installed && fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	if (!fd_installed && sync_file && sync_file->file)
 		fput(sync_file->file);
 	if (fence)
 		dma_fence_put(fence);
-	if (fence_fd >= 0)
-		put_unused_fd(fence_fd);
-	goto err_unmap_out;
+
+	if (out_sgt && out_attach)
+		dma_buf_unmap_attachment(out_attach, out_sgt,
+					 DMA_FROM_DEVICE);
+	if (out_attach && out_dmabuf)
+		dma_buf_detach(out_dmabuf, out_attach);
+	if (out_dmabuf && !IS_ERR(out_dmabuf))
+		dma_buf_put(out_dmabuf);
+
+	if (dst_sgt && dst_attach)
+		dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_TO_DEVICE);
+	if (dst_attach && dst_dmabuf)
+		dma_buf_detach(dst_dmabuf, dst_attach);
+	if (dst_dmabuf && !IS_ERR(dst_dmabuf))
+		dma_buf_put(dst_dmabuf);
+
+	if (src_sgt && src_attach)
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+	if (src_attach && src_dmabuf)
+		dma_buf_detach(src_dmabuf, src_attach);
+	if (src_dmabuf && !IS_ERR(src_dmabuf))
+		dma_buf_put(src_dmabuf);
+
+	return ret;
 }
 
 /*
@@ -4513,6 +4906,13 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 			"G2D_CMD_ROTATE: dst rect out of bounds (%u,%u %ux%u vs %ux%u)\n",
 			cmd.dst_x, cmd.dst_y, cmd.dst_w, cmd.dst_h,
 			cmd.dst.width, cmd.dst.height);
+		return -EINVAL;
+	}
+	if (cmd.src.crop_w == 0 || cmd.src.crop_h == 0 || cmd.dst_w == 0 ||
+	    cmd.dst_h == 0) {
+		dev_err(g2d->dev,
+			"G2D_CMD_ROTATE: zero-sized crop/dst (crop=%ux%u dst=%ux%u)\n",
+			cmd.src.crop_w, cmd.src.crop_h, cmd.dst_w, cmd.dst_h);
 		return -EINVAL;
 	}
 
@@ -4673,22 +5073,6 @@ static long sunxi_g2d_cmd_rotate(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (ret)
 		goto cleanup;
 
-	/*
-	ret = sunxi_g2d_do_blit_rot(
-		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
-		job->data.blit.src_height, job->data.blit.src_pitch,
-		job->data.blit.src_format, job->data.blit.src_crop_x,
-		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
-		job->data.blit.dst_height, job->data.blit.dst_pitch,
-		job->data.blit.dst_format, job->data.blit.dst_x,
-		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
-		job->data.blit.flags);
-	if (ret) {
-		sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
-		goto err_free_job;
-	}
-	*/
 	job->rcq_ready = true;
 
 	/* MMIO execution successful - Signal fence and cleanup immediately */
@@ -4952,11 +5336,12 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL, *out_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr, out_dma_addr;
 	u32 src_bpp, dst_bpp, out_bpp;
-	int ret;
-	struct dma_fence *fence;
-	struct sync_file *sync_file;
-	int fence_fd;
-	struct sunxi_g2d_job *job;
+	int ret = 0;
+	struct dma_fence *fence = NULL;
+	struct sync_file *sync_file = NULL;
+	int fence_fd = -1;
+	bool fd_installed = false;
+	struct sunxi_g2d_job *job = NULL;
 	bool has_out_buffer;
 
 	/* Copy command from userspace */
@@ -4994,13 +5379,13 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
-		goto err_put_src;
+		goto cleanup;
 	}
 
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
-		goto err_detach_src;
+		goto cleanup;
 	}
 
 	/* Pre-compute strides/offsets for potential staging */
@@ -5012,58 +5397,58 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
 				 "CMD_MASK src");
 	if (ret) {
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
-		goto err_put_dst;
+		goto cleanup;
 	}
 
 	dst_sgt = dma_buf_map_attachment(
 		dst_attach, has_out_buffer ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
-		goto err_detach_dst;
+		goto cleanup;
 	}
 
 	ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
 				 "CMD_MASK dst");
 	if (ret)
-		goto err_unmap_dst;
+		goto cleanup;
 
 	/* Import output buffer if provided */
 	if (has_out_buffer) {
 		out_dmabuf = dma_buf_get(cmd.out.dma_fd);
 		if (IS_ERR(out_dmabuf)) {
 			ret = PTR_ERR(out_dmabuf);
-			goto err_unmap_dst;
+			goto cleanup;
 		}
 
 		out_attach = dma_buf_attach(out_dmabuf, g2d->dev);
 		if (IS_ERR(out_attach)) {
 			ret = PTR_ERR(out_attach);
-			goto err_put_out;
+			goto cleanup;
 		}
 
 		out_sgt = dma_buf_map_attachment(out_attach, DMA_FROM_DEVICE);
 		if (IS_ERR(out_sgt)) {
 			ret = PTR_ERR(out_sgt);
-			goto err_detach_out;
+			goto cleanup;
 		}
 
 		ret = g2d_sg_dma_address(g2d->dev, out_sgt, &out_dma_addr,
 					 "CMD_MASK out");
 		if (ret)
-			goto err_unmap_out;
+			goto cleanup;
 	} else {
 		/* No output buffer - mask in-place (dst is both input and output) */
 		out_dma_addr = dst_dma_addr;
@@ -5073,7 +5458,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	/* Create sync_file for userspace */
@@ -5081,14 +5466,14 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (!sync_file) {
 		dma_fence_put(fence);
 		ret = -ENOMEM;
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	/* Create/obtain async job (from pool if available) */
@@ -5097,7 +5482,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
 		ret = PTR_ERR(job);
-		goto err_unmap_out;
+		goto cleanup;
 	}
 
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
@@ -5188,7 +5573,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	ret = g2d_job_prepare_rcq(g2d, job);
 	if (ret)
-		goto err_free_job;
+		goto cleanup;
 
 	ret = sunxi_g2d_do_blend_rcq(
 		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
@@ -5207,7 +5592,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.blit.src_color_space, job->data.blit.dst_color_space,
 		job->data.blit.out_color_space, &job->csc_state);
 	if (ret)
-		goto err_free_job;
+		goto cleanup;
 	job->rcq_ready = true;
 
 	/* Enqueue job to worker */
@@ -5222,6 +5607,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
+	fd_installed = true;
 
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
@@ -5235,42 +5621,44 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	return 0;
 
-err_unmap_out:
-	if (has_out_buffer)
-		dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
-err_detach_out:
-	if (has_out_buffer)
-		dma_buf_detach(out_dmabuf, out_attach);
-err_put_out:
-	if (has_out_buffer)
-		dma_buf_put(out_dmabuf);
-err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt,
-				 has_out_buffer ? DMA_TO_DEVICE :
-						  DMA_FROM_DEVICE);
-err_detach_dst:
-	dma_buf_detach(dst_dmabuf, dst_attach);
-err_put_dst:
-	dma_buf_put(dst_dmabuf);
-err_unmap_src:
-	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
-err_detach_src:
-	dma_buf_detach(src_dmabuf, src_attach);
-err_put_src:
-	dma_buf_put(src_dmabuf);
-err_free_job:
+cleanup:
 	if (!IS_ERR_OR_NULL(job)) {
 		if (job->rcq.vir_addr)
 			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
 		g2d_job_free(g2d, job);
 	}
-	if (sync_file && sync_file->file)
+
+	if (!fd_installed && fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	if (!fd_installed && sync_file && sync_file->file)
 		fput(sync_file->file);
 	if (fence)
 		dma_fence_put(fence);
-	if (fence_fd >= 0)
-		put_unused_fd(fence_fd);
-	goto err_unmap_out;
+
+	if (has_out_buffer && out_sgt && out_attach)
+		dma_buf_unmap_attachment(out_attach, out_sgt, DMA_FROM_DEVICE);
+	if (has_out_buffer && out_attach && out_dmabuf)
+		dma_buf_detach(out_dmabuf, out_attach);
+	if (has_out_buffer && out_dmabuf && !IS_ERR(out_dmabuf))
+		dma_buf_put(out_dmabuf);
+
+	if (dst_sgt && dst_attach)
+		dma_buf_unmap_attachment(dst_attach, dst_sgt,
+					 has_out_buffer ? DMA_TO_DEVICE :
+							  DMA_FROM_DEVICE);
+	if (dst_attach && dst_dmabuf)
+		dma_buf_detach(dst_dmabuf, dst_attach);
+	if (dst_dmabuf && !IS_ERR(dst_dmabuf))
+		dma_buf_put(dst_dmabuf);
+
+	if (src_sgt && src_attach)
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+	if (src_attach && src_dmabuf)
+		dma_buf_detach(src_dmabuf, src_attach);
+	if (src_dmabuf && !IS_ERR(src_dmabuf))
+		dma_buf_put(src_dmabuf);
+
+	return ret;
 }
 
 /*
@@ -5286,11 +5674,12 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	struct sg_table *src_sgt = NULL, *dst_sgt = NULL;
 	dma_addr_t src_dma_addr, dst_dma_addr;
 	u32 src_bpp, dst_bpp;
-	int ret;
-	struct dma_fence *fence;
-	struct sync_file *sync_file;
-	int fence_fd;
-	struct sunxi_g2d_job *job;
+	int ret = 0;
+	struct dma_fence *fence = NULL;
+	struct sync_file *sync_file = NULL;
+	int fence_fd = -1;
+	bool fd_installed = false;
+	struct sunxi_g2d_job *job = NULL;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
@@ -5323,13 +5712,13 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	src_attach = dma_buf_attach(src_dmabuf, g2d->dev);
 	if (IS_ERR(src_attach)) {
 		ret = PTR_ERR(src_attach);
-		goto err_put_src;
+		goto cleanup;
 	}
 
 	src_sgt = dma_buf_map_attachment(src_attach, DMA_TO_DEVICE);
 	if (IS_ERR(src_sgt)) {
 		ret = PTR_ERR(src_sgt);
-		goto err_detach_src;
+		goto cleanup;
 	}
 
 	/* Pre-compute strides/offsets for possible staging */
@@ -5342,26 +5731,26 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	ret = g2d_sg_dma_address(g2d->dev, src_sgt, &src_dma_addr,
 				 "CMD_COPY src");
 	if (ret) {
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	/* Import destination buffer */
 	dst_dmabuf = dma_buf_get(cmd.dst.dma_fd);
 	if (IS_ERR(dst_dmabuf)) {
 		ret = PTR_ERR(dst_dmabuf);
-		goto err_unmap_src;
+		goto cleanup;
 	}
 
 	dst_attach = dma_buf_attach(dst_dmabuf, g2d->dev);
 	if (IS_ERR(dst_attach)) {
 		ret = PTR_ERR(dst_attach);
-		goto err_put_dst;
+		goto cleanup;
 	}
 
 	dst_sgt = dma_buf_map_attachment(dst_attach, DMA_FROM_DEVICE);
 	if (IS_ERR(dst_sgt)) {
 		ret = PTR_ERR(dst_sgt);
-		goto err_detach_dst;
+		goto cleanup;
 	}
 
 	/* Determine if writeback staging is needed for destination (output) */
@@ -5369,7 +5758,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		ret = g2d_sg_dma_address(g2d->dev, dst_sgt, &dst_dma_addr,
 					 "CMD_COPY dst");
 		if (ret) {
-			goto err_unmap_dst;
+			goto cleanup;
 		}
 	}
 
@@ -5377,7 +5766,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	fence = sunxi_g2d_fence_create(g2d);
 	if (!fence) {
 		ret = -ENOMEM;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	/* Create sync_file for userspace */
@@ -5385,14 +5774,14 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (!sync_file) {
 		dma_fence_put(fence);
 		ret = -ENOMEM;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	fence_fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fence_fd < 0) {
 		fput(sync_file->file);
 		ret = fence_fd;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	/* Create/obtain async job (from pool if available) */
@@ -5401,7 +5790,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		put_unused_fd(fence_fd);
 		fput(sync_file->file);
 		ret = -ENOMEM;
-		goto err_unmap_dst;
+		goto cleanup;
 	}
 
 	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
@@ -5448,9 +5837,8 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	job->data.blit.dst_color_space = cmd.dst.color_space;
 
 	ret = g2d_job_prepare_rcq(g2d, job);
-	if (ret) {
-		goto err_free_job;
-	}
+	if (ret)
+		goto cleanup;
 
 	ret = sunxi_g2d_do_blit_rcq(
 		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
@@ -5463,7 +5851,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
 		job->data.blit.src_color_space, job->data.blit.dst_color_space);
 	if (ret)
-		goto err_free_job;
+		goto cleanup;
 	job->rcq_ready = true;
 
 	/* Enqueue job to worker */
@@ -5478,6 +5866,7 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	/* Install fence fd */
 	fd_install(fence_fd, sync_file->file);
+	fd_installed = true;
 
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
@@ -5491,31 +5880,35 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 
 	return 0;
 
-err_unmap_dst:
-	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
-err_detach_dst:
-	dma_buf_detach(dst_dmabuf, dst_attach);
-err_put_dst:
-	dma_buf_put(dst_dmabuf);
-err_unmap_src:
-	dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
-err_detach_src:
-	dma_buf_detach(src_dmabuf, src_attach);
-err_put_src:
-	dma_buf_put(src_dmabuf);
-err_free_job:
+cleanup:
 	if (!IS_ERR_OR_NULL(job)) {
 		if (job->rcq.vir_addr)
 			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
 		g2d_job_free(g2d, job);
 	}
-	if (sync_file && sync_file->file)
+
+	if (!fd_installed && fence_fd >= 0)
+		put_unused_fd(fence_fd);
+	if (!fd_installed && sync_file && sync_file->file)
 		fput(sync_file->file);
 	if (fence)
 		dma_fence_put(fence);
-	if (fence_fd >= 0)
-		put_unused_fd(fence_fd);
-	goto err_unmap_dst;
+
+	if (dst_sgt && dst_attach)
+		dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
+	if (dst_attach && dst_dmabuf)
+		dma_buf_detach(dst_dmabuf, dst_attach);
+	if (dst_dmabuf && !IS_ERR(dst_dmabuf))
+		dma_buf_put(dst_dmabuf);
+
+	if (src_sgt && src_attach)
+		dma_buf_unmap_attachment(src_attach, src_sgt, DMA_TO_DEVICE);
+	if (src_attach && src_dmabuf)
+		dma_buf_detach(src_dmabuf, src_attach);
+	if (src_dmabuf && !IS_ERR(src_dmabuf))
+		dma_buf_put(src_dmabuf);
+
+	return ret;
 }
 
 /**
@@ -5732,8 +6125,13 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 	bool needs_scaling = (src_crop_w != dst_w) || (src_crop_h != dst_h);
 	/* Force VSU for YUV420 formats (0x28-0x2B) to handle subsampling via scaler */
 	bool is_yuv420 = (src_fmt_val >= 0x28 && src_fmt_val <= 0x2B);
-	/* BSP enables VSU for all YUV formats (>= 0x20) */
-	bool needs_vsu = needs_scaling || is_yuv;
+	/*
+	 * Force VSU even for 1:1 RGB copies.
+	 * Empirically the RCQ path hangs after a while when the SCAL blocks are
+	 * completely omitted (headers with len=0). Enabling a passthrough VSU
+	 * keeps the BSP-like block layout (SCAL + SCAL_EN valid) and avoids
+	 * RCQ timeouts seen after repeated rotate+copy sequences.
+	 */
 
 	dev_dbg(
 		g2d->dev,
@@ -5757,54 +6155,36 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 		goto cleanup;
 	}
 
-	if (needs_vsu) {
-		if (needs_scaling || is_yuv420) {
-			/* Use active scaler builder for scaling operations OR YUV420 upsampling.
-			 * YUV420 requires chroma upscaling (1/2 -> 1/1) even if Luma is 1:1.
-			 * The passthrough builder assumes 1:1 for ALL channels, which is wrong for YUV420.
-			 */
-			ret = g2d_rcq_build_scaler_active(
-				src_crop_w, src_crop_h, dst_w, dst_h,
-				src_fmt_val, 0xFF, &scal_regs, &scal_size);
-		} else {
-			/* Use passthrough builder for 1:1 operations (optimized) */
-			ret = g2d_rcq_build_scaler_passthrough(dst_w, dst_h,
-							       src_fmt_val,
-							       &scal_regs,
-							       &scal_size);
-		}
-
-		if (ret) {
-			dev_err(g2d->dev, "Failed to build SCAL block: %d\n",
-				ret);
-			goto cleanup;
-		}
-
-		/* Build SCAL_EN block to trigger VSU execution */
-		ret = g2d_rcq_build_scaler_enable(src_fmt_val, &scal_en_regs,
-						  &scal_en_size);
-		if (ret) {
-			dev_err(g2d->dev, "Failed to build SCAL_EN block: %d\n",
-				ret);
-			goto cleanup;
-		}
-
-		dev_dbg(g2d->dev, "VSU activated: scaling=%d is_yuv=%d\n",
-			needs_scaling, is_yuv);
-	} else {
-		dev_dbg(g2d->dev,
-			"VSU skipped: 1:1 copy (RGB or YUV via CSC)\n");
-		/* Do NOT build dummy scaler block. Writing zeros to VSU registers
-		 * when VSU is not used might be unsafe or unnecessary.
-		 * Just pass NULL/0 size, and the packer will create an empty header.
+	if (needs_scaling || is_yuv420) {
+		/* Use active scaler builder for scaling operations OR YUV420 upsampling.
+		 * YUV420 requires chroma upscaling (1/2 -> 1/1) even if Luma is 1:1.
+		 * The passthrough builder assumes 1:1 for ALL channels, which is wrong for YUV420.
 		 */
-		scal_regs = NULL;
-		scal_size = 0;
-
-		/* No enable block needed */
-		scal_en_size = 0;
-		scal_en_regs = NULL;
+		ret = g2d_rcq_build_scaler_active(src_crop_w, src_crop_h, dst_w,
+						  dst_h, src_fmt_val, 0xFF,
+						  &scal_regs, &scal_size);
+	} else {
+		/* Use passthrough builder for 1:1 operations (optimized) */
+		ret = g2d_rcq_build_scaler_passthrough(dst_w, dst_h, src_fmt_val,
+						       &scal_regs,
+						       &scal_size);
 	}
+
+	if (ret) {
+		dev_err(g2d->dev, "Failed to build SCAL block: %d\n", ret);
+		goto cleanup;
+	}
+
+	/* Always build SCAL_EN block to keep BSP RCQ layout */
+	ret = g2d_rcq_build_scaler_enable(src_fmt_val, &scal_en_regs,
+					  &scal_en_size);
+	if (ret) {
+		dev_err(g2d->dev, "Failed to build SCAL_EN block: %d\n", ret);
+		goto cleanup;
+	}
+
+	dev_dbg(g2d->dev, "VSU activated: scaling=%d is_yuv=%d\n",
+		needs_scaling, is_yuv);
 
 	/* Block 3: WB (writeback) - ACTIVE
 	 * CRITICAL: WB size must match BLD output size (the region being copied),
@@ -5851,12 +6231,12 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 
 	layout.blocks[4].size = scal_size;
 	layout.blocks[4].reg_offset = VS_CTRL;
-	layout.blocks[4].dirty = (is_yuv && needs_vsu) ? 1 : 0;
+	layout.blocks[4].dirty = 1;
 
 	/* New block: SCAL_EN (VS_CTRL write) */
 	layout.blocks[5].size = scal_en_size;
 	layout.blocks[5].reg_offset = VS_CTRL;
-	layout.blocks[5].dirty = (needs_vsu && scal_en_size) ? 1 : 0;
+	layout.blocks[5].dirty = 1;
 
 	layout.blocks[6].size = bld_size;
 	layout.blocks[6].reg_offset = BLD_EN_CTL;
@@ -5964,6 +6344,7 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 	int ret;
 	u32 src_bpp, dst_bpp;
 	bool is_yuv, needs_scaling, is_packed_yuv422, needs_vsu;
+	u64 dst_offset_bytes;
 
 	/* Blocks allocated by builders (BSP order V0+UI0+UI1+UI2+SCAL+BLD+WB) */
 	u32 *v0_regs = NULL, v0_size;
@@ -5995,6 +6376,47 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 	is_packed_yuv422 = (src_fmt_val >= 0x2c);
 	/* VSU (scaler) needed for ANY scaling (RGB or YUV) OR any YUV format on V0 */
 	needs_vsu = needs_scaling || is_yuv;
+
+	/* Require WB offset alignment to avoid hangs */
+	dst_offset_bytes =
+		((u64)dst_y * dst_pitch) + ((u64)dst_x * dst_bpp);
+	if (dst_offset_bytes & 0x1F) {
+		dev_err(g2d->dev,
+			"SCALE_RCQ: dst offset not 32-byte aligned (0x%llx)\n",
+			dst_offset_bytes);
+		return -EINVAL;
+	}
+
+	/* Guard against zero sizes/invalid pitches */
+	if (!src_crop_w || !src_crop_h || !dst_w || !dst_h) {
+		dev_err(g2d->dev,
+			"SCALE_RCQ: zero size (src_crop=%ux%u dst=%ux%u)\n",
+			src_crop_w, src_crop_h, dst_w, dst_h);
+		return -EINVAL;
+	}
+	if (!src_pitch || !dst_pitch) {
+		dev_err(g2d->dev, "SCALE_RCQ: zero pitch (src=%u dst=%u)\n",
+			src_pitch, dst_pitch);
+		return -EINVAL;
+	}
+	if (!sunxi_g2d_is_yuv_planar(src_format) &&
+	    !sunxi_g2d_is_yuv_semiplanar(src_format)) {
+		if (src_pitch < src_width * src_bpp) {
+			dev_err(g2d->dev,
+				"SCALE_RCQ: src pitch %u too small for width %u bpp %u\n",
+				src_pitch, src_width, src_bpp);
+			return -EINVAL;
+		}
+	}
+	if (!sunxi_g2d_is_yuv_planar(dst_format) &&
+	    !sunxi_g2d_is_yuv_semiplanar(dst_format)) {
+		if (dst_pitch < dst_width * dst_bpp) {
+			dev_err(g2d->dev,
+				"SCALE_RCQ: dst pitch %u too small for width %u bpp %u\n",
+				dst_pitch, dst_width, dst_bpp);
+			return -EINVAL;
+		}
+	}
 
 	/* ALIGNMENT CHECK: Verify 32KB alignment for DMA addresses */
 	if (src_dma & 0x7FFF) {
@@ -6031,20 +6453,6 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 
 	/* Reset RCQ buffer */
 	sunxi_g2d_rcq_reset(rcq);
-
-	/* Keep destination base; positioning is handled via BLD mem_coor */
-	/* dma_addr_t dst_offset_dma = dst_dma; */ /* Unused */
-
-	/* Calculate offset bytes for WB manual positioning */
-	u64 dst_offset_bytes;
-	if (dst_y > dst_height * 2) {
-		dst_offset_bytes = dst_y;
-		dev_dbg(g2d->dev, "SCALE_RCQ: dst_y=%u looks like offset\n",
-			 dst_y);
-	} else {
-		dst_offset_bytes =
-			(u64)dst_y * dst_pitch + (u64)dst_x * dst_bpp;
-	}
 
 	/* Calculate plane offsets and strides for multi-plane YUV formats */
 	u32 src_user_stride[3] = { src_pitch, 0, 0 };
@@ -6113,8 +6521,8 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 	ret = g2d_rcq_build_bld(dst_w, dst_h, dst_w, dst_h, dst_width,
 				dst_height, src_fmt_val, src_fmt_val,
 				dst_fmt_val, src_colorspace, src_colorspace,
-				dst_colorspace, true, false, dst_x, dst_y, dst_x,
-				dst_y, G2D_BLD_COPY, 0, false, csc_state,
+				dst_colorspace, true, false, dst_x, dst_y,
+				dst_x, dst_y, G2D_BLD_COPY, 0, false, csc_state,
 				(u32 **)&bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build BLD block: %d\n", ret);
@@ -6152,10 +6560,9 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 		scal_en_size = 0;
 	}
 
-	/* WB: Use full buffer dimensions and base address (no manual offset) */
-	ret = g2d_rcq_build_wb(dst_width, dst_height, dst_pitch,
-			       dst_dma, dst_fmt_val,
-			       &wb_regs, &wb_size);
+	/* WB: Write full destination buffer (BSP pattern) */
+	ret = g2d_rcq_build_wb(dst_width, dst_height, dst_pitch, dst_dma,
+			       dst_fmt_val, &wb_regs, &wb_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build WB block: %d\n", ret);
 		goto cleanup;
