@@ -660,7 +660,14 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 		bld->color_key_max.dwval = ck_max & 0x00FFFFFF;
 		bld->color_key_min.dwval = ck_min & 0x00FFFFFF;
 		
-		pr_debug("BLD_BUILDER: ck_en=1 dir=%u min=0x%06x max=0x%06x\n",
+		/* CRITICAL: ROP must be enabled (not bypassed) for Color Key to work.
+		 * We use the standard "Copy" pattern (0x00061080) which passes the
+		 * Blender output through the ROP unit.
+		 */
+		bld->rop_ctrl.dwval = 0x00000000; /* Enable ROP (disable bypass) */
+		bld->ch3_index0.dwval = 0x00061080; /* Standard pass-through */
+		
+		pr_debug("BLD_BUILDER: ck_en=1 dir=%u min=0x%06x max=0x%06x ROP enabled\n",
 			dir, bld->color_key_min.dwval, bld->color_key_max.dwval);
 	} else {
 		bld->color_key.dwval = 0;
