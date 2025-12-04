@@ -116,13 +116,15 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 				 dma_addr_t dst_dma, u32 dst_width,
 				 u32 dst_height, u32 dst_pitch, u32 dst_format,
 				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
-				 u8 src_color_space, u8 dst_color_space);
+				 u8 src_color_space, u8 dst_color_space,
+				 u32 op_flags);
 
 static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 				     struct g2d_rcq_mem *rcq,
 				     dma_addr_t dst_dma, u32 width, u32 height,
 				     u32 pitch, u32 color, u32 color_format,
-				     u32 dst_format);
+				     u32 dst_format, u32 dst_x, u32 dst_y,
+				     u32 global_alpha);
 
 static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 				  struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -144,7 +146,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
-	u8 out_color_space, struct g2d_csc_state *csc_state);
+	u8 out_color_space, bool ck_enable, bool ck_on_src, u32 ck_min, u32 ck_max,
+	struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot_rcq(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -657,9 +660,12 @@ struct g2d_job_fillrect_data {
 	u32 width;
 	u32 height;
 	u32 pitch;
+	u32 dst_x;
+	u32 dst_y;
 	u32 color;
 	u32 color_format;
 	u32 dst_format;
+	u32 global_alpha;
 };
 
 struct g2d_job_blit_data {
@@ -1125,7 +1131,13 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 		step->fillrect.pitch = cmd->dst.stride[0] ?
 					       cmd->dst.stride[0] :
 					       (cmd->dst.width * dst_bpp);
+		step->fillrect.dst_x = cmd->dst_x;
+		step->fillrect.dst_y = cmd->dst_y;
 		step->fillrect.color = cmd->params.fillrect.color;
+		step->fillrect.global_alpha =
+			cmd->params.fillrect.global_alpha ?
+				cmd->params.fillrect.global_alpha :
+				0xFF;
 		step->fillrect.color_format = cmd->dst.format;
 		step->fillrect.dst_format = cmd->dst.format;
 
@@ -1133,7 +1145,8 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 			g2d, &step->rcq, step->dst_dma, step->fillrect.width,
 			step->fillrect.height, step->fillrect.pitch,
 			step->fillrect.color, step->fillrect.color_format,
-			step->fillrect.dst_format);
+			step->fillrect.dst_format, step->fillrect.dst_x,
+			step->fillrect.dst_y, step->fillrect.global_alpha);
 		if (!ret)
 			step->rcq_ready = true;
 		step->type = G2D_JOB_FILLRECT;
@@ -1323,11 +1336,21 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 			(cmd->cmd_type == G2D_CMD_MASK) ?
 				G2D_BLD_SRCOVER :
 				cmd->params.blend.bld_mode;
-		step->blit.color_key_enable =
-			(cmd->cmd_type == G2D_CMD_MASK);
-		step->blit.color_key_mode = cmd->params.mask.color_key_mode;
-		step->blit.color_key_min = cmd->params.mask.color_key_min;
-		step->blit.color_key_max = cmd->params.mask.color_key_max;
+		if (cmd->cmd_type == G2D_CMD_MASK) {
+			step->blit.color_key_enable = 1;
+			step->blit.color_key_mode = cmd->params.mask.color_key_mode;
+			step->blit.color_key_min = cmd->params.mask.color_key_min;
+			step->blit.color_key_max = cmd->params.mask.color_key_max;
+		} else {
+			step->blit.color_key_enable =
+				cmd->params.blend.color_key_enable;
+			step->blit.color_key_mode =
+				cmd->params.blend.color_key_mode;
+			step->blit.color_key_min =
+				cmd->params.blend.color_key_min;
+			step->blit.color_key_max =
+				cmd->params.blend.color_key_max;
+		}
 		step->blit.flags = cmd->flags;
 
 		if (cmd->cmd_type == G2D_CMD_COPY) {
@@ -1343,7 +1366,7 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 				step->blit.dst_format, step->blit.dst_x,
 				step->blit.dst_y, step->blit.dst_w,
 				step->blit.dst_h, step->blit.src_color_space,
-				step->blit.dst_color_space);
+				step->blit.dst_color_space, step->blit.flags);
 		} else if (cmd->cmd_type == G2D_CMD_SCALE) {
 			step->type = G2D_JOB_CMD_SCALE;
 			ret = sunxi_g2d_do_scale_rcq(
@@ -1381,7 +1404,12 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 				step->blit.src_alpha, step->blit.src_premul,
 				step->blit.src_color_space,
 				step->blit.dst_color_space,
-				step->blit.out_color_space, &step->csc_state);
+				step->blit.out_color_space,
+				step->blit.color_key_enable,
+				/* color key always targets source layer */
+				true,
+				step->blit.color_key_min,
+				step->blit.color_key_max, &step->csc_state);
 		} else if (cmd->cmd_type == G2D_CMD_ROTATE) {
 			u32 flags = 0;
 			step->type = G2D_JOB_CMD_ROTATE;
@@ -2275,12 +2303,6 @@ static void sunxi_g2d_disable_workfn(struct work_struct *work)
 /* ========== Async Job Queue Worker ========== */
 
 /* Forward declarations for job execution helpers */
-static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
-				     struct g2d_rcq_mem *rcq,
-				     dma_addr_t dst_dma, u32 width, u32 height,
-				     u32 pitch, u32 color, u32 color_format,
-				     u32 dst_format);
-
 static int sunxi_g2d_do_blend_rcq(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
 	u32 src_width, u32 src_height, u32 src_pitch, u32 src_format, u32 src_x,
@@ -2290,7 +2312,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
-	u8 out_color_space, struct g2d_csc_state *csc_state);
+	u8 out_color_space, bool ck_enable, bool ck_on_src, u32 ck_min,
+	u32 ck_max, struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -3628,11 +3651,18 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 				     struct g2d_rcq_mem *rcq,
 				     dma_addr_t dst_dma, u32 width, u32 height,
 				     u32 pitch, u32 color, u32 color_format,
-				     u32 dst_format)
+				     u32 dst_format, u32 dst_x, u32 dst_y,
+				     u32 global_alpha)
 {
 	struct sunxi_g2d_rcq_frame_layout layout;
-	int color_fmt_val, dst_fmt_val;
+	int dst_fmt_val;
 	int ret;
+	u32 bpp_bytes = 0;
+	dma_addr_t rect_dma;
+	u32 stride[3] = { 0, 0, 0 };
+	u32 plane_offset[3] = { 0, 0, 0 };
+	bool premul = false;
+	u32 eff_alpha = 0xFF;
 
 	/* Blocks allocated by builders (must kfree at end) */
 	u32 *v0_regs = NULL, v0_size;
@@ -3644,52 +3674,79 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 	u32 bld_size;
 	u32 *wb_regs = NULL, wb_size;
 
-	/* Convert formats. For the fill color format we preserve the value
-	 * provided by the caller (UAPI `g2d_pixel_format`) and pass it through
-	 * to the RCQ builder/packers. The destination format still needs to be
-	 * converted to the hardware enum via sunxi_g2d_format_to_hw().
-	 *
-	 * Rationale: fillrect color semantics differ from memory-layer formats
-	 * because the color is written via the V0 fillcolor register and the
-	 * byte-order handling is performed conditionally below (swap only for
-	 * framebuffer XBGR). Passing the UAPI format here avoids forcing an
-	 * implicit ARGB convention on userspace callers.
-	 */
-	color_fmt_val = (int)color_format;
-	dst_fmt_val = sunxi_g2d_format_to_hw(dst_format, NULL);
-	if (dst_fmt_val < 0)
+	dst_fmt_val = sunxi_g2d_format_to_hw(dst_format, &bpp_bytes);
+	if (dst_fmt_val < 0 || !bpp_bytes)
 		return -EOPNOTSUPP;
 
-	dev_dbg(
-		g2d->dev,
-		"FILLRECT_RCQ(modular): %ux%u color=0x%08x fmt=%u->0x%02X dst_fmt=%u->0x%02X\n",
-		width, height, color, color_format, color_fmt_val, dst_format,
-		dst_fmt_val);
+	/* Default global alpha */
+	if (!global_alpha)
+		global_alpha = 0xFF;
 
-	/* Convert color value ONLY when writing to framebuffer (XBGR destination)
-	 * For ION/G2D buffers (ABGR): DON'T swap. The fill_color writes to memory via
-	 * writeback, and little-endian byte order automatically produces the correct
-	 * layout for subsequent reads.
-	 * For framebuffer (XBGR): DO swap. The writeback format differs from V0 format,
-	 * requiring explicit byte swap.
-	 */
+	/* Match legacy behavior: swap channels for framebuffer XBGR */
 	if (dst_fmt_val == G2D_FORMAT_XBGR8888) {
 		color = (color & 0xFF00FF00) | ((color & 0x00FF0000) >> 16) |
 			((color & 0x000000FF) << 16);
-		dev_dbg(g2d->dev, "FILLRECT_RCQ: color swapped for XBGR framebuffer: 0x%08x\n", color);
 	}
+
+	dev_dbg(
+		g2d->dev,
+		"FILLRECT_RCQ(modular): %ux%u@(%u,%u) color=0x%08x fmt=%u dst_fmt=%u->0x%02X pitch=%u\n",
+		width, height, dst_x, dst_y, color, color_format, dst_format,
+		dst_fmt_val, pitch);
 
 	if (!g2d->rcq_enabled || !rcq || !rcq->vir_addr)
 		return -EOPNOTSUPP;
+
+	/* Adjust base DMA to the target rectangle origin */
+	rect_dma = dst_dma + (dma_addr_t)dst_y * pitch +
+		   (dma_addr_t)dst_x * bpp_bytes;
+
+	/* Apply global alpha into color (only for common 32-bit formats) */
+	switch (color_format) {
+	case G2D_FMT_ARGB8888:
+	case G2D_FMT_ABGR8888:
+	case G2D_FMT_XRGB8888:
+	case G2D_FMT_XBGR8888: {
+		u32 a = (color >> 24) & 0xFF;
+		if (!a)
+			a = 0xFF;
+		eff_alpha = (a * global_alpha + 127) / 255;
+		color = (color & 0x00FFFFFF) | (eff_alpha << 24);
+		break;
+	}
+	case G2D_FMT_RGBA8888:
+	case G2D_FMT_BGRA8888:
+	case G2D_FMT_RGBX8888:
+	case G2D_FMT_BGRX8888: {
+		u32 a = color & 0xFF;
+		if (!a)
+			a = 0xFF;
+		eff_alpha = (a * global_alpha + 127) / 255;
+		color = (color & 0xFFFFFF00) | (eff_alpha & 0xFF);
+		break;
+	}
+	default:
+		eff_alpha = global_alpha;
+		break;
+	}
+	if (eff_alpha < 0xFF)
+		premul = true;
+
+	/* Simple packed formats: single stride/plane */
+	stride[0] = pitch;
+	plane_offset[0] = 0;
 
 	/* Reset RCQ buffer */
 	sunxi_g2d_rcq_reset(rcq);
 
 	/* ========== BUILD BLOCKS USING MODULAR FUNCTIONS ========== */
 
-	/* Block 0: V0 (fill color) - ACTIVE */
-	ret = g2d_rcq_build_v0_fillcolor(width, height, pitch, color,
-					 color_fmt_val, &v0_regs, &v0_size);
+	/* Block 0: V0 (memory source = destination buffer) - ACTIVE
+	 * Read current dst contents so alpha blending (SRCOVER) works.
+	 */
+	ret = g2d_rcq_build_v0_memory(width, height, stride, rect_dma,
+				      plane_offset, dst_fmt_val, 0, 0, width,
+				      height, &v0_regs, &v0_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build V0 block: %d\n", ret);
 		goto cleanup;
@@ -3722,21 +3779,22 @@ static int sunxi_g2d_do_fillrect_rcq(struct sunxi_g2d_dev *g2d,
 	/* Block 5: BLD (blender with fill color) - ACTIVE */
 	ret = g2d_rcq_build_bld_fillcolor(width, height, color,
 					  0x03010301, /* SRCOVER Porter-Duff */
-					  &bld_regs, &bld_size);
+					  premul, &bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build BLD block: %d\n", ret);
 		goto cleanup;
 	}
 
 	/* Block 6: WB (writeback) - ACTIVE */
-	ret = g2d_rcq_build_wb(width, height, pitch, dst_dma, dst_fmt_val,
+	ret = g2d_rcq_build_wb(width, height, pitch, rect_dma, dst_fmt_val,
 			       &wb_regs, &wb_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build WB block: %d\n", ret);
 		goto cleanup;
 	}
 
-	dev_dbg(g2d->dev, "RCQ(modular) WB setup: dst_dma=0x%pad\n", &dst_dma);
+	dev_dbg(g2d->dev, "RCQ(modular) WB setup: dst_dma=0x%pad\n",
+		&rect_dma);
 
 	/* ========== SETUP RCQ LAYOUT (7-block BSP structure) ========== */
 
@@ -4639,57 +4697,6 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (ret)
 		goto cleanup;
 
-	/* Create fence for async operation */
-	fence = sunxi_g2d_fence_create(g2d);
-	if (!fence) {
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	/* Create sync_file for userspace */
-	sync_file = sync_file_create(fence);
-	if (!sync_file) {
-		dma_fence_put(fence);
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	fence_fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fence_fd < 0) {
-		fput(sync_file->file);
-		ret = fence_fd;
-		goto cleanup;
-	}
-
-	/* Create/obtain async job (from pool if available) */
-	job = g2d_job_alloc(g2d);
-	if (IS_ERR(job)) {
-		put_unused_fd(fence_fd);
-		fput(sync_file->file);
-		ret = PTR_ERR(job);
-		goto cleanup;
-	}
-
-	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-	job->g2d = g2d;
-	job->csc_state = ctx->csc_changed ? ctx->csc_state : g2d->csc_state;
-	job->fence = fence;
-	job->src_dmabuf = src_dmabuf;
-	job->dst_dmabuf = dst_dmabuf;
-	job->out_dmabuf = out_dmabuf;
-	job->src_attach = src_attach;
-	job->dst_attach = dst_attach;
-	job->out_attach = out_attach;
-	job->src_sgt = src_sgt;
-	job->dst_sgt = dst_sgt;
-	job->out_sgt = out_sgt;
-
-	/* Setup job parameters */
-	job->type = G2D_JOB_CMD_BLEND;
-	job->src_dma = src_dma_addr;
-	job->dst_dma = dst_dma_addr;
-	job->out_dma = out_dma_addr;
-
 	/* Calculate proper strides for YUV formats */
 	u32 dst_stride[3], dst_plane_offset[3];
 	u32 out_stride[3], out_plane_offset[3];
@@ -4704,91 +4711,465 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 				     cmd.out.height, cmd.out.stride, out_stride,
 				     out_plane_offset);
 
-	/* Fill blit data structure */
-	job->data.blit.src_width = cmd.src.width;
-	job->data.blit.src_height = cmd.src.height;
-	job->data.blit.src_pitch = src_stride[0];
-	job->data.blit.src_format = cmd.src.format;
-	job->data.blit.src_crop_x = cmd.src.crop_x;
-	job->data.blit.src_crop_y = cmd.src.crop_y;
-	job->data.blit.src_crop_w = cmd.src.crop_w;
-	job->data.blit.src_crop_h = cmd.src.crop_h;
-	job->data.blit.src_alpha = cmd.src.alpha;
-	job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
-	job->data.blit.src_premul = cmd.src.premul_mode;
-	job->data.blit.src_color_space = cmd.src.color_space;
+	/* Tile repeat support (phase-aware like COPY) */
+	{
+		bool tile_repeat = (cmd.flags & G2D_FLAG_TILE_REPEAT);
+		u32 tile_w = cmd.src.crop_w ? cmd.src.crop_w : cmd.src.width;
+		u32 tile_h = cmd.src.crop_h ? cmd.src.crop_h : cmd.src.height;
+		u32 phase_x = tile_repeat ? cmd.src.crop_x % tile_w :
+					    cmd.src.crop_x;
+		u32 phase_y = tile_repeat ? cmd.src.crop_y % tile_h :
+					    cmd.src.crop_y;
+		u32 area_w = cmd.dst_w;
+		u32 area_h = cmd.dst_h;
 
-	job->data.blit.dst_width = cmd.dst.width;
-	job->data.blit.dst_height = cmd.dst.height;
-	job->data.blit.dst_pitch = dst_stride[0];
-	job->data.blit.dst_format = cmd.dst.format;
-	job->data.blit.dst_x = cmd.dst_x;
-	job->data.blit.dst_y = cmd.dst_y;
-	job->data.blit.dst_w = cmd.dst_w;
-	job->data.blit.dst_h = cmd.dst_h;
-	job->data.blit.dst_alpha = cmd.dst.alpha;
-	job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
-	job->data.blit.dst_premul = cmd.dst.premul_mode;
-	job->data.blit.dst_color_space = cmd.dst.color_space;
+		if (!area_w || !area_h)
+			return -EINVAL;
 
-	job->data.blit.out_width = cmd.out.width;
-	job->data.blit.out_height = cmd.out.height;
-	job->data.blit.out_pitch = out_stride[0];
+		if (!tile_repeat) {
+			/* Single-job path (original behavior) */
+			fence = sunxi_g2d_fence_create(g2d);
+			if (!fence) {
+				ret = -ENOMEM;
+				goto cleanup;
+			}
+
+			sync_file = sync_file_create(fence);
+			if (!sync_file) {
+				dma_fence_put(fence);
+				ret = -ENOMEM;
+				goto cleanup;
+			}
+
+			fence_fd = get_unused_fd_flags(O_CLOEXEC);
+			if (fence_fd < 0) {
+				fput(sync_file->file);
+				ret = fence_fd;
+				goto cleanup;
+			}
+
+			job = g2d_job_alloc(g2d);
+			if (IS_ERR(job)) {
+				put_unused_fd(fence_fd);
+				fput(sync_file->file);
+				ret = PTR_ERR(job);
+				goto cleanup;
+			}
+
+			INIT_WORK(&job->cleanup_work,
+				  sunxi_g2d_job_cleanup_workfn);
+			job->g2d = g2d;
+			job->csc_state = ctx->csc_changed ?
+						 ctx->csc_state :
+						 g2d->csc_state;
+			job->fence = fence;
+			job->src_dmabuf = src_dmabuf;
+			job->dst_dmabuf = dst_dmabuf;
+			job->out_dmabuf = out_dmabuf;
+			job->src_attach = src_attach;
+			job->dst_attach = dst_attach;
+			job->out_attach = out_attach;
+			job->src_sgt = src_sgt;
+			job->dst_sgt = dst_sgt;
+			job->out_sgt = out_sgt;
+
+			job->type = G2D_JOB_CMD_BLEND;
+			job->src_dma = src_dma_addr;
+			job->dst_dma = dst_dma_addr;
+			job->out_dma = out_dma_addr;
+
+			job->data.blit.src_width = cmd.src.width;
+			job->data.blit.src_height = cmd.src.height;
+			job->data.blit.src_pitch = src_stride[0];
+			job->data.blit.src_format = cmd.src.format;
+			job->data.blit.src_crop_x = cmd.src.crop_x;
+			job->data.blit.src_crop_y = cmd.src.crop_y;
+			job->data.blit.src_crop_w = cmd.src.crop_w;
+			job->data.blit.src_crop_h = cmd.src.crop_h;
+			job->data.blit.src_alpha = cmd.src.alpha;
+			job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
+			job->data.blit.src_premul = cmd.src.premul_mode;
+			job->data.blit.src_color_space = cmd.src.color_space;
+
+			job->data.blit.dst_width = cmd.dst.width;
+			job->data.blit.dst_height = cmd.dst.height;
+			job->data.blit.dst_pitch = dst_stride[0];
+			job->data.blit.dst_format = cmd.dst.format;
+			job->data.blit.dst_x = cmd.dst_x;
+			job->data.blit.dst_y = cmd.dst_y;
+			job->data.blit.dst_w = cmd.dst_w;
+			job->data.blit.dst_h = cmd.dst_h;
+			job->data.blit.dst_alpha = cmd.dst.alpha;
+			job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
+			job->data.blit.dst_premul = cmd.dst.premul_mode;
+			job->data.blit.dst_color_space = cmd.dst.color_space;
+
+			job->data.blit.out_width = cmd.out.width;
+			job->data.blit.out_height = cmd.out.height;
+			job->data.blit.out_pitch = out_stride[0];
 	job->data.blit.out_format = cmd.out.format;
 	job->data.blit.out_color_space = cmd.out.color_space;
 
 	job->data.blit.bld_mode = cmd.params.blend.bld_mode;
+	job->data.blit.color_key_enable = cmd.params.blend.color_key_enable;
+	job->data.blit.color_key_mode = cmd.params.blend.color_key_mode;
+	job->data.blit.color_key_min = cmd.params.blend.color_key_min;
+	job->data.blit.color_key_max = cmd.params.blend.color_key_max;
+			job->data.blit.flags = cmd.flags;
 
-	ret = g2d_job_prepare_rcq(g2d, job);
-	if (ret) {
-		goto cleanup;
+			ret = g2d_job_prepare_rcq(g2d, job);
+			if (ret)
+				goto cleanup;
+
+			ret = sunxi_g2d_do_blend_rcq(
+				g2d, &job->rcq, job->src_dma,
+				job->data.blit.src_width,
+				job->data.blit.src_height,
+				job->data.blit.src_pitch,
+				job->data.blit.src_format,
+				job->data.blit.src_crop_x,
+				job->data.blit.src_crop_y,
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h, job->dst_dma,
+				job->data.blit.dst_width,
+				job->data.blit.dst_height,
+				job->data.blit.dst_pitch,
+				job->data.blit.dst_format,
+				job->data.blit.dst_x, job->data.blit.dst_y,
+				job->out_dma, job->data.blit.out_width,
+				job->data.blit.out_height,
+				job->data.blit.out_pitch,
+				job->data.blit.out_format,
+				job->data.blit.dst_x, job->data.blit.dst_y,
+				job->data.blit.dst_w, job->data.blit.dst_h,
+				job->data.blit.bld_mode,
+				job->data.blit.src_alpha_mode,
+				job->data.blit.src_alpha,
+				job->data.blit.src_premul,
+				job->data.blit.src_color_space,
+				job->data.blit.dst_color_space,
+				job->data.blit.out_color_space,
+				job->data.blit.color_key_enable,
+				/* key on source layer (UI2 unless swap_layers flips it to V0) */
+				true,
+				job->data.blit.color_key_min,
+				job->data.blit.color_key_max, &job->csc_state);
+			if (ret)
+				goto cleanup;
+			job->rcq_ready = true;
+
+			/* Enqueue job to worker */
+			{
+				unsigned long flags;
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				list_add_tail(&job->node, &g2d->job_queue);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+			}
+
+			queue_work(g2d->job_wq, &g2d->job_work);
+
+			fd_install(fence_fd, sync_file->file);
+			fd_installed = true;
+
+			if (put_user(fence_fd,
+				     &((struct g2d_cmd __user *)arg)
+					      ->fence_fd_out)) {
+				dev_err(g2d->dev,
+					"Failed to copy fence_fd_out to userspace\n");
+				return -EFAULT;
+			}
+
+			dev_dbg(g2d->dev,
+				"G2D_CMD_BLEND: enqueued job, fence_fd=%d\n",
+				fence_fd);
+
+			return 0;
+		} else {
+			/* Tile repeat: split into multiple jobs */
+			LIST_HEAD(job_list);
+			struct dma_fence *last_fence = NULL;
+			struct sync_file *last_sync_file = NULL;
+			struct sunxi_g2d_job *last_job = NULL;
+			u32 rows = DIV_ROUND_UP(area_h + phase_y, tile_h);
+			u32 cols = DIV_ROUND_UP(area_w + phase_x, tile_w);
+			u32 total_tiles = rows * cols;
+			u32 tile_idx = 0;
+
+			if (!total_tiles) {
+				ret = -EINVAL;
+				goto cleanup;
+			}
+
+			u32 rem_h = area_h;
+			u32 dst_row_y = cmd.dst_y;
+			u32 out_row_y = cmd.dst_y;
+			u32 y_phase = phase_y;
+
+			while (rem_h) {
+				u32 th = min(tile_h - y_phase, rem_h);
+				u32 rem_w = area_w;
+				u32 dst_col_x = cmd.dst_x;
+				u32 out_col_x = cmd.dst_x;
+				u32 x_phase = phase_x;
+
+				while (rem_w) {
+					u32 tw = min(tile_w - x_phase, rem_w);
+					bool is_last =
+						(++tile_idx == total_tiles);
+					struct sunxi_g2d_job *tjob;
+					struct dma_fence *f;
+
+					tjob = g2d_job_alloc(g2d);
+					if (!tjob) {
+						ret = -ENOMEM;
+						goto cleanup_tiles;
+					}
+
+					f = sunxi_g2d_fence_create(g2d);
+					if (!f) {
+						g2d_job_free(g2d, tjob);
+						ret = -ENOMEM;
+						goto cleanup_tiles;
+					}
+
+					INIT_WORK(&tjob->cleanup_work,
+						  sunxi_g2d_job_cleanup_workfn);
+					tjob->g2d = g2d;
+					tjob->csc_state =
+						ctx->csc_changed ?
+							ctx->csc_state :
+							g2d->csc_state;
+					tjob->fence = f;
+					tjob->fence_fd = -1;
+					tjob->sync_file = NULL;
+					tjob->type = G2D_JOB_CMD_BLEND;
+					tjob->src_dmabuf = src_dmabuf;
+					tjob->dst_dmabuf = dst_dmabuf;
+					tjob->out_dmabuf = out_dmabuf;
+					tjob->src_attach = src_attach;
+					tjob->dst_attach = dst_attach;
+					tjob->out_attach = out_attach;
+					tjob->src_sgt = src_sgt;
+					tjob->dst_sgt = dst_sgt;
+					tjob->out_sgt = out_sgt;
+					tjob->src_dma = src_dma_addr;
+					tjob->dst_dma = dst_dma_addr;
+					tjob->out_dma = out_dma_addr;
+					tjob->persistent_refs = !is_last;
+
+					tjob->data.blit.src_width =
+						cmd.src.width;
+					tjob->data.blit.src_height =
+						cmd.src.height;
+					tjob->data.blit.src_pitch =
+						src_stride[0];
+					tjob->data.blit.src_format =
+						cmd.src.format;
+					tjob->data.blit.src_crop_x = x_phase;
+					tjob->data.blit.src_crop_y = y_phase;
+					tjob->data.blit.src_crop_w = tw;
+					tjob->data.blit.src_crop_h = th;
+					tjob->data.blit.src_alpha = cmd.src.alpha;
+					tjob->data.blit.src_alpha_mode =
+						cmd.src.alpha_mode;
+					tjob->data.blit.src_premul =
+						cmd.src.premul_mode;
+					tjob->data.blit.src_color_space =
+						cmd.src.color_space;
+
+					tjob->data.blit.dst_width =
+						cmd.dst.width;
+					tjob->data.blit.dst_height =
+						cmd.dst.height;
+					tjob->data.blit.dst_pitch =
+						dst_stride[0];
+					tjob->data.blit.dst_format =
+						cmd.dst.format;
+					tjob->data.blit.dst_x = dst_col_x;
+					tjob->data.blit.dst_y = dst_row_y;
+					tjob->data.blit.dst_w = tw;
+					tjob->data.blit.dst_h = th;
+					tjob->data.blit.dst_alpha =
+						cmd.dst.alpha;
+					tjob->data.blit.dst_alpha_mode =
+						cmd.dst.alpha_mode;
+					tjob->data.blit.dst_premul =
+						cmd.dst.premul_mode;
+					tjob->data.blit.dst_color_space =
+						cmd.dst.color_space;
+
+					tjob->data.blit.out_width =
+						cmd.out.width;
+					tjob->data.blit.out_height =
+						cmd.out.height;
+					tjob->data.blit.out_pitch =
+						out_stride[0];
+					tjob->data.blit.out_format =
+						cmd.out.format;
+					tjob->data.blit.out_color_space =
+						cmd.out.color_space;
+
+					tjob->data.blit.color_key_enable =
+						cmd.params.blend.color_key_enable;
+					tjob->data.blit.color_key_mode =
+						cmd.params.blend.color_key_mode;
+					tjob->data.blit.color_key_min =
+						cmd.params.blend.color_key_min;
+					tjob->data.blit.color_key_max =
+						cmd.params.blend.color_key_max;
+
+					tjob->data.blit.bld_mode =
+						cmd.params.blend.bld_mode;
+					tjob->data.blit.flags = cmd.flags;
+
+					ret = g2d_job_prepare_rcq(g2d, tjob);
+					if (ret) {
+						g2d_job_free(g2d, tjob);
+						goto cleanup_tiles;
+					}
+
+					ret = sunxi_g2d_do_blend_rcq(
+						g2d, &tjob->rcq,
+						tjob->src_dma,
+						tjob->data.blit.src_width,
+						tjob->data.blit.src_height,
+						tjob->data.blit.src_pitch,
+						tjob->data.blit.src_format,
+						tjob->data.blit.src_crop_x,
+						tjob->data.blit.src_crop_y,
+						tjob->data.blit.src_crop_w,
+						tjob->data.blit.src_crop_h,
+						tjob->dst_dma,
+						tjob->data.blit.dst_width,
+						tjob->data.blit.dst_height,
+						tjob->data.blit.dst_pitch,
+						tjob->data.blit.dst_format,
+						tjob->data.blit.dst_x,
+						tjob->data.blit.dst_y,
+						tjob->out_dma,
+						tjob->data.blit.out_width,
+						tjob->data.blit.out_height,
+						tjob->data.blit.out_pitch,
+						tjob->data.blit.out_format,
+						out_col_x, out_row_y, tw, th,
+						tjob->data.blit.bld_mode,
+						tjob->data.blit.src_alpha_mode,
+						tjob->data.blit.src_alpha,
+						tjob->data.blit.src_premul,
+						tjob->data.blit.src_color_space,
+						tjob->data.blit.dst_color_space,
+						tjob->data.blit.out_color_space,
+						tjob->data.blit.color_key_enable,
+						/* key on source layer (UI2 unless swap_layers flips to V0) */
+						true,
+						tjob->data.blit.color_key_min,
+						tjob->data.blit.color_key_max,
+						&tjob->csc_state);
+					if (ret) {
+						sunxi_g2d_rcq_free(g2d->dev,
+								   &tjob->rcq);
+						g2d_job_free(g2d, tjob);
+						goto cleanup_tiles;
+					}
+					tjob->rcq_ready = true;
+
+					if (is_last) {
+						last_fence = f;
+						last_sync_file =
+							sync_file_create(f);
+						last_job = tjob;
+						if (!last_sync_file) {
+							ret = -ENOMEM;
+							goto cleanup_tiles;
+						}
+						fence_fd = get_unused_fd_flags(
+							O_CLOEXEC);
+						if (fence_fd < 0) {
+							ret = fence_fd;
+							goto cleanup_tiles;
+						}
+						tjob->fence_fd = fence_fd;
+						tjob->sync_file = last_sync_file;
+					}
+
+					list_add_tail(&tjob->node, &job_list);
+
+					dst_col_x += tw;
+					out_col_x += tw;
+					rem_w -= tw;
+					x_phase = 0;
+				}
+
+				dst_row_y += th;
+				out_row_y += th;
+				rem_h -= th;
+				y_phase = 0;
+			}
+
+			if (last_sync_file && last_sync_file->file) {
+				fd_install(fence_fd, last_sync_file->file);
+				fd_installed = true;
+				if (last_job)
+					last_job->sync_file = NULL;
+			} else {
+				ret = -EINVAL;
+				goto cleanup_tiles;
+			}
+
+			/* Enqueue all tile jobs */
+			{
+				unsigned long flags;
+				struct sunxi_g2d_job *j, *tmp;
+
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				list_for_each_entry_safe(j, tmp, &job_list,
+							 node)
+					list_move_tail(&j->node,
+						       &g2d->job_queue);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+			}
+
+			queue_work(g2d->job_wq, &g2d->job_work);
+
+			if (put_user(fence_fd,
+				     &((struct g2d_cmd __user *)arg)
+					      ->fence_fd_out)) {
+				dev_err(g2d->dev,
+					"Failed to copy fence_fd_out to userspace\n");
+				return -EFAULT;
+			}
+
+			dev_dbg(g2d->dev,
+				"G2D_CMD_BLEND: enqueued %u tiles, fence_fd=%d tile_repeat=1 phase_x=%u phase_y=%u\n",
+				total_tiles, fence_fd, phase_x, phase_y);
+
+			return 0;
+
+cleanup_tiles:
+			{
+				struct sunxi_g2d_job *j, *tmp;
+				list_for_each_entry_safe(j, tmp, &job_list,
+							 node) {
+					if (j->rcq.vir_addr)
+						sunxi_g2d_rcq_free(g2d->dev,
+								   &j->rcq);
+					if (j->sync_file && j->sync_file->file)
+						fput(j->sync_file->file);
+					if (j->fence)
+						dma_fence_put(j->fence);
+					g2d_job_free(g2d, j);
+				}
+			}
+			if (!fd_installed && fence_fd >= 0)
+				put_unused_fd(fence_fd);
+			if (!fd_installed && last_sync_file &&
+			    last_sync_file->file)
+				fput(last_sync_file->file);
+			if (!fd_installed && last_fence)
+				dma_fence_put(last_fence);
+			/* fall through to common cleanup */
+		}
 	}
-
-	ret = sunxi_g2d_do_blend_rcq(
-		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
-		job->data.blit.src_height, job->data.blit.src_pitch,
-		job->data.blit.src_format, job->data.blit.src_crop_x,
-		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
-		job->data.blit.dst_height, job->data.blit.dst_pitch,
-		job->data.blit.dst_format, job->data.blit.dst_x,
-		job->data.blit.dst_y, job->out_dma, job->data.blit.out_width,
-		job->data.blit.out_height, job->data.blit.out_pitch,
-		job->data.blit.out_format, job->data.blit.dst_x,
-		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
-		job->data.blit.bld_mode, job->data.blit.src_alpha_mode,
-		job->data.blit.src_alpha, job->data.blit.src_premul,
-		job->data.blit.src_color_space, job->data.blit.dst_color_space,
-		job->data.blit.out_color_space, &job->csc_state);
-	if (ret)
-		goto cleanup;
-	job->rcq_ready = true;
-
-	/* Enqueue job to worker */
-	{
-		unsigned long flags;
-		spin_lock_irqsave(&g2d->job_lock, flags);
-		list_add_tail(&job->node, &g2d->job_queue);
-		spin_unlock_irqrestore(&g2d->job_lock, flags);
-	}
-
-	queue_work(g2d->job_wq, &g2d->job_work);
-
-	/* Install fence fd */
-	fd_install(fence_fd, sync_file->file);
-	fd_installed = true;
-
-	/* Return fence fd to userspace */
-	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
-		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
-		/* Job already enqueued, can't cleanly abort */
-		return -EFAULT;
-	}
-
-	dev_dbg(g2d->dev, "G2D_CMD_BLEND: enqueued job, fence_fd=%d\n",
-		fence_fd);
-
-	return 0;
 
 cleanup:
 	if (!IS_ERR_OR_NULL(job)) {
@@ -5153,6 +5534,10 @@ static long sunxi_g2d_cmd_fillrect(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	dma_addr_t dst_dma_addr;
 	u32 dst_bpp;
 	int ret;
+	struct dma_fence *fence = NULL;
+	struct sync_file *sync_file = NULL;
+	int out_fd = -1;
+	struct sunxi_g2d_job *job = NULL;
 
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
@@ -5184,133 +5569,129 @@ static long sunxi_g2d_cmd_fillrect(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	if (ret)
 		goto err_unmap_dst;
 
-	/* Enqueue as an async job and return a fence fd immediately. This matches
-	 * the legacy behavior of G2D_IOC_FILLRECT: create a job, install a
-	 * sync_file FD into the caller, enqueue the job and return the FD in the
-	 * userspace structure so callers can poll/wait on it. */
+	/* If userspace provided an input fence fd, wait on it first */
+	if (cmd.fence_fd_in >= 0) {
+		struct dma_fence *in_fence =
+			sync_file_get_fence(cmd.fence_fd_in);
+
+		if (!in_fence) {
+			ret = -EINVAL;
+			goto err_unmap_dst;
+		}
+		dma_fence_wait(in_fence, false);
+		dma_fence_put(in_fence);
+	}
+
+	/* Allocate job from the shared pool (keeps slab usage consistent) */
+	job = g2d_job_alloc(g2d);
+	if (!job) {
+		ret = -ENOMEM;
+		goto err_unmap_dst;
+	}
+
+	/* Create DMA fence and sync_file (fd not installed until copy_to_user succeeds) */
+	fence = sunxi_g2d_fence_create(g2d);
+	if (!fence) {
+		ret = -ENOMEM;
+		goto err_free_job;
+	}
+
+	out_fd = get_unused_fd_flags(O_CLOEXEC);
+	if (out_fd < 0) {
+		ret = out_fd;
+		goto err_put_fence;
+	}
+
+	sync_file = sync_file_create(fence);
+	if (!sync_file) {
+		ret = -ENOMEM;
+		goto err_put_fd;
+	}
+
+	/* Fill job with operation parameters */
+	job->g2d = g2d;
+	job->csc_state =
+		ctx->csc_changed ? ctx->csc_state : g2d->csc_state;
+	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
+	job->type = G2D_JOB_FILLRECT;
+	job->dst_dma = dst_dma_addr;
+	job->data.fillrect.width = cmd.dst_w;
+	job->data.fillrect.height = cmd.dst_h;
+	job->data.fillrect.pitch = cmd.dst.stride[0] ?
+					   cmd.dst.stride[0] :
+					   (cmd.dst.width * dst_bpp);
+	job->data.fillrect.dst_x = cmd.dst_x;
+	job->data.fillrect.dst_y = cmd.dst_y;
+	job->data.fillrect.color = cmd.params.fillrect.color;
+	job->data.fillrect.global_alpha =
+		cmd.params.fillrect.global_alpha ?
+			cmd.params.fillrect.global_alpha :
+			0xFF;
+	job->data.fillrect.color_format = cmd.dst.format;
+	job->data.fillrect.dst_format = cmd.dst.format;
+	job->fence = fence;
+	job->fence_fd = out_fd;
+	job->sync_file = sync_file;
+
+	ret = g2d_job_prepare_rcq(g2d, job);
+	if (ret)
+		goto err_put_fd;
+
+	ret = sunxi_g2d_do_fillrect_rcq(
+		g2d, &job->rcq, job->dst_dma, job->data.fillrect.width,
+		job->data.fillrect.height, job->data.fillrect.pitch,
+		job->data.fillrect.color, job->data.fillrect.color_format,
+		job->data.fillrect.dst_format, job->data.fillrect.dst_x,
+		job->data.fillrect.dst_y, job->data.fillrect.global_alpha);
+	if (ret)
+		goto err_free_rcq;
+	job->rcq_ready = true;
+
+	/* Store DMA-BUF references for cleanup */
+	job->dst_dmabuf = dst_dmabuf;
+	job->dst_attach = dst_attach;
+	job->dst_sgt = dst_sgt;
+
+	/* Copy fence fd back to userspace before enqueueing */
+	cmd.fence_fd_out = out_fd;
+	if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd))) {
+		ret = -EFAULT;
+		goto err_free_rcq;
+	}
+
+	/* Install FD now that userspace has the number */
+	fd_install(out_fd, sync_file->file);
+	job->sync_file = NULL; /* fd table owns the reference */
+	sync_file = NULL;
+
+	/* Enqueue job (under spinlock) */
 	{
-		struct sunxi_g2d_job *job;
-		int out_fd = -1;
 		unsigned long flags;
 
-		/* If userspace provided an input fence fd, wait on it first */
-		if (cmd.fence_fd_in >= 0) {
-			struct dma_fence *in_fence = sync_file_get_fence(cmd.fence_fd_in);
-			if (!in_fence) {
-				ret = -EINVAL;
-				goto err_unmap_dst;
-			}
-			dma_fence_wait(in_fence, false);
-			dma_fence_put(in_fence);
-		}
-
-		/* Allocate job structure */
-		job = kzalloc(sizeof(*job), GFP_KERNEL);
-		if (!job) {
-			ret = -ENOMEM;
-			goto err_unmap_dst;
-		}
-
-		/* Create DMA fence for this job */
-		job->fence = sunxi_g2d_fence_create(g2d);
-		if (!job->fence) {
-			kfree(job);
-			ret = -ENOMEM;
-			goto err_unmap_dst;
-		}
-
-		/* Reserve file descriptor for userspace */
-		out_fd = get_unused_fd_flags(O_CLOEXEC);
-		if (out_fd < 0) {
-			dma_fence_put(job->fence);
-			kfree(job);
-			ret = out_fd;
-			goto err_unmap_dst;
-		}
-
-		/* Create sync_file wrapping the fence */
-		job->fence_fd = out_fd;
-		job->sync_file = sync_file_create(job->fence);
-		if (!job->sync_file) {
-			put_unused_fd(out_fd);
-			dma_fence_put(job->fence);
-			kfree(job);
-			ret = -ENOMEM;
-			goto err_unmap_dst;
-		}
-
-		/* Install FD in process context (must do before queueing) */
-		if (job->sync_file && job->sync_file->file) {
-			fd_install(out_fd, job->sync_file->file);
-			job->sync_file = NULL; /* fd table owns the ref now */
-		} else {
-			put_unused_fd(out_fd);
-			dma_fence_put(job->fence);
-			kfree(job);
-			ret = -ENOMEM;
-			goto err_unmap_dst;
-		}
-
-		/* Fill job with operation parameters */
-		job->g2d = g2d;
-		job->csc_state = ctx->csc_changed ? ctx->csc_state : g2d->csc_state;
-		INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-		job->type = G2D_JOB_FILLRECT;
-		job->dst_dma = dst_dma_addr;
-		job->data.fillrect.width = cmd.dst_w;
-		job->data.fillrect.height = cmd.dst_h;
-		job->data.fillrect.pitch = cmd.dst.stride[0] ? cmd.dst.stride[0] : (cmd.dst.width * dst_bpp);
-		job->data.fillrect.color = cmd.params.fillrect.color;
-		job->data.fillrect.color_format = cmd.dst.format;
-		job->data.fillrect.dst_format = cmd.dst.format;
-
-		ret = g2d_job_prepare_rcq(g2d, job);
-		if (ret) {
-			dma_fence_put(job->fence);
-			kfree(job);
-			goto err_unmap_dst;
-		}
-
-		ret = sunxi_g2d_do_fillrect_rcq(
-			g2d, &job->rcq, job->dst_dma, job->data.fillrect.width,
-			job->data.fillrect.height, job->data.fillrect.pitch,
-			job->data.fillrect.color,
-			job->data.fillrect.color_format,
-			job->data.fillrect.dst_format);
-		if (ret) {
-			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
-			dma_fence_put(job->fence);
-			kfree(job);
-			goto err_unmap_dst;
-		}
-		job->rcq_ready = true;
-
-		/* Store DMA-BUF references for cleanup */
-		job->dst_dmabuf = dst_dmabuf;
-		job->dst_attach = dst_attach;
-		job->dst_sgt = dst_sgt;
-
-		/* Enqueue job (under spinlock) */
 		spin_lock_irqsave(&g2d->job_lock, flags);
 		list_add_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
-
-		/* Schedule worker to process the job */
-		queue_work(g2d->job_wq, &g2d->job_work);
-
-		/* Return fence_fd to userspace */
-		cmd.fence_fd_out = job->fence_fd;
-		ret = 0;
-		if (copy_to_user((void __user *)arg, &cmd, sizeof(cmd))) {
-			ret = -EFAULT;
-			/* On copy_to_user failure, abort the job and cleanup */
-			/* Note: cleanup work will free resources when executed */
-			goto err_unmap_dst;
-		}
-
-		/* Successfully enqueued and returned fence fd */
-		return 0;
 	}
+
+	/* Schedule worker to process the job */
+	queue_work(g2d->job_wq, &g2d->job_work);
+
+	/* Successfully enqueued and returned fence fd */
+	return 0;
+
+err_free_rcq:
+	if (job->rcq.vir_addr)
+		sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+err_put_fd:
+	if (out_fd >= 0)
+		put_unused_fd(out_fd);
+	if (sync_file && sync_file->file)
+		fput(sync_file->file);
+err_put_fence:
+	if (fence)
+		dma_fence_put(fence);
+err_free_job:
+	g2d_job_free(g2d, job);
 
 err_unmap_dst:
 	dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_TO_DEVICE);
@@ -5454,60 +5835,6 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		out_dma_addr = dst_dma_addr;
 	}
 
-	/* Create fence for async operation */
-	fence = sunxi_g2d_fence_create(g2d);
-	if (!fence) {
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	/* Create sync_file for userspace */
-	sync_file = sync_file_create(fence);
-	if (!sync_file) {
-		dma_fence_put(fence);
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	fence_fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fence_fd < 0) {
-		fput(sync_file->file);
-		ret = fence_fd;
-		goto cleanup;
-	}
-
-	/* Create/obtain async job (from pool if available) */
-	job = g2d_job_alloc(g2d);
-	if (IS_ERR(job)) {
-		put_unused_fd(fence_fd);
-		fput(sync_file->file);
-		ret = PTR_ERR(job);
-		goto cleanup;
-	}
-
-	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-	job->g2d = g2d;
-	job->csc_state = ctx->csc_changed ? ctx->csc_state : g2d->csc_state;
-	job->fence = fence;
-	job->src_dmabuf = src_dmabuf;
-	job->dst_dmabuf = dst_dmabuf;
-	job->src_attach = src_attach;
-	job->dst_attach = dst_attach;
-	job->src_sgt = src_sgt;
-	job->dst_sgt = dst_sgt;
-
-	if (has_out_buffer) {
-		job->out_dmabuf = out_dmabuf;
-		job->out_attach = out_attach;
-		job->out_sgt = out_sgt;
-	}
-
-	/* Setup job parameters */
-	job->type = G2D_JOB_CMD_MASK;
-	job->src_dma = src_dma_addr;
-	job->dst_dma = dst_dma_addr;
-	job->out_dma = out_dma_addr;
-
 	/* Calculate proper strides for YUV formats (dst/out only; src precomputed) */
 	u32 dst_stride[3], dst_plane_offset[3];
 	u32 out_stride[3], out_plane_offset[3];
@@ -5518,108 +5845,501 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		sunxi_g2d_get_yuv_plane_info(cmd.out.format, cmd.out.width,
 					     cmd.out.height, cmd.out.stride,
 					     out_stride, out_plane_offset);
-	}
-
-	/* Fill blit data structure */
-	job->data.blit.src_width = cmd.src.width;
-	job->data.blit.src_height = cmd.src.height;
-	job->data.blit.src_pitch = src_stride[0];
-	job->data.blit.src_format = cmd.src.format;
-	job->data.blit.src_crop_x = cmd.src.crop_x;
-	job->data.blit.src_crop_y = cmd.src.crop_y;
-	job->data.blit.src_crop_w = cmd.src.crop_w;
-	job->data.blit.src_crop_h = cmd.src.crop_h;
-	job->data.blit.src_alpha = cmd.src.alpha;
-	job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
-	job->data.blit.src_premul = cmd.src.premul_mode;
-	job->data.blit.src_color_space = cmd.src.color_space;
-
-	job->data.blit.dst_width = cmd.dst.width;
-	job->data.blit.dst_height = cmd.dst.height;
-	job->data.blit.dst_pitch = dst_stride[0];
-	job->data.blit.dst_format = cmd.dst.format;
-	job->data.blit.dst_x = cmd.dst_x;
-	job->data.blit.dst_y = cmd.dst_y;
-	job->data.blit.dst_w = cmd.dst_w;
-	job->data.blit.dst_h = cmd.dst_h;
-	job->data.blit.dst_alpha = cmd.dst.alpha;
-	job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
-	job->data.blit.dst_premul = cmd.dst.premul_mode;
-	job->data.blit.dst_color_space = cmd.dst.color_space;
-
-	if (has_out_buffer) {
-		job->data.blit.out_width = cmd.out.width;
-		job->data.blit.out_height = cmd.out.height;
-		job->data.blit.out_pitch = out_stride[0];
-		job->data.blit.out_format = cmd.out.format;
-		job->data.blit.out_color_space = cmd.out.color_space;
 	} else {
-		/* In-place: out parameters = dst parameters */
-		job->data.blit.out_width = cmd.dst.width;
-		job->data.blit.out_height = cmd.dst.height;
-		job->data.blit.out_pitch = dst_stride[0];
-		job->data.blit.out_format = cmd.dst.format;
-		job->data.blit.out_color_space = cmd.dst.color_space;
+		/* mirror dst */
+		out_stride[0] = dst_stride[0];
 	}
 
-	/* Color keying parameters */
-	job->data.blit.color_key_enable = 1;
-	job->data.blit.color_key_mode = cmd.params.mask.color_key_mode;
-	job->data.blit.color_key_min = cmd.params.mask.color_key_min;
-	job->data.blit.color_key_max = cmd.params.mask.color_key_max;
-
-	/* Use SRCOVER blend mode for masking */
-	job->data.blit.bld_mode = G2D_BLD_SRCOVER;
-
-	ret = g2d_job_prepare_rcq(g2d, job);
-	if (ret)
-		goto cleanup;
-
-	ret = sunxi_g2d_do_blend_rcq(
-		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
-		job->data.blit.src_height, job->data.blit.src_pitch,
-		job->data.blit.src_format, job->data.blit.src_crop_x,
-		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
-		job->data.blit.dst_height, job->data.blit.dst_pitch,
-		job->data.blit.dst_format, job->data.blit.dst_x,
-		job->data.blit.dst_y, job->out_dma, job->data.blit.out_width,
-		job->data.blit.out_height, job->data.blit.out_pitch,
-		job->data.blit.out_format, job->data.blit.dst_x,
-		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
-		job->data.blit.bld_mode, job->data.blit.src_alpha_mode,
-		job->data.blit.src_alpha, job->data.blit.src_premul,
-		job->data.blit.src_color_space, job->data.blit.dst_color_space,
-		job->data.blit.out_color_space, &job->csc_state);
-	if (ret)
-		goto cleanup;
-	job->rcq_ready = true;
-
-	/* Enqueue job to worker */
+	/* Tile repeat support */
 	{
-		unsigned long flags;
-		spin_lock_irqsave(&g2d->job_lock, flags);
-		list_add_tail(&job->node, &g2d->job_queue);
-		spin_unlock_irqrestore(&g2d->job_lock, flags);
+		bool tile_repeat = (cmd.flags & G2D_FLAG_TILE_REPEAT);
+		u32 tile_w = cmd.src.crop_w ? cmd.src.crop_w : cmd.src.width;
+		u32 tile_h = cmd.src.crop_h ? cmd.src.crop_h : cmd.src.height;
+		u32 phase_x = tile_repeat ? cmd.src.crop_x % tile_w :
+					    cmd.src.crop_x;
+		u32 phase_y = tile_repeat ? cmd.src.crop_y % tile_h :
+					    cmd.src.crop_y;
+		u32 area_w = cmd.dst_w;
+		u32 area_h = cmd.dst_h;
+
+		if (!area_w || !area_h)
+			return -EINVAL;
+
+		if (!tile_repeat) {
+			/* Original single-job path */
+			fence = sunxi_g2d_fence_create(g2d);
+			if (!fence) {
+				ret = -ENOMEM;
+				goto cleanup;
+			}
+
+			sync_file = sync_file_create(fence);
+			if (!sync_file) {
+				dma_fence_put(fence);
+				ret = -ENOMEM;
+				goto cleanup;
+			}
+
+			fence_fd = get_unused_fd_flags(O_CLOEXEC);
+			if (fence_fd < 0) {
+				fput(sync_file->file);
+				ret = fence_fd;
+				goto cleanup;
+			}
+
+			job = g2d_job_alloc(g2d);
+			if (IS_ERR(job)) {
+				put_unused_fd(fence_fd);
+				fput(sync_file->file);
+				ret = PTR_ERR(job);
+				goto cleanup;
+			}
+
+			INIT_WORK(&job->cleanup_work,
+				  sunxi_g2d_job_cleanup_workfn);
+			job->g2d = g2d;
+			job->csc_state = ctx->csc_changed ?
+						 ctx->csc_state :
+						 g2d->csc_state;
+			job->fence = fence;
+			job->src_dmabuf = src_dmabuf;
+			job->dst_dmabuf = dst_dmabuf;
+			job->src_attach = src_attach;
+			job->dst_attach = dst_attach;
+			job->src_sgt = src_sgt;
+			job->dst_sgt = dst_sgt;
+
+			if (has_out_buffer) {
+				job->out_dmabuf = out_dmabuf;
+				job->out_attach = out_attach;
+				job->out_sgt = out_sgt;
+			}
+
+			job->type = G2D_JOB_CMD_MASK;
+			job->src_dma = src_dma_addr;
+			job->dst_dma = dst_dma_addr;
+			job->out_dma = out_dma_addr;
+
+			job->data.blit.src_width = cmd.src.width;
+			job->data.blit.src_height = cmd.src.height;
+			job->data.blit.src_pitch = src_stride[0];
+			job->data.blit.src_format = cmd.src.format;
+			job->data.blit.src_crop_x = cmd.src.crop_x;
+			job->data.blit.src_crop_y = cmd.src.crop_y;
+			job->data.blit.src_crop_w = cmd.src.crop_w;
+			job->data.blit.src_crop_h = cmd.src.crop_h;
+			job->data.blit.src_alpha = cmd.src.alpha;
+			job->data.blit.src_alpha_mode = cmd.src.alpha_mode;
+			job->data.blit.src_premul = cmd.src.premul_mode;
+			job->data.blit.src_color_space = cmd.src.color_space;
+
+			job->data.blit.dst_width = cmd.dst.width;
+			job->data.blit.dst_height = cmd.dst.height;
+			job->data.blit.dst_pitch = dst_stride[0];
+			job->data.blit.dst_format = cmd.dst.format;
+			job->data.blit.dst_x = cmd.dst_x;
+			job->data.blit.dst_y = cmd.dst_y;
+			job->data.blit.dst_w = cmd.dst_w;
+			job->data.blit.dst_h = cmd.dst_h;
+			job->data.blit.dst_alpha = cmd.dst.alpha;
+			job->data.blit.dst_alpha_mode = cmd.dst.alpha_mode;
+			job->data.blit.dst_premul = cmd.dst.premul_mode;
+			job->data.blit.dst_color_space = cmd.dst.color_space;
+
+			if (has_out_buffer) {
+				job->data.blit.out_width = cmd.out.width;
+				job->data.blit.out_height = cmd.out.height;
+				job->data.blit.out_pitch = out_stride[0];
+				job->data.blit.out_format = cmd.out.format;
+				job->data.blit.out_color_space =
+					cmd.out.color_space;
+			} else {
+				job->data.blit.out_width = cmd.dst.width;
+				job->data.blit.out_height = cmd.dst.height;
+				job->data.blit.out_pitch = dst_stride[0];
+				job->data.blit.out_format = cmd.dst.format;
+				job->data.blit.out_color_space =
+					cmd.dst.color_space;
+			}
+
+			job->data.blit.color_key_enable = 1;
+			job->data.blit.color_key_mode =
+				cmd.params.mask.color_key_mode;
+			job->data.blit.color_key_min =
+				cmd.params.mask.color_key_min;
+			job->data.blit.color_key_max =
+				cmd.params.mask.color_key_max;
+
+			job->data.blit.bld_mode = G2D_BLD_SRCOVER;
+			job->data.blit.flags = cmd.flags;
+
+			ret = g2d_job_prepare_rcq(g2d, job);
+			if (ret)
+				goto cleanup;
+
+			ret = sunxi_g2d_do_blend_rcq(
+				g2d, &job->rcq, job->src_dma,
+				job->data.blit.src_width,
+				job->data.blit.src_height,
+				job->data.blit.src_pitch,
+				job->data.blit.src_format,
+				job->data.blit.src_crop_x,
+				job->data.blit.src_crop_y,
+				job->data.blit.src_crop_w,
+				job->data.blit.src_crop_h, job->dst_dma,
+				job->data.blit.dst_width,
+				job->data.blit.dst_height,
+				job->data.blit.dst_pitch,
+				job->data.blit.dst_format,
+				job->data.blit.dst_x, job->data.blit.dst_y,
+				job->out_dma, job->data.blit.out_width,
+				job->data.blit.out_height,
+				job->data.blit.out_pitch,
+				job->data.blit.out_format,
+				job->data.blit.dst_x, job->data.blit.dst_y,
+				job->data.blit.dst_w, job->data.blit.dst_h,
+				job->data.blit.bld_mode,
+				job->data.blit.src_alpha_mode,
+				job->data.blit.src_alpha,
+				job->data.blit.src_premul,
+				job->data.blit.src_color_space,
+				job->data.blit.dst_color_space,
+				job->data.blit.out_color_space,
+				job->data.blit.color_key_enable,
+				/* mask keys source layer */
+				true,
+				job->data.blit.color_key_min,
+				job->data.blit.color_key_max, &job->csc_state);
+			if (ret)
+				goto cleanup;
+			job->rcq_ready = true;
+
+			{
+				unsigned long flags;
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				list_add_tail(&job->node, &g2d->job_queue);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+			}
+
+			queue_work(g2d->job_wq, &g2d->job_work);
+
+			fd_install(fence_fd, sync_file->file);
+			fd_installed = true;
+
+			if (put_user(fence_fd,
+				     &((struct g2d_cmd __user *)arg)
+					      ->fence_fd_out)) {
+				dev_err(g2d->dev,
+					"Failed to copy fence_fd_out to userspace\n");
+				return -EFAULT;
+			}
+
+			dev_dbg(g2d->dev,
+				"G2D_CMD_MASK: enqueued job, fence_fd=%d\n",
+				fence_fd);
+
+			return 0;
+		} else {
+			/* Tiled mask */
+			LIST_HEAD(job_list);
+			struct dma_fence *last_fence = NULL;
+			struct sync_file *last_sync_file = NULL;
+			struct sunxi_g2d_job *last_job = NULL;
+			u32 rows = DIV_ROUND_UP(area_h + phase_y, tile_h);
+			u32 cols = DIV_ROUND_UP(area_w + phase_x, tile_w);
+			u32 total_tiles = rows * cols;
+			u32 tile_idx = 0;
+
+			if (!total_tiles) {
+				ret = -EINVAL;
+				goto cleanup;
+			}
+
+			u32 rem_h = area_h;
+			u32 dst_row_y = cmd.dst_y;
+			u32 out_row_y = cmd.dst_y;
+			u32 y_phase = phase_y;
+
+			while (rem_h) {
+				u32 th = min(tile_h - y_phase, rem_h);
+				u32 rem_w = area_w;
+				u32 dst_col_x = cmd.dst_x;
+				u32 out_col_x = cmd.dst_x;
+				u32 x_phase = phase_x;
+
+				while (rem_w) {
+					u32 tw = min(tile_w - x_phase, rem_w);
+					bool is_last =
+						(++tile_idx == total_tiles);
+					struct sunxi_g2d_job *tjob;
+					struct dma_fence *f;
+
+					tjob = g2d_job_alloc(g2d);
+					if (!tjob) {
+						ret = -ENOMEM;
+						goto cleanup_tiles;
+					}
+
+					f = sunxi_g2d_fence_create(g2d);
+					if (!f) {
+						g2d_job_free(g2d, tjob);
+						ret = -ENOMEM;
+						goto cleanup_tiles;
+					}
+
+					INIT_WORK(&tjob->cleanup_work,
+						  sunxi_g2d_job_cleanup_workfn);
+					tjob->g2d = g2d;
+					tjob->csc_state =
+						ctx->csc_changed ?
+							ctx->csc_state :
+							g2d->csc_state;
+					tjob->fence = f;
+					tjob->fence_fd = -1;
+					tjob->sync_file = NULL;
+					tjob->type = G2D_JOB_CMD_MASK;
+					tjob->src_dmabuf = src_dmabuf;
+					tjob->dst_dmabuf = dst_dmabuf;
+					tjob->src_attach = src_attach;
+					tjob->dst_attach = dst_attach;
+					tjob->src_sgt = src_sgt;
+					tjob->dst_sgt = dst_sgt;
+					tjob->src_dma = src_dma_addr;
+					tjob->dst_dma = dst_dma_addr;
+					tjob->out_dma = out_dma_addr;
+					tjob->persistent_refs = !is_last;
+
+					if (has_out_buffer) {
+						tjob->out_dmabuf = out_dmabuf;
+						tjob->out_attach = out_attach;
+						tjob->out_sgt = out_sgt;
+					}
+
+					tjob->data.blit.src_width =
+						cmd.src.width;
+					tjob->data.blit.src_height =
+						cmd.src.height;
+					tjob->data.blit.src_pitch =
+						src_stride[0];
+					tjob->data.blit.src_format =
+						cmd.src.format;
+					tjob->data.blit.src_crop_x = x_phase;
+					tjob->data.blit.src_crop_y = y_phase;
+					tjob->data.blit.src_crop_w = tw;
+					tjob->data.blit.src_crop_h = th;
+					tjob->data.blit.src_alpha =
+						cmd.src.alpha;
+					tjob->data.blit.src_alpha_mode =
+						cmd.src.alpha_mode;
+					tjob->data.blit.src_premul =
+						cmd.src.premul_mode;
+					tjob->data.blit.src_color_space =
+						cmd.src.color_space;
+
+					tjob->data.blit.dst_width =
+						cmd.dst.width;
+					tjob->data.blit.dst_height =
+						cmd.dst.height;
+					tjob->data.blit.dst_pitch =
+						dst_stride[0];
+					tjob->data.blit.dst_format =
+						cmd.dst.format;
+					tjob->data.blit.dst_x = dst_col_x;
+					tjob->data.blit.dst_y = dst_row_y;
+					tjob->data.blit.dst_w = tw;
+					tjob->data.blit.dst_h = th;
+					tjob->data.blit.dst_alpha =
+						cmd.dst.alpha;
+					tjob->data.blit.dst_alpha_mode =
+						cmd.dst.alpha_mode;
+					tjob->data.blit.dst_premul =
+						cmd.dst.premul_mode;
+					tjob->data.blit.dst_color_space =
+						cmd.dst.color_space;
+
+					if (has_out_buffer) {
+						tjob->data.blit.out_width =
+							cmd.out.width;
+						tjob->data.blit.out_height =
+							cmd.out.height;
+						tjob->data.blit.out_pitch =
+							out_stride[0];
+						tjob->data.blit.out_format =
+							cmd.out.format;
+						tjob->data.blit.out_color_space =
+							cmd.out.color_space;
+					} else {
+						tjob->data.blit.out_width =
+							cmd.dst.width;
+						tjob->data.blit.out_height =
+							cmd.dst.height;
+						tjob->data.blit.out_pitch =
+							dst_stride[0];
+						tjob->data.blit.out_format =
+							cmd.dst.format;
+						tjob->data.blit.out_color_space =
+							cmd.dst.color_space;
+					}
+
+					tjob->data.blit.color_key_enable = 1;
+					tjob->data.blit.color_key_mode =
+						cmd.params.mask.color_key_mode;
+					tjob->data.blit.color_key_min =
+						cmd.params.mask.color_key_min;
+					tjob->data.blit.color_key_max =
+						cmd.params.mask.color_key_max;
+
+					tjob->data.blit.bld_mode =
+						G2D_BLD_SRCOVER;
+					tjob->data.blit.flags = cmd.flags;
+
+					ret = g2d_job_prepare_rcq(g2d, tjob);
+					if (ret) {
+						g2d_job_free(g2d, tjob);
+						goto cleanup_tiles;
+					}
+
+					ret = sunxi_g2d_do_blend_rcq(
+						g2d, &tjob->rcq,
+						tjob->src_dma,
+						tjob->data.blit.src_width,
+						tjob->data.blit.src_height,
+						tjob->data.blit.src_pitch,
+						tjob->data.blit.src_format,
+						tjob->data.blit.src_crop_x,
+						tjob->data.blit.src_crop_y,
+						tjob->data.blit.src_crop_w,
+						tjob->data.blit.src_crop_h,
+						tjob->dst_dma,
+						tjob->data.blit.dst_width,
+						tjob->data.blit.dst_height,
+						tjob->data.blit.dst_pitch,
+						tjob->data.blit.dst_format,
+						tjob->data.blit.dst_x,
+						tjob->data.blit.dst_y,
+						tjob->out_dma,
+						tjob->data.blit.out_width,
+						tjob->data.blit.out_height,
+						tjob->data.blit.out_pitch,
+						tjob->data.blit.out_format,
+						out_col_x, out_row_y, tw, th,
+						tjob->data.blit.bld_mode,
+						tjob->data.blit.src_alpha_mode,
+						tjob->data.blit.src_alpha,
+						tjob->data.blit.src_premul,
+						tjob->data.blit.src_color_space,
+						tjob->data.blit.dst_color_space,
+						tjob->data.blit.out_color_space,
+						tjob->data.blit.color_key_enable,
+						/* mask keys source layer */
+						true,
+						tjob->data.blit.color_key_min,
+						tjob->data.blit.color_key_max,
+						&tjob->csc_state);
+					if (ret) {
+						sunxi_g2d_rcq_free(g2d->dev,
+								   &tjob->rcq);
+						g2d_job_free(g2d, tjob);
+						goto cleanup_tiles;
+					}
+					tjob->rcq_ready = true;
+
+					if (is_last) {
+						last_fence = f;
+						last_sync_file =
+							sync_file_create(f);
+						last_job = tjob;
+						if (!last_sync_file) {
+							ret = -ENOMEM;
+							goto cleanup_tiles;
+						}
+						fence_fd = get_unused_fd_flags(
+							O_CLOEXEC);
+						if (fence_fd < 0) {
+							ret = fence_fd;
+							goto cleanup_tiles;
+						}
+						tjob->fence_fd = fence_fd;
+						tjob->sync_file = last_sync_file;
+					}
+
+					list_add_tail(&tjob->node, &job_list);
+
+					dst_col_x += tw;
+					out_col_x += tw;
+					rem_w -= tw;
+					x_phase = 0;
+				}
+
+				dst_row_y += th;
+				out_row_y += th;
+				rem_h -= th;
+				y_phase = 0;
+			}
+
+			if (last_sync_file && last_sync_file->file) {
+				fd_install(fence_fd, last_sync_file->file);
+				fd_installed = true;
+				if (last_job)
+					last_job->sync_file = NULL;
+			} else {
+				ret = -EINVAL;
+				goto cleanup_tiles;
+			}
+
+			{
+				unsigned long flags;
+				struct sunxi_g2d_job *j, *tmp;
+
+				spin_lock_irqsave(&g2d->job_lock, flags);
+				list_for_each_entry_safe(j, tmp, &job_list,
+							 node)
+					list_move_tail(&j->node,
+						       &g2d->job_queue);
+				spin_unlock_irqrestore(&g2d->job_lock, flags);
+			}
+
+			queue_work(g2d->job_wq, &g2d->job_work);
+
+			if (put_user(fence_fd,
+				     &((struct g2d_cmd __user *)arg)
+					      ->fence_fd_out)) {
+				dev_err(g2d->dev,
+					"Failed to copy fence_fd_out to userspace\n");
+				return -EFAULT;
+			}
+
+			dev_dbg(g2d->dev,
+				"G2D_CMD_MASK: enqueued %u tiles, fence_fd=%d tile_repeat=1 phase_x=%u phase_y=%u\n",
+				total_tiles, fence_fd, phase_x, phase_y);
+
+			return 0;
+
+cleanup_tiles:
+			{
+				struct sunxi_g2d_job *j, *tmp;
+				list_for_each_entry_safe(j, tmp, &job_list,
+							 node) {
+					if (j->rcq.vir_addr)
+						sunxi_g2d_rcq_free(g2d->dev,
+								   &j->rcq);
+					if (j->sync_file && j->sync_file->file)
+						fput(j->sync_file->file);
+					if (j->fence)
+						dma_fence_put(j->fence);
+					g2d_job_free(g2d, j);
+				}
+			}
+			if (!fd_installed && fence_fd >= 0)
+				put_unused_fd(fence_fd);
+			if (!fd_installed && last_sync_file &&
+			    last_sync_file->file)
+				fput(last_sync_file->file);
+			if (!fd_installed && last_fence)
+				dma_fence_put(last_fence);
+			/* fall through to common cleanup */
+		}
 	}
-
-	queue_work(g2d->job_wq, &g2d->job_work);
-
-	/* Install fence fd */
-	fd_install(fence_fd, sync_file->file);
-	fd_installed = true;
-
-	/* Return fence fd to userspace */
-	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
-		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
-		/* Job already enqueued, can't cleanly abort */
-		return -EFAULT;
-	}
-
-	dev_dbg(g2d->dev, "G2D_CMD_MASK: enqueued job, fence_fd=%d\n",
-		fence_fd);
-
-	return 0;
 
 cleanup:
 	if (!IS_ERR_OR_NULL(job)) {
@@ -5675,15 +6395,31 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	dma_addr_t src_dma_addr, dst_dma_addr;
 	u32 src_bpp, dst_bpp;
 	int ret = 0;
-	struct dma_fence *fence = NULL;
-	struct sync_file *sync_file = NULL;
+	struct dma_fence *last_fence = NULL;
+	struct sync_file *last_sync_file = NULL;
 	int fence_fd = -1;
 	bool fd_installed = false;
-	struct sunxi_g2d_job *job = NULL;
+	LIST_HEAD(job_list);
+	struct sunxi_g2d_job *last_job = NULL;
+	struct dma_fence *in_fence = NULL;
+	u32 tile_w, tile_h, area_w, area_h;
+	u32 total_tiles = 0, tile_idx = 0;
+	bool tile_repeat = false;
+	u32 phase_x = 0, phase_y = 0;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
+
+	/* Optional input fence */
+	if (cmd.fence_fd_in >= 0) {
+		in_fence = sync_file_get_fence(cmd.fence_fd_in);
+		if (!in_fence)
+			return -EINVAL;
+		dma_fence_wait(in_fence, false);
+		dma_fence_put(in_fence);
+		in_fence = NULL;
+	}
 
 	/* Validate buffer formats */
 	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
@@ -5697,11 +6433,32 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		return -EOPNOTSUPP;
 	}
 
-	/* Validate dimensions - for COPY, no scaling allowed */
-	if (cmd.src.crop_w != cmd.dst_w || cmd.src.crop_h != cmd.dst_h) {
-		dev_err(g2d->dev,
-			"G2D_CMD_COPY requires src crop size == dst size (no scaling)\n");
+	/* Tiling support: repeat crop (or full src) to fill dst rect */
+	tile_repeat = (cmd.flags & G2D_FLAG_TILE_REPEAT);
+	tile_w = cmd.src.crop_w ? cmd.src.crop_w : cmd.src.width;
+	tile_h = cmd.src.crop_h ? cmd.src.crop_h : cmd.src.height;
+	phase_x = cmd.src.crop_x % tile_w;
+	phase_y = cmd.src.crop_y % tile_h;
+	area_w = cmd.dst_w;
+	area_h = cmd.dst_h;
+
+	if (!tile_w || !tile_h || !area_w || !area_h)
 		return -EINVAL;
+
+	if (!tile_repeat) {
+		/* Legacy COPY: require 1:1 sizes */
+		if (cmd.src.crop_w != cmd.dst_w || cmd.src.crop_h != cmd.dst_h) {
+			dev_err(g2d->dev,
+				"G2D_CMD_COPY requires src crop size == dst size (no scaling)\n");
+			return -EINVAL;
+		}
+		total_tiles = 1;
+	} else {
+		u32 rows = DIV_ROUND_UP(area_h + phase_y, tile_h);
+		u32 cols = DIV_ROUND_UP(area_w + phase_x, tile_w);
+		total_tiles = rows * cols;
+		if (!total_tiles)
+			return -EINVAL;
 	}
 
 	/* Import source buffer */
@@ -5762,137 +6519,216 @@ static long sunxi_g2d_cmd_copy(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 		}
 	}
 
-	/* Create fence for async operation */
-	fence = sunxi_g2d_fence_create(g2d);
-	if (!fence) {
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	/* Create sync_file for userspace */
-	sync_file = sync_file_create(fence);
-	if (!sync_file) {
-		dma_fence_put(fence);
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	fence_fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fence_fd < 0) {
-		fput(sync_file->file);
-		ret = fence_fd;
-		goto cleanup;
-	}
-
-	/* Create/obtain async job (from pool if available) */
-	job = g2d_job_alloc(g2d);
-	if (!job) {
-		put_unused_fd(fence_fd);
-		fput(sync_file->file);
-		ret = -ENOMEM;
-		goto cleanup;
-	}
-
-	INIT_WORK(&job->cleanup_work, sunxi_g2d_job_cleanup_workfn);
-	job->g2d = g2d;
-	job->csc_state = ctx->csc_changed ? ctx->csc_state : g2d->csc_state;
-	job->fence = fence;
-	job->src_dmabuf = src_dmabuf;
-	job->dst_dmabuf = dst_dmabuf;
-	job->src_attach = src_attach;
-	job->dst_attach = dst_attach;
-	job->src_sgt = src_sgt;
-	job->dst_sgt = dst_sgt;
-
-	/* Setup job parameters */
-	job->type = G2D_JOB_CMD_COPY;
-	job->src_dma = src_dma_addr;
-	job->dst_dma = dst_dma_addr;
-
 	/* Calculate proper strides for YUV formats (dst only; src already computed) */
-	u32 dst_stride[3], dst_plane_offset[3];
-	sunxi_g2d_get_yuv_plane_info(cmd.dst.format, cmd.dst.width,
-				     cmd.dst.height, cmd.dst.stride, dst_stride,
-				     dst_plane_offset);
+	{
+		u32 dst_stride[3], dst_plane_offset[3];
 
-	/* Fill blit data structure */
-	job->data.blit.src_width = cmd.src.width;
-	job->data.blit.src_height = cmd.src.height;
-	job->data.blit.src_pitch = src_stride[0]; /* Use calculated stride */
-	job->data.blit.src_format = cmd.src.format;
-	job->data.blit.src_crop_x = cmd.src.crop_x;
-	job->data.blit.src_crop_y = cmd.src.crop_y;
-	job->data.blit.src_crop_w = cmd.src.crop_w;
-	job->data.blit.src_crop_h = cmd.src.crop_h;
-	job->data.blit.src_color_space = cmd.src.color_space;
+		sunxi_g2d_get_yuv_plane_info(cmd.dst.format, cmd.dst.width,
+					     cmd.dst.height, cmd.dst.stride,
+					     dst_stride, dst_plane_offset);
 
-	job->data.blit.dst_width = cmd.dst.width;
-	job->data.blit.dst_height = cmd.dst.height;
-	job->data.blit.dst_pitch = dst_stride[0]; /* Use calculated stride */
-	job->data.blit.dst_format = cmd.dst.format;
-	job->data.blit.dst_x = cmd.dst_x;
-	job->data.blit.dst_y = cmd.dst_y;
-	job->data.blit.dst_w = cmd.dst_w;
-	job->data.blit.dst_h = cmd.dst_h;
-	job->data.blit.dst_color_space = cmd.dst.color_space;
+		/* Build one job per tile */
+		/* Phase-aware tiling: crop_x/crop_y are treated as phase offsets
+		 * inside the source tile. First row/col may be smaller; subsequent
+		 * tiles start at (0,0) in the source.
+		 */
+		u32 rem_h = area_h;
+		u32 dst_row_y = cmd.dst_y;
+		u32 y_phase = phase_y;
 
-	ret = g2d_job_prepare_rcq(g2d, job);
-	if (ret)
+		while (rem_h) {
+			u32 th = min(tile_h - y_phase, rem_h);
+			u32 rem_w = area_w;
+			u32 dst_col_x = cmd.dst_x;
+			u32 x_phase = phase_x;
+
+			while (rem_w) {
+				u32 tw = min(tile_w - x_phase, rem_w);
+				bool is_last = (++tile_idx == total_tiles);
+				struct sunxi_g2d_job *job;
+				struct dma_fence *f;
+
+				if (!tile_repeat) {
+					/* Single job path (should not reach here when !tile_repeat) */
+					tw = tile_w;
+					th = tile_h;
+				}
+
+				job = g2d_job_alloc(g2d);
+				if (!job) {
+					ret = -ENOMEM;
+					goto cleanup;
+				}
+
+				f = sunxi_g2d_fence_create(g2d);
+				if (!f) {
+					g2d_job_free(g2d, job);
+					ret = -ENOMEM;
+					goto cleanup;
+				}
+
+				INIT_WORK(&job->cleanup_work,
+					  sunxi_g2d_job_cleanup_workfn);
+				job->g2d = g2d;
+				job->csc_state = ctx->csc_changed ?
+							 ctx->csc_state :
+							 g2d->csc_state;
+				job->fence = f;
+				job->fence_fd = -1;
+				job->sync_file = NULL;
+				job->type = G2D_JOB_CMD_COPY;
+				job->src_dmabuf = src_dmabuf;
+				job->dst_dmabuf = dst_dmabuf;
+				job->src_attach = src_attach;
+				job->dst_attach = dst_attach;
+				job->src_sgt = src_sgt;
+				job->dst_sgt = dst_sgt;
+				job->src_dma = src_dma_addr;
+				job->dst_dma = dst_dma_addr;
+				job->persistent_refs = !is_last;
+
+				job->data.blit.src_width = cmd.src.width;
+				job->data.blit.src_height = cmd.src.height;
+				job->data.blit.src_pitch = src_stride[0];
+				job->data.blit.src_format = cmd.src.format;
+				job->data.blit.src_crop_x = x_phase;
+				job->data.blit.src_crop_y = y_phase;
+				job->data.blit.src_crop_w = tw;
+				job->data.blit.src_crop_h = th;
+				job->data.blit.src_color_space =
+					cmd.src.color_space;
+
+				job->data.blit.dst_width = cmd.dst.width;
+				job->data.blit.dst_height = cmd.dst.height;
+				job->data.blit.dst_pitch = dst_stride[0];
+				job->data.blit.dst_format = cmd.dst.format;
+				job->data.blit.dst_x = dst_col_x;
+				job->data.blit.dst_y = dst_row_y;
+				job->data.blit.dst_w = tw;
+				job->data.blit.dst_h = th;
+				job->data.blit.dst_color_space =
+					cmd.dst.color_space;
+				job->data.blit.flags = cmd.flags;
+
+				ret = g2d_job_prepare_rcq(g2d, job);
+				if (ret) {
+					g2d_job_free(g2d, job);
+					goto cleanup;
+				}
+
+					ret = sunxi_g2d_do_blit_rcq(
+						g2d, &job->rcq, job->src_dma,
+						job->data.blit.src_width,
+						job->data.blit.src_height,
+						job->data.blit.src_pitch,
+						job->data.blit.src_format,
+						job->data.blit.src_crop_x,
+						job->data.blit.src_crop_y,
+						job->data.blit.src_crop_w,
+						job->data.blit.src_crop_h, job->dst_dma,
+						job->data.blit.dst_width,
+						job->data.blit.dst_height,
+						job->data.blit.dst_pitch,
+						job->data.blit.dst_format,
+					job->data.blit.dst_x,
+					job->data.blit.dst_y,
+					job->data.blit.dst_w,
+					job->data.blit.dst_h,
+					job->data.blit.src_color_space,
+					job->data.blit.dst_color_space,
+					job->data.blit.flags);
+				if (ret) {
+					sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+					g2d_job_free(g2d, job);
+					goto cleanup;
+				}
+				job->rcq_ready = true;
+
+				if (is_last) {
+					last_fence = f;
+					last_sync_file = sync_file_create(f);
+					last_job = job;
+					if (!last_sync_file) {
+						ret = -ENOMEM;
+						goto cleanup;
+					}
+					fence_fd =
+						get_unused_fd_flags(O_CLOEXEC);
+					if (fence_fd < 0) {
+						ret = fence_fd;
+						goto cleanup;
+					}
+					job->fence_fd = fence_fd;
+					job->sync_file = last_sync_file;
+				}
+
+				list_add_tail(&job->node, &job_list);
+
+				dst_col_x += tw;
+				rem_w -= tw;
+				x_phase = 0;
+			}
+
+			dst_row_y += th;
+			rem_h -= th;
+			y_phase = 0;
+		}
+	}
+
+	/* Install fence fd (last job) */
+	if (last_sync_file && last_sync_file->file) {
+		fd_install(fence_fd, last_sync_file->file);
+		fd_installed = true;
+		/* fd table owns the reference now */
+		if (last_job)
+			last_job->sync_file = NULL;
+	} else {
+		ret = -EINVAL;
 		goto cleanup;
+	}
 
-	ret = sunxi_g2d_do_blit_rcq(
-		g2d, &job->rcq, job->src_dma, job->data.blit.src_width,
-		job->data.blit.src_height, job->data.blit.src_pitch,
-		job->data.blit.src_format, job->data.blit.src_crop_x,
-		job->data.blit.src_crop_y, job->data.blit.src_crop_w,
-		job->data.blit.src_crop_h, job->dst_dma, job->data.blit.dst_width,
-		job->data.blit.dst_height, job->data.blit.dst_pitch,
-		job->data.blit.dst_format, job->data.blit.dst_x,
-		job->data.blit.dst_y, job->data.blit.dst_w, job->data.blit.dst_h,
-		job->data.blit.src_color_space, job->data.blit.dst_color_space);
-	if (ret)
-		goto cleanup;
-	job->rcq_ready = true;
-
-	/* Enqueue job to worker */
+	/* Enqueue all tile jobs */
 	{
 		unsigned long flags;
+		struct sunxi_g2d_job *job, *tmp;
+
 		spin_lock_irqsave(&g2d->job_lock, flags);
-		list_add_tail(&job->node, &g2d->job_queue);
+		list_for_each_entry_safe(job, tmp, &job_list, node)
+			list_move_tail(&job->node, &g2d->job_queue);
 		spin_unlock_irqrestore(&g2d->job_lock, flags);
 	}
 
 	queue_work(g2d->job_wq, &g2d->job_work);
 
-	/* Install fence fd */
-	fd_install(fence_fd, sync_file->file);
-	fd_installed = true;
-
 	/* Return fence fd to userspace */
 	if (put_user(fence_fd, &((struct g2d_cmd __user *)arg)->fence_fd_out)) {
 		dev_err(g2d->dev, "Failed to copy fence_fd_out to userspace\n");
-		/* Job already enqueued, can't cleanly abort */
+		/* Jobs enqueued; cannot abort cleanly */
 		return -EFAULT;
 	}
 
-	dev_dbg(g2d->dev, "G2D_CMD_COPY: enqueued job, fence_fd=%d\n",
-		fence_fd);
+	dev_dbg(g2d->dev,
+		"G2D_CMD_COPY: enqueued %u tiles, fence_fd=%d tile_repeat=%d phase_x=%u phase_y=%u\n",
+		total_tiles, fence_fd, tile_repeat, phase_x, phase_y);
 
 	return 0;
 
 cleanup:
-	if (!IS_ERR_OR_NULL(job)) {
-		if (job->rcq.vir_addr)
-			sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
-		g2d_job_free(g2d, job);
+	{
+		struct sunxi_g2d_job *job, *tmp;
+		list_for_each_entry_safe(job, tmp, &job_list, node) {
+			if (job->rcq.vir_addr)
+				sunxi_g2d_rcq_free(g2d->dev, &job->rcq);
+			if (job->sync_file && job->sync_file->file)
+				fput(job->sync_file->file);
+			if (job->fence)
+				dma_fence_put(job->fence);
+			g2d_job_free(g2d, job);
+		}
 	}
 
 	if (!fd_installed && fence_fd >= 0)
 		put_unused_fd(fence_fd);
-	if (!fd_installed && sync_file && sync_file->file)
-		fput(sync_file->file);
-	if (fence)
-		dma_fence_put(fence);
 
 	if (dst_sgt && dst_attach)
 		dma_buf_unmap_attachment(dst_attach, dst_sgt, DMA_FROM_DEVICE);
@@ -5925,7 +6761,8 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 				 dma_addr_t dst_dma, u32 dst_width,
 				 u32 dst_height, u32 dst_pitch, u32 dst_format,
 				 u32 dst_x, u32 dst_y, u32 dst_w, u32 dst_h,
-				 u8 src_color_space, u8 dst_color_space)
+				 u8 src_color_space, u8 dst_color_space,
+				 u32 op_flags)
 {
 	struct sunxi_g2d_rcq_frame_layout layout;
 	int src_fmt_val, dst_fmt_val;
@@ -6007,8 +6844,11 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 	dma_addr_t dst_offset_dma;
 	u64 dst_offset_bytes = 0;
 
-	/* Handle case where dst_y is passed as a byte offset (legacy/quirk) */
-	if (dst_y > dst_height * 2) {
+	/* Handle case where dst_y is passed as a byte offset (legacy/quirk).
+	 * When tiling, always treat dst_x/dst_y as coordinates to avoid
+	 * misplacing tiles on large destination rectangles.
+	 */
+	if (!(op_flags & G2D_FLAG_TILE_REPEAT) && dst_y > dst_height * 2) {
 		/* Heuristic: if y is huge, assume it's an offset */
 		dst_offset_bytes = dst_y;
 		dev_dbg(
@@ -6125,6 +6965,8 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 	bool needs_scaling = (src_crop_w != dst_w) || (src_crop_h != dst_h);
 	/* Force VSU for YUV420 formats (0x28-0x2B) to handle subsampling via scaler */
 	bool is_yuv420 = (src_fmt_val >= 0x28 && src_fmt_val <= 0x2B);
+	bool tile_repeat = (op_flags & G2D_FLAG_TILE_REPEAT);
+	bool force_passthrough = tile_repeat && !needs_scaling && !is_yuv420;
 	/*
 	 * Force VSU even for 1:1 RGB copies.
 	 * Empirically the RCQ path hangs after a while when the SCAL blocks are
@@ -6148,14 +6990,14 @@ static int sunxi_g2d_do_blit_rcq(struct sunxi_g2d_dev *g2d,
 				src_fmt_val, src_fmt_val, dst_fmt_val,
 				src_color_space, src_color_space,
 				dst_color_space, true, false, 0, 0, 0, 0,
-				G2D_BLD_COPY, 0, false, &g2d->csc_state,
-				(u32 **)&bld_regs, &bld_size);
+				G2D_BLD_COPY, 0, false, false, 0, 0, 0,
+				&g2d->csc_state, (u32 **)&bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build BLD block: %d\n", ret);
 		goto cleanup;
 	}
 
-	if (needs_scaling || is_yuv420) {
+	if (!force_passthrough && (needs_scaling || is_yuv420)) {
 		/* Use active scaler builder for scaling operations OR YUV420 upsampling.
 		 * YUV420 requires chroma upscaling (1/2 -> 1/1) even if Luma is 1:1.
 		 * The passthrough builder assumes 1:1 for ALL channels, which is wrong for YUV420.
@@ -6522,8 +7364,8 @@ static int sunxi_g2d_do_scale_rcq(struct sunxi_g2d_dev *g2d,
 				dst_height, src_fmt_val, src_fmt_val,
 				dst_fmt_val, src_colorspace, src_colorspace,
 				dst_colorspace, true, false, dst_x, dst_y,
-				dst_x, dst_y, G2D_BLD_COPY, 0, false, csc_state,
-				(u32 **)&bld_regs, &bld_size);
+				dst_x, dst_y, G2D_BLD_COPY, 0, false, false, 0,
+				0, 0, csc_state, (u32 **)&bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "Failed to build BLD block: %d\n", ret);
 		goto cleanup;
@@ -6705,7 +7547,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
-	u8 out_color_space, struct g2d_csc_state *csc_state)
+	u8 out_color_space, bool ck_enable, bool ck_on_src, u32 ck_min,
+	u32 ck_max, struct g2d_csc_state *csc_state)
 {
 	struct g2d_mixer_ovl_u_reg *ui2_regs = NULL; /* Foreground (src) */
 	struct g2d_mixer_ovl_v_reg *v0_regs = NULL; /* Background (dst) */
@@ -6721,6 +7564,7 @@ static int sunxi_g2d_do_blend_rcq(
 	int ret;
 	bool needs_scaling;
 	bool swap_layers = false; /* If true, Src=V0, Dst=UI2 (for scaling) */
+	u32 hw_alpha_mode;
 
 	dev_dbg(
 		g2d->dev,
@@ -6741,6 +7585,11 @@ static int sunxi_g2d_do_blend_rcq(
 	dev_dbg(g2d->dev,
 		 "BLEND_RCQ ENTRY: alpha_mode=%u global_alpha=%u premul=%u\n",
 		 alpha_mode, global_alpha, premul_mode);
+
+	/* Hardware only distinguishes pixel/global alpha. Map MIXER to global. */
+	hw_alpha_mode = (alpha_mode == G2D_MIXER_ALPHA) ?
+				G2D_GLOBAL_ALPHA :
+				alpha_mode;
 
 	/* Get bytes-per-pixel and HW format (swapped if needed) */
 	src_hw_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
@@ -6864,8 +7713,8 @@ static int sunxi_g2d_do_blend_rcq(
 		/* Build UI2 block (Background/Dst) - reads dst crop */
 		ret = g2d_rcq_build_ui2_memory(blend_w, blend_h, dst_pitch,
 					       dst_dma, dst_crop_offset, dst_hw_fmt, 0,
-					       0, blend_w, blend_h, G2D_PIXEL_ALPHA,
-					       0xFF, G2D_PREMUL_NONE, &ui2_regs,
+					       0, blend_w, blend_h, hw_alpha_mode,
+					       global_alpha, premul_mode, &ui2_regs,
 					       &ui2_size);
 		
 		/* Build V0 block (Foreground/Src) - reads src crop */
@@ -6880,7 +7729,7 @@ static int sunxi_g2d_do_blend_rcq(
 		 */
 		ret = g2d_rcq_build_ui2_memory(src_crop_w, src_crop_h, src_pitch,
 					       src_dma, src_crop_offset, src_hw_fmt, 0,
-					       0, blend_w, blend_h, alpha_mode,
+					       0, blend_w, blend_h, hw_alpha_mode,
 					       global_alpha, premul_mode, &ui2_regs,
 					       &ui2_size);
 		if (ret) {
@@ -6906,16 +7755,29 @@ static int sunxi_g2d_do_blend_rcq(
 
 	/* Build BLD block:
 	 * - Output size: blend_w x blend_h
-	 * - Pipe 0 (UI2) pos: 0,0
-	 * - Pipe 1 (V0) pos: 0,0
-	 * 
-	 * CORRECTION: UI2 is Pipe 0, V0 is Pipe 1.
-	 * We must pass src_hw_fmt (UI2) as fmt_p0 and dst_hw_fmt (V0) as fmt_p1.
+	 * - Pipe 0 = V0 (background/dst) unless swapped
+	 * - Pipe 1 = UI2 (foreground/src) unless swapped
 	 */
-	u32 fmt_p0 = swap_layers ? dst_hw_fmt : src_hw_fmt;
-	u32 fmt_p1 = swap_layers ? src_hw_fmt : dst_hw_fmt;
+	u32 fmt_p0 = swap_layers ? src_hw_fmt : dst_hw_fmt;
+	u32 fmt_p1 = swap_layers ? dst_hw_fmt : src_hw_fmt;
 	u8 cs_p0 = swap_layers ? dst_color_space : src_color_space;
 	u8 cs_p1 = swap_layers ? src_color_space : dst_color_space;
+	bool ck_en = ck_enable;
+	u32 ck_min_local = ck_min;
+	u32 ck_max_local = ck_max;
+	/*
+	 * Color key direction must follow the layer being keyed:
+	 * - When keying source (default), UI2 carries src if !swap_layers,
+	 *   otherwise src moves to V0 (ck_on_ui2 = false).
+	 * - If ever keyed on destination, invert the selection.
+	 */
+	bool ck_on_ui2 = false;
+	if (ck_en) {
+		if (ck_on_src)
+			ck_on_ui2 = !swap_layers;
+		else
+			ck_on_ui2 = swap_layers;
+	}
 	
 	/* Fix: Pass blend_w/h for both pipes.
 	 * If scaling is active, VSU scales Pipe 0 to blend_w.
@@ -6924,7 +7786,9 @@ static int sunxi_g2d_do_blend_rcq(
 	ret = g2d_rcq_build_bld(blend_w, blend_h, blend_w, blend_h, blend_w,
 				blend_h, fmt_p0, fmt_p1, out_hw_fmt, cs_p0,
 				cs_p1, out_color_space, true, true, 0, 0, 0, 0,
-				bld_mode, premul_mode, false, csc_state,
+				bld_mode, premul_mode, false, ck_en,
+				ck_on_ui2, ck_min_local, ck_max_local,
+				csc_state,
 				(u32 **)&bld_regs, &bld_size);
 	if (ret) {
 		dev_err(g2d->dev, "BLEND_RCQ: failed to build BLD block: %d\n",

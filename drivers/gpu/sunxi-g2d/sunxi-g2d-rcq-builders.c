@@ -436,13 +436,14 @@ int g2d_rcq_build_v0_memory(u32 width, u32 height, const u32 stride[3],
  * @out_size: Output size of block in bytes
  * 
  * Configures BLD with dual-pipe setup (pipe0=V0, pipe1=fill color).
+ * premul=true sets premultiplication bits for both pipes and output.
  * 
  * Returns: 0 on success, negative error on failure
  * 
  * The caller must kfree(*out_block) when done.
  */
 int g2d_rcq_build_bld_fillcolor(u32 width, u32 height, u32 fill_color,
-                                 u32 porter_duff,
+                                 u32 porter_duff, bool premul,
                                  struct g2d_mixer_bld_reg **out_block,
                                  u32 *out_size)
 {
@@ -476,11 +477,16 @@ int g2d_rcq_build_bld_fillcolor(u32 width, u32 height, u32 fill_color,
 	bld->bld_fill_color[0] = 0x00000000;  /* Pipe 0 unused */
 	bld->bld_fill_color[1] = fill_color;  /* Pipe 1 fill color */
 	
+	/* Match BSP: optionally enable premultiplication for both pipes/output */
 	bld->out_size.bits.width = width - 1;
 	bld->out_size.bits.height = height - 1;
 	
 	bld->out_color.bits.alpha_mode = 0;  /* RGB mode */
-	bld->out_color.bits.premul_en = 0;
+	bld->out_color.bits.premul_en = premul ? 1 : 0;
+	if (premul) {
+		bld->premulti_ctrl.bits.p0_alpha_mode = 1;
+		bld->premulti_ctrl.bits.p1_alpha_mode = 1;
+	}
 	
 	/* Porter-Duff blend factors */
 	bld->bld_ctrl.dwval = porter_duff;
@@ -527,6 +533,7 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 		      u32 out_fmt, u8 cs_p0, u8 cs_p1, u8 cs_out, bool p0_en,
 		      bool p1_en, u32 p0_x, u32 p0_y, u32 p1_x, u32 p1_y,
 		      u32 bld_mode, u32 premul_mode, bool p1_is_copy_src,
+		      bool ck_enable, bool ck_on_ui2, u32 ck_min, u32 ck_max,
 		      struct g2d_csc_state *csc_state, u32 **out_block,
 		      u32 *out_size)
 {
@@ -636,6 +643,30 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 		 */
 		
 		bld->rop_ctrl.dwval = 0x000000f0; /* Passthrough ROP */
+	}
+
+	/* Color keying (chromakey)
+	 * Hardware interpretation (BSP pattern):
+	 *   key0_match_dir = 0 -> key on Source/UI2 (foreground)
+	 *   key0_match_dir = 1 -> key on Destination/V0 (background)
+	 * The user-supplied mode is mapped to this selector.
+	 */
+	if (ck_enable) {
+		u32 dir = ck_on_ui2 ? 0 : 1; /* 0 = key UI2 (foreground), 1 = key V0 (background) */
+		bld->color_key.bits.key0_en = 1;
+		bld->color_key.bits.key0_match_dir = dir;
+		/* Match all RGB channels */
+		bld->color_key_cfg.dwval = 0x7;
+		bld->color_key_max.dwval = ck_max & 0x00FFFFFF;
+		bld->color_key_min.dwval = ck_min & 0x00FFFFFF;
+		
+		pr_debug("BLD_BUILDER: ck_en=1 dir=%u min=0x%06x max=0x%06x\n",
+			dir, bld->color_key_min.dwval, bld->color_key_max.dwval);
+	} else {
+		bld->color_key.dwval = 0;
+		bld->color_key_cfg.dwval = 0;
+		bld->color_key_max.dwval = 0;
+		bld->color_key_min.dwval = 0;
 	}
 
 	*out_block = (u32 *)bld;
