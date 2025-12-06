@@ -40,9 +40,9 @@ static u32 g2d_rcq_get_bld_mode(u32 mode)
 	case G2D_BLD_DSTOVER: /* 3 */
 		return 0x01030103;
 	case G2D_BLD_SRCIN: /* 6 */
-		return 0x00020002;
+		return 0x00000002; /* Only P0/P1: P0 * P1_Alpha */
 	case G2D_BLD_DSTIN: /* 5 */
-		return 0x02000200;
+		return 0x00000200; /* Only P0/P1: P1 * P0_Alpha */
 	case G2D_BLD_SRCOUT: /* 8 */
 		return 0x00030003;
 	case G2D_BLD_DSTOUT: /* 7 */
@@ -323,7 +323,7 @@ int g2d_rcq_build_v0_memory(u32 width, u32 height, const u32 stride[3],
 	 * If we use Pixel Alpha for XRGB/XBGR, the hardware reads the 'X' byte (usually 0)
 	 * as alpha, resulting in a transparent (black) image.
 	 */
-	bool has_alpha = (src_fmt == G2D_FORMAT_ARGB8888 || src_fmt == G2D_FORMAT_ABGR8888 ||
+	bool has_alpha = (src_fmt == G2D_FORMAT_Y8 || src_fmt == G2D_FORMAT_ARGB8888 || src_fmt == G2D_FORMAT_ABGR8888 ||
 			  src_fmt == G2D_FORMAT_RGBA8888 || src_fmt == G2D_FORMAT_BGRA8888 ||
 			  src_fmt == G2D_FORMAT_ARGB4444 || src_fmt == G2D_FORMAT_ABGR4444 ||
 			  src_fmt == G2D_FORMAT_RGBA4444 || src_fmt == G2D_FORMAT_BGRA4444 ||
@@ -788,7 +788,7 @@ int g2d_rcq_build_wb(u32 width, u32 height, u32 pitch,
 	if (!out_block || !out_size)
 		return -EINVAL;
 
-	/* WB block: 9 registers (WB_ATT to WB_HADD0) 
+	/* WB block: 12 registers (WB_ATT to WB_CROP_COOR) 
 	 * Offsets:
 	 * 0x00: WB_ATT
 	 * 0x04: WB_SIZE
@@ -796,11 +796,14 @@ int g2d_rcq_build_wb(u32 width, u32 height, u32 pitch,
 	 * 0x0C: WB_PITCH1
 	 * 0x10: WB_PITCH2
 	 * 0x14: WB_LADD0
-	 * 0x18: WB_LADD1
-	 * 0x1C: WB_LADD2
-	 * 0x20: WB_HADD0
+	 * 0x18: WB_HADD0
+	 * 0x1C: WB_LADD1
+	 * 0x20: WB_HADD1
+	 * 0x24: WB_LADD2
+	 * 0x28: WB_HADD2
+	 * 0x2C: WB_CROP_COOR
 	 */
-	regs = kzalloc(9 * sizeof(u32), GFP_KERNEL);
+	regs = kzalloc(12 * sizeof(u32), GFP_KERNEL);
 	if (!regs)
 		return -ENOMEM;
 	
@@ -830,22 +833,25 @@ int g2d_rcq_build_wb(u32 width, u32 height, u32 pitch,
 	pr_debug("WB_BUILDER: dma=0x%llx → laddr0=0x%08x haddr0=0x%08x\n",
 		(u64)dma_addr, wb.laddr0, wb.haddr0);
 	
-	/* Pack into register array */
+	/* Pack into register array - CORRECTED MAPPING */
 	regs[0] = wb.wb_attr.dwval;
 	regs[1] = wb.data_size.dwval;
 	regs[2] = wb.pitch0;
 	regs[3] = 0;  /* pitch1 */
 	regs[4] = 0;  /* pitch2 */
 	regs[5] = wb.laddr0;
-	regs[6] = 0;  /* laddr1 */
-	regs[7] = 0;  /* laddr2 */
-	regs[8] = wb.haddr0;
+	regs[6] = wb.haddr0;
+	regs[7] = 0;  /* laddr1 */
+	regs[8] = 0;  /* haddr1 */
+	regs[9] = 0;  /* laddr2 */
+	regs[10] = 0; /* haddr2 */
+	regs[11] = 0; /* wb_crop_coor (0,0) - Use DMA address for positioning */
 	
-	pr_debug("WB_BUILDER: regs[0-8] = 0x%08x 0x%08x 0x%08x ... 0x%08x\n",
-		regs[0], regs[1], regs[2], regs[8]);
+	pr_debug("WB_BUILDER: regs[0-11] = 0x%08x ... 0x%08x\n",
+		regs[0], regs[11]);
 	
 	*out_block = regs;
-	*out_size = 9 * sizeof(u32);
+	*out_size = 12 * sizeof(u32);
 	
 	return 0;
 }
@@ -928,20 +934,13 @@ int g2d_rcq_build_scaler_passthrough(u32 width, u32 height, u32 fmt,
 	size_reg = ((height - 1) << 16) | (width - 1);
 	step_1_0 = 0x00100000;  /* 1.0 in fixed-point (0x80000 << 1) */
 	
-	/* VS_CTRL @0x00: en=1, coef_access=1, filter_type
-	 * Must be in COEF_ACCESS mode to load coefficients.
-	 * EN=1 because BSP enables it during load!
-	 * 
-	 * FIX: Must set FILTER_TYPE correctly during load phase too!
-	 * BSP Logic: if (fmt > G2D_FORMAT_IYUV422_Y1U0Y0V0) filter_type=1; else filter_type=0;
-	 * 
-	 * UPDATE: We set EN=0 here to avoid starting the scaler while loading coefficients.
-	 * The separate SCAL_EN block will set EN=1 later.
+	/* VS_CTRL @0x00: enable immediately in passthrough (no SCAL_EN dependency)
+	 * EN=1, COEF_ACCESS=0, FILTER_TYPE based on format.
 	 */
 	if (fmt > G2D_FORMAT_IYUV422_Y1U0Y0V0) {
-		regs[0x00 / 4] = 0x00010100;  /* en=0, coef_access=1, filter_type=1 */
+		regs[0x00 / 4] = 0x00010101;  /* en=1, coef_access=0, filter_type=1 */
 	} else {
-		regs[0x00 / 4] = 0x00000100;  /* en=0, coef_access=1, filter_type=0 */
+		regs[0x00 / 4] = 0x00000101;  /* en=1, coef_access=0, filter_type=0 */
 	}
 	
 	/* VS_OUT_SIZE @0x40: output dimensions (H-1)<<16 | (W-1) */
@@ -958,11 +957,17 @@ int g2d_rcq_build_scaler_passthrough(u32 width, u32 height, u32 fmt,
 	regs[0x44 / 4] = 0x000000FF;
 	
 	/* VS_C_SIZE @0xC0: input chroma dimensions */
-	regs[0xC0 / 4] = size_reg;
-	
-	/* VS_C_HSTEP @0xC8, VS_C_VSTEP @0xCC: chroma step (1.0) */
-	regs[0xC8 / 4] = step_1_0;
-	regs[0xCC / 4] = step_1_0;
+	if (fmt == G2D_FORMAT_Y8) {
+		/* Y8 has no chroma */
+		regs[0xC0 / 4] = 0;
+		regs[0xC8 / 4] = 0;
+		regs[0xCC / 4] = 0;
+	} else {
+		regs[0xC0 / 4] = size_reg;
+		/* VS_C_HSTEP @0xC8, VS_C_VSTEP @0xCC: chroma step (1.0) */
+		regs[0xC8 / 4] = step_1_0;
+		regs[0xCC / 4] = step_1_0;
+	}
 	
 	/* Load horizontal FIR coefficients (Lanczos2, phase 0 only for 1:1)
 	 * BSP always loads coefficients even for passthrough

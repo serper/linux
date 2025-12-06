@@ -146,8 +146,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
-	u8 out_color_space, bool ck_enable, bool ck_on_src, u32 ck_min, u32 ck_max,
-	struct g2d_csc_state *csc_state);
+	u8 out_color_space, bool mask_alpha, bool ck_enable, bool ck_on_src,
+	u32 ck_min, u32 ck_max, struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot_rcq(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -711,6 +711,7 @@ struct g2d_job_blit_data {
 	u8 color_key_mode;
 	u32 color_key_min;
 	u32 color_key_max;
+	u8 mask_alpha;
 	u8 needs_alpha;
 	u8 needs_rotation;
 	u8 needs_scaling;
@@ -1341,6 +1342,7 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 			step->blit.color_key_mode = cmd->params.mask.color_key_mode;
 			step->blit.color_key_min = cmd->params.mask.color_key_min;
 			step->blit.color_key_max = cmd->params.mask.color_key_max;
+			step->blit.mask_alpha = cmd->params.mask.alpha_enable;
 		} else {
 			step->blit.color_key_enable =
 				cmd->params.blend.color_key_enable;
@@ -1350,6 +1352,7 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 				cmd->params.blend.color_key_min;
 			step->blit.color_key_max =
 				cmd->params.blend.color_key_max;
+			step->blit.mask_alpha = 0;
 		}
 		step->blit.flags = cmd->flags;
 
@@ -1405,6 +1408,7 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 				step->blit.src_color_space,
 				step->blit.dst_color_space,
 				step->blit.out_color_space,
+				step->blit.mask_alpha,
 				step->blit.color_key_enable,
 				/* color key always targets source layer */
 				true,
@@ -2312,8 +2316,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
-	u8 out_color_space, bool ck_enable, bool ck_on_src, u32 ck_min,
-	u32 ck_max, struct g2d_csc_state *csc_state);
+	u8 out_color_space, bool mask_alpha, bool ck_enable, bool ck_on_src,
+	u32 ck_min, u32 ck_max, struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -4815,6 +4819,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	job->data.blit.color_key_mode = cmd.params.blend.color_key_mode;
 	job->data.blit.color_key_min = cmd.params.blend.color_key_min;
 	job->data.blit.color_key_max = cmd.params.blend.color_key_max;
+	job->data.blit.mask_alpha = 0;
 			job->data.blit.flags = cmd.flags;
 
 			ret = g2d_job_prepare_rcq(g2d, job);
@@ -4849,6 +4854,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 				job->data.blit.src_color_space,
 				job->data.blit.dst_color_space,
 				job->data.blit.out_color_space,
+				job->data.blit.mask_alpha,
 				job->data.blit.color_key_enable,
 				/* key on source layer (UI2 unless swap_layers flips it to V0) */
 				true,
@@ -5017,6 +5023,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 						cmd.params.blend.color_key_min;
 					tjob->data.blit.color_key_max =
 						cmd.params.blend.color_key_max;
+					tjob->data.blit.mask_alpha = 0;
 
 					tjob->data.blit.bld_mode =
 						cmd.params.blend.bld_mode;
@@ -5059,6 +5066,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 						tjob->data.blit.src_color_space,
 						tjob->data.blit.dst_color_space,
 						tjob->data.blit.out_color_space,
+						tjob->data.blit.mask_alpha,
 						tjob->data.blit.color_key_enable,
 						/* key on source layer (UI2 unless swap_layers flips to V0) */
 						true,
@@ -5724,10 +5732,13 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 	bool fd_installed = false;
 	struct sunxi_g2d_job *job = NULL;
 	bool has_out_buffer;
+	bool mask_alpha;
 
 	/* Copy command from userspace */
 	if (copy_from_user(&cmd, (void __user *)arg, sizeof(cmd)))
 		return -EFAULT;
+
+	mask_alpha = cmd.params.mask.alpha_enable;
 
 	/* Validate buffer formats */
 	if (sunxi_g2d_format_to_hw(cmd.src.format, &src_bpp) < 0) {
@@ -5962,16 +5973,37 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 					cmd.dst.color_space;
 			}
 
-			job->data.blit.color_key_enable = 1;
+			job->data.blit.color_key_enable = mask_alpha ? 0 : 1;
 			job->data.blit.color_key_mode =
 				cmd.params.mask.color_key_mode;
 			job->data.blit.color_key_min =
 				cmd.params.mask.color_key_min;
 			job->data.blit.color_key_max =
 				cmd.params.mask.color_key_max;
+			job->data.blit.mask_alpha = mask_alpha;
 
-			job->data.blit.bld_mode = G2D_BLD_SRCOVER;
+			if (mask_alpha) {
+				job->data.blit.bld_mode = G2D_BLD_DSTIN;
+				job->data.blit.src_alpha_mode = G2D_PIXEL_ALPHA;
+				job->data.blit.src_premul = G2D_PREMUL_NONE;
+				job->data.blit.src_alpha = 255;
+			} else {
+				job->data.blit.bld_mode = G2D_BLD_SRCOVER;
+			}
 			job->data.blit.flags = cmd.flags;
+
+			dev_info(g2d->dev, "CMD_MASK: src=%ux%u fmt=0x%x crop=(%u,%u %ux%u)\n",
+				job->data.blit.src_width, job->data.blit.src_height,
+				job->data.blit.src_format,
+				job->data.blit.src_crop_x, job->data.blit.src_crop_y,
+				job->data.blit.src_crop_w, job->data.blit.src_crop_h);
+			dev_info(g2d->dev, "CMD_MASK: dst=%ux%u fmt=0x%x dst=(%u,%u %ux%u)\n",
+				job->data.blit.dst_width, job->data.blit.dst_height,
+				job->data.blit.dst_format,
+				job->data.blit.dst_x, job->data.blit.dst_y,
+				job->data.blit.dst_w, job->data.blit.dst_h);
+			dev_info(g2d->dev, "CMD_MASK: mask_alpha=%d bld_mode=%u\n",
+				mask_alpha, job->data.blit.bld_mode);
 
 			ret = g2d_job_prepare_rcq(g2d, job);
 			if (ret)
@@ -6005,6 +6037,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 				job->data.blit.src_color_space,
 				job->data.blit.dst_color_space,
 				job->data.blit.out_color_space,
+				job->data.blit.mask_alpha,
 				job->data.blit.color_key_enable,
 				/* mask keys source layer */
 				true,
@@ -6181,16 +6214,28 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 							cmd.dst.color_space;
 					}
 
-					tjob->data.blit.color_key_enable = 1;
+					tjob->data.blit.color_key_enable =
+						mask_alpha ? 0 : 1;
 					tjob->data.blit.color_key_mode =
 						cmd.params.mask.color_key_mode;
 					tjob->data.blit.color_key_min =
 						cmd.params.mask.color_key_min;
 					tjob->data.blit.color_key_max =
 						cmd.params.mask.color_key_max;
+					tjob->data.blit.mask_alpha = mask_alpha;
 
-					tjob->data.blit.bld_mode =
-						G2D_BLD_SRCOVER;
+					if (mask_alpha) {
+						tjob->data.blit.bld_mode =
+							G2D_BLD_DSTIN;
+						tjob->data.blit.src_alpha_mode =
+							G2D_PIXEL_ALPHA;
+						tjob->data.blit.src_premul =
+							G2D_PREMUL_NONE;
+						tjob->data.blit.src_alpha = 255;
+					} else {
+						tjob->data.blit.bld_mode =
+							G2D_BLD_SRCOVER;
+					}
 					tjob->data.blit.flags = cmd.flags;
 
 					ret = g2d_job_prepare_rcq(g2d, tjob);
@@ -6230,6 +6275,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 						tjob->data.blit.src_color_space,
 						tjob->data.blit.dst_color_space,
 						tjob->data.blit.out_color_space,
+						tjob->data.blit.mask_alpha,
 						tjob->data.blit.color_key_enable,
 						/* mask keys source layer */
 						true,
@@ -7547,8 +7593,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 out_pitch, u32 out_format, u32 out_x, u32 out_y, u32 blend_w,
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
-	u8 out_color_space, bool ck_enable, bool ck_on_src, u32 ck_min,
-	u32 ck_max, struct g2d_csc_state *csc_state)
+	u8 out_color_space, bool mask_alpha, bool ck_enable, bool ck_on_src,
+	u32 ck_min, u32 ck_max, struct g2d_csc_state *csc_state)
 {
 	struct g2d_mixer_ovl_u_reg *ui2_regs = NULL; /* Foreground (src) */
 	struct g2d_mixer_ovl_v_reg *v0_regs = NULL; /* Background (dst) */
@@ -7583,13 +7629,26 @@ static int sunxi_g2d_do_blend_rcq(
 		 "BLEND_RCQ ENTRY: DMA src=0x%llx dst=0x%llx out=0x%llx\n",
 		 (u64)src_dma, (u64)dst_dma, (u64)out_dma);
 	dev_dbg(g2d->dev,
-		 "BLEND_RCQ ENTRY: alpha_mode=%u global_alpha=%u premul=%u\n",
-		 alpha_mode, global_alpha, premul_mode);
+		 "BLEND_RCQ ENTRY: alpha_mode=%u global_alpha=%u premul=%u mask_alpha=%u\n",
+		 alpha_mode, global_alpha, premul_mode, mask_alpha);
 
 	/* Hardware only distinguishes pixel/global alpha. Map MIXER to global. */
 	hw_alpha_mode = (alpha_mode == G2D_MIXER_ALPHA) ?
 				G2D_GLOBAL_ALPHA :
 				alpha_mode;
+	/* Mask alpha only makes sense for 8bpp mask buffers */
+	if (mask_alpha && src_format != G2D_FMT_8BPP_MONO) {
+		dev_warn(g2d->dev, "MASK: alpha_enable set but src fmt=0x%02x not 8bpp mono; disabling mask_alpha\n",
+			 src_format);
+		mask_alpha = false;
+	}
+
+	if (mask_alpha) {
+		hw_alpha_mode = G2D_PIXEL_ALPHA;
+		ck_enable = false;
+		bld_mode = G2D_BLD_DSTIN;
+		premul_mode = G2D_PREMUL_NONE;
+	}
 
 	/* Get bytes-per-pixel and HW format (swapped if needed) */
 	src_hw_fmt = sunxi_g2d_format_to_hw(src_format, &src_bpp);
@@ -7605,25 +7664,32 @@ static int sunxi_g2d_do_blend_rcq(
 
 	/* Check if scaling is needed */
 	needs_scaling = (src_crop_w != blend_w) || (src_crop_h != blend_h);
+	/* UI2 only supports RGB; for YUV or mask alpha force src on V0 */
+	bool force_swap_for_fmt =
+		mask_alpha ||
+		sunxi_g2d_is_yuv_format(src_format) ||
+		(src_format == G2D_FMT_8BPP_MONO);
 
-	if (needs_scaling) {
+	if (needs_scaling || force_swap_for_fmt) {
 		/* Scaling required: Must use V0 for Source (to use VSU).
 		 * This forces Source to be on Pipe 1 (Bottom) and Dest on Pipe 0 (Top).
 		 * Result: Source appears UNDER Destination.
 		 */
 		swap_layers = true;
-		dev_dbg(g2d->dev, "BLEND_RCQ: Scaling enabled. Swapping layers: Src=V0(Bottom), Dst=UI2(Top).\n");
+		dev_dbg(g2d->dev, "BLEND_RCQ: Swapping layers: Src=V0(Bottom), Dst=UI2(Top).\n");
 
 		/* Fix Z-order inversion:
 		 * Since V0 (Src) is physically below UI2 (Dst), we must invert the blend mode
 		 * to maintain the logical "Src over Dst" operation.
 		 * e.g., SRCOVER becomes DSTOVER.
 		 */
-		u32 old_mode = bld_mode;
-		bld_mode = sunxi_g2d_swap_blend_mode(bld_mode);
-		if (bld_mode != old_mode)
-			dev_dbg(g2d->dev, "BLEND_RCQ: Swapped blend mode %u -> %u to correct Z-order.\n",
-				 old_mode, bld_mode);
+		{
+			u32 old_mode = bld_mode;
+			bld_mode = sunxi_g2d_swap_blend_mode(bld_mode);
+			if (bld_mode != old_mode)
+				dev_dbg(g2d->dev, "BLEND_RCQ: Swapped blend mode %u -> %u to correct Z-order.\n",
+					 old_mode, bld_mode);
+		}
 	}
 
 	/* Calculate DMA offsets:
@@ -7760,8 +7826,8 @@ static int sunxi_g2d_do_blend_rcq(
 	 */
 	u32 fmt_p0 = swap_layers ? src_hw_fmt : dst_hw_fmt;
 	u32 fmt_p1 = swap_layers ? dst_hw_fmt : src_hw_fmt;
-	u8 cs_p0 = swap_layers ? dst_color_space : src_color_space;
-	u8 cs_p1 = swap_layers ? src_color_space : dst_color_space;
+	u8 cs_p0 = swap_layers ? src_color_space : dst_color_space;
+	u8 cs_p1 = swap_layers ? dst_color_space : src_color_space;
 	bool ck_en = ck_enable;
 	u32 ck_min_local = ck_min;
 	u32 ck_max_local = ck_max;
@@ -7825,7 +7891,7 @@ static int sunxi_g2d_do_blend_rcq(
 	ret = g2d_rcq_build_ui_dummy(&u1_regs, &u1_size);
 	if (ret)
 		goto cleanup;
-	/* Build Scaler block (Active or Dummy) */
+	/* Build Scaler block (Active or Passthrough) */
 	if (needs_scaling) {
 		/* Active Scaler on V0 (Pipe 1) */
 		/* If swap_layers is true, V0 is Source.
@@ -7841,32 +7907,29 @@ static int sunxi_g2d_do_blend_rcq(
 			dev_err(g2d->dev, "BLEND_RCQ: failed to build Active Scaler: %d\n", ret);
 			goto cleanup;
 		}
-		
-		/* Build Scaler Enable block */
-		ret = g2d_rcq_build_scaler_enable(src_hw_fmt, &scal_en_regs, &scal_en_size);
-		if (ret) {
-			dev_err(g2d->dev, "BLEND_RCQ: failed to build Scaler Enable: %d\n", ret);
-			goto cleanup;
-		}
 	} else {
-		/* Dummy Scaler (Bypass) */
-		ret = g2d_rcq_build_scaler_dummy(&scal_regs, &scal_size);
+		/* Passthrough Scaler to keep RCQ layout stable (avoids timeouts) */
+		ret = g2d_rcq_build_scaler_passthrough(blend_w, blend_h,
+						       src_hw_fmt, &scal_regs,
+						       &scal_size);
 		if (ret) {
-			dev_err(g2d->dev, "BLEND_RCQ: failed to build Dummy Scaler: %d\n", ret);
+			dev_err(g2d->dev, "BLEND_RCQ: failed to build Passthrough Scaler: %d\n", ret);
 			goto cleanup;
 		}
-		scal_en_size = 0;
+	}
+	/* Build Scaler Enable block */
+	ret = g2d_rcq_build_scaler_enable(src_hw_fmt, &scal_en_regs, &scal_en_size);
+	if (ret) {
+		dev_err(g2d->dev, "BLEND_RCQ: failed to build Scaler Enable: %d\n", ret);
+		goto cleanup;
 	}
 
 	/* ========== INITIALIZE RCQ LAYOUT ========== */
 	struct sunxi_g2d_rcq_frame_layout layout;
 	memset(&layout, 0, sizeof(layout));
 
-	/* Layout depends on scaling:
-	 * - No Scaling: 7 blocks (V0, U0, U1, U2, SCAL(dummy), BLD, WB)
-	 * - Scaling: 8 blocks (V0, U0, U1, U2, SCAL(active), SCAL_EN, BLD, WB)
-	 */
-	layout.block_count = needs_scaling ? 8 : 7;
+	/* Layout: always 8 blocks */
+	layout.block_count = 8;
 	layout.header_len_bytes =
 		layout.block_count * sizeof(struct g2d_rcq_header);
 
@@ -7890,48 +7953,28 @@ static int sunxi_g2d_do_blend_rcq(
 	layout.blocks[4].reg_offset = VS_CTRL;
 	layout.blocks[4].dirty = 1;
 
-	if (needs_scaling) {
-		/* Block 5: SCAL_EN */
-		layout.blocks[5].size = scal_en_size;
-		layout.blocks[5].reg_offset = VS_CTRL;
-		layout.blocks[5].dirty = 1;
+	/* Block 5: SCAL_EN */
+	layout.blocks[5].size = scal_en_size;
+	layout.blocks[5].reg_offset = VS_CTRL;
+	layout.blocks[5].dirty = 1;
 
-		/* Block 6: BLD */
-		layout.blocks[6].size = bld_size;
-		layout.blocks[6].reg_offset = BLD_EN_CTL;
-		layout.blocks[6].dirty = 1;
+	/* Block 6: BLD */
+	layout.blocks[6].size = bld_size;
+	layout.blocks[6].reg_offset = BLD_EN_CTL;
+	layout.blocks[6].dirty = 1;
 
-		/* Block 7: WB */
-		layout.blocks[7].size = wb_size;
-		layout.blocks[7].reg_offset = WB_ATT;
-		layout.blocks[7].dirty = 1;
-	} else {
-		/* Block 5: BLD */
-		layout.blocks[5].size = bld_size;
-		layout.blocks[5].reg_offset = BLD_EN_CTL;
-		layout.blocks[5].dirty = 1;
-
-		/* Block 6: WB */
-		layout.blocks[6].size = wb_size;
-		layout.blocks[6].reg_offset = WB_ATT;
-		layout.blocks[6].dirty = 1;
-	}
+	/* Block 7: WB */
+	layout.blocks[7].size = wb_size;
+	layout.blocks[7].reg_offset = WB_ATT;
+	layout.blocks[7].dirty = 1;
 
 	/* ========== PACK INTO RCQ BUFFER ========== */
-	if (needs_scaling) {
-		ret = sunxi_g2d_rcq_pack_frame_8blocks(rcq, &layout,
-						       (u32 *)v0_regs, u0_regs,
-						       u1_regs, (u32 *)ui2_regs,
-						       scal_regs, scal_en_regs,
-						       (u32 *)bld_regs,
-						       (u32 *)wb_regs);
-	} else {
-		ret = sunxi_g2d_rcq_pack_frame_7blocks(rcq, &layout,
-						       (u32 *)v0_regs, u0_regs,
-						       u1_regs, (u32 *)ui2_regs,
-						       scal_regs, (u32 *)bld_regs,
-						       (u32 *)wb_regs);
-	}
+	ret = sunxi_g2d_rcq_pack_frame_8blocks(rcq, &layout,
+					       (u32 *)v0_regs, u0_regs,
+					       u1_regs, (u32 *)ui2_regs,
+					       scal_regs, scal_en_regs,
+					       (u32 *)bld_regs,
+					       (u32 *)wb_regs);
 	
 	if (ret) {
 		dev_err(g2d->dev, "BLEND_RCQ: failed to pack RCQ frame: %d\n",

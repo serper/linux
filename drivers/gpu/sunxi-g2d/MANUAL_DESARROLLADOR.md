@@ -38,7 +38,6 @@ Guía rápida para trabajar con la UAPI expuesta en `/dev/g2d`. La UAPI se defin
   - Para pipelines largos, usa `G2D_IOC_TASK` y espera solo un fence final.
 - **Límites y validaciones**:
   - Dimensiones soportadas: 2–2048 px por eje.
-  - BLEND 3-buffers no escala; si necesitas escala + blend, haz SCALE y luego BLEND.
   - Rotación (90/180/270 y flips) no se mezcla con escalado en el mismo comando.
 
 ## Ejemplo mínimo: FILLRECT → COPY al framebuffer

@@ -92,7 +92,7 @@ static int sunxi_g2d_do_fillrect_rcq_modular(struct sunxi_g2d_dev *g2d,
 	/* Block 5: BLD (blender with fill color) - ACTIVE */
 	ret = g2d_rcq_build_bld_fillcolor(width, height, color, 
 	                                   0x03010301,  /* SRCOVER Porter-Duff */
-	                                   &bld_regs, &bld_size);
+	                                   false, &bld_regs, &bld_size);
 	if (ret)
 		goto cleanup;
 	

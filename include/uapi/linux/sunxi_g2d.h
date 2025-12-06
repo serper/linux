@@ -96,6 +96,14 @@ enum g2d_color_space {
 	G2D_COLOR_SPACE_BT2020 = 2,	/* BT.2020 (UHD video) */
 };
 
+/* Color keying modes */
+enum g2d_color_key_mode {
+	/* Pixels with RGB inside [min,max] become transparent */
+	G2D_CK_MODE_INSIDE_TRANSPARENT = 0,
+	/* Pixels with RGB outside [min,max] become transparent */
+	G2D_CK_MODE_OUTSIDE_TRANSPARENT = 1,
+};
+
 /* Porter-Duff blending modes
  * These define how source and destination are combined during alpha blending.
  * Only used when alpha blending is active.
@@ -215,6 +223,9 @@ struct g2d_blit {
 #define G2D_BLIT_FLAG_ALPHA_BLEND	(1 << 0)  /* Deprecated: auto-detected */
 #define G2D_BLIT_FLAG_ASYNC		(1 << 6)  /* Deprecated: always async */
 
+/* Generic command flags (apply to COPY/BLEND/MASK) */
+#define G2D_FLAG_TILE_REPEAT		(1 << 8)  /* Repeat source tile (crop or full src) to fill dst rect */
+
 /* G2D fillrect operation 
  * 
  * Fills a rectangular region with a solid color.
@@ -231,6 +242,7 @@ struct g2d_fillrect {
 	
 	__u32 color;		/* Color in format specified by color_format */
 	__u32 color_format;	/* enum g2d_pixel_format - format of color value */
+	__u32 global_alpha;	/* 0-255 global alpha applied over color alpha; 0 = 255 (opaque) */
 	
 	__s32 fence_fd_in;
 	__s32 fence_fd_out;	/* OUT */
@@ -316,20 +328,27 @@ struct g2d_cmd {
 	union {
 		struct {
 			__u32 color;
-		} fillrect;
-		struct {
-			__u32 bld_mode;
-		} blend;
-		struct {
-			__u32 angle;
-			__u32 flip_h;
-			__u32 flip_v;
+			__u32 global_alpha; /* 0-255, 0 defaults to 255 */
+	} fillrect;
+	struct {
+		__u32 bld_mode;
+		/* Optional color keying (chromakey) */
+		__u32 color_key_enable; /* 1 = enable color keying */
+		__u32 color_key_mode;   /* enum g2d_color_key_mode */
+		__u32 color_key_min;    /* 0xRRGGBB */
+		__u32 color_key_max;    /* 0xRRGGBB */
+	} blend;
+	struct {
+		__u32 angle;
+		__u32 flip_h;
+		__u32 flip_v;
 		} rotate;
-		struct {
-			__u32 color;
-			__u32 color_key_mode;
-			__u32 color_key_min;
-			__u32 color_key_max;
+	struct {
+		__u32 color;
+		__u32 color_key_mode;
+		__u32 color_key_min;
+		__u32 color_key_max;
+		__u32 alpha_enable;	/* 1 = usar src como máscara de alpha (8bpp), ignora colorkey */
 	} mask;
 	} params;
 };

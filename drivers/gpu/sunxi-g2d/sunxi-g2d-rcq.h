@@ -201,7 +201,7 @@ int g2d_rcq_build_v0_memory(u32 width, u32 height, const u32 stride[3],
                              u32 win_x, u32 win_y, u32 win_w, u32 win_h,
                              u32 **out_block, u32 *out_size);
 int g2d_rcq_build_bld_fillcolor(u32 width, u32 height, u32 fill_color,
-                                 u32 porter_duff,
+                                 u32 porter_duff, bool premul,
                                  struct g2d_mixer_bld_reg **out_block,
                                  u32 *out_size);
 int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
@@ -209,6 +209,7 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 		      u32 out_fmt, u8 cs_p0, u8 cs_p1, u8 cs_out, bool p0_en,
 		      bool p1_en, u32 p0_x, u32 p0_y, u32 p1_x, u32 p1_y,
 		      u32 bld_mode, u32 premul_mode, bool p1_is_copy_src,
+		      bool ck_enable, bool ck_on_ui2, u32 ck_min, u32 ck_max,
 		      struct g2d_csc_state *csc_state, u32 **out_block,
 		      u32 *out_size);
 int g2d_rcq_build_ui2_memory(u32 width, u32 height, u32 pitch,

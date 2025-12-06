@@ -360,6 +360,16 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 				blk = "SCAL";
 			else if (roff >= G2D_ROT && roff < (G2D_ROT + 0x1000))
 				blk = "ROT";
+			else if (roff >= G2D_UI0 && roff < (G2D_UI0 + 0x1000))
+				blk = "UI0";
+			else if (roff >= G2D_UI1 && roff < (G2D_UI1 + 0x1000))
+				blk = "UI1";
+			else if (roff >= G2D_UI2 && roff < (G2D_UI2 + 0x1000))
+				blk = "UI2";
+			else if (roff >= G2D_VSU && roff < (G2D_VSU + 0x1000))
+				blk = "VSU";
+			else if (roff >= G2D_GSU && roff < (G2D_GSU + 0x1000))
+				blk = "GSU";
 
 			pr_debug("RCQ CPU hdr[%u]: low=0x%08x len=0x%08x high=0x%02x reg_off=0x%08x (%s)\n",
 				  i, low, len, high, roff, blk);

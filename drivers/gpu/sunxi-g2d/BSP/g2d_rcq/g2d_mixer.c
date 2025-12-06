@@ -78,7 +78,7 @@ OUT:
 
 }
 
-    static __s32 g2d_fillrectangle(struct g2d_mixer_frame *p_frame,
+static __s32 g2d_fillrectangle(struct g2d_mixer_frame *p_frame,
 				   g2d_image_enh *dst, __u32 color_value)
 {
 	g2d_rect rect0;
