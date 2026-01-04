@@ -358,26 +358,6 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 
 	sync_wait_and_close(cmd_scale_ball.fence_fd_out, "CMD_SCALE ball→comp");
 
-	// /* DEBUG: Read first few pixels of comp buffer to verify SCALE output */
-	// {
-	// 	uint32_t comp_pixels[16] = {0};  /* Read first 4×4 pixels */
-	// 	struct g2d_buffer_rw read_buf = {
-	// 		.dma_fd = comp_dma_fd,
-	// 		.offset = 0,
-	// 		.size = sizeof(comp_pixels),
-	// 		.user_ptr = (__u64)(unsigned long)comp_pixels
-	// 	};
-
-	// 	ret = ioctl(g2d_fd, G2D_IOC_READ_BUFFER, &read_buf);
-	// 	if (ret == 0) {
-	// 		printf("COMP buffer first 16 pixels after SCALE:\n");
-	// 		for (int i = 0; i < 16; i++) {
-	// 			printf("  [%2d] = 0x%08x", i, comp_pixels[i]);
-	// 			if ((i+1) % 4 == 0) printf("\n");
-	// 		}
-	// 	}
-	// }
-
 	/* Step 2: CMD_COPY bg → blend (fresh background copy) */
 	{
 		struct g2d_cmd cmd_scale_gradient = { 0 };
@@ -424,7 +404,7 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 	cmd_blend.src.width = ball_size; /* Physical buffer size (radius*2) */
 	cmd_blend.src.height = ball_size; /* Physical buffer size (radius*2) */
 	cmd_blend.src.format =
-		G2D_FMT_ARGB8888; /* Match SCALE output format (no alpha) */
+		G2D_FMT_ARGB8888; /* VSU path keeps channels; pattern is ARGB */
 	cmd_blend.src.stride[0] =
 		ball_size * 4; /* Physical stride (radius*2 * 4) */
 	cmd_blend.src.dma_fd = comp_dma_fd;
@@ -432,10 +412,10 @@ int g2d_blend_ball_dma(struct drm_display *disp, int g2d_fd, int bg_dma_fd,
 	cmd_blend.src.crop_y = 0;
 	cmd_blend.src.crop_w = ball_size; /* Read only the scaled portion */
 	cmd_blend.src.crop_h = ball_size; /* Read only the scaled portion */
-	cmd_blend.src.alpha = 0;
+	cmd_blend.src.alpha = 255;  /* Use full global alpha for blending */
 	cmd_blend.src.alpha_mode =
-		G2D_PIXEL_ALPHA; /* Per-pixel alpha from ARGB */
-	cmd_blend.src.premul_mode = G2D_PREMUL_ALPHA; /* Straight alpha */
+		G2D_GLOBAL_ALPHA; /* Use global alpha (PIXEL_ALPHA broken after SCALE) */
+	cmd_blend.src.premul_mode = G2D_PREMUL_NONE; /* Straight alpha */
 
 	/* Destination (background READ): blend buffer (full screen dimensions)
 	 * Crop to the region where ball will be composited */
@@ -650,7 +630,7 @@ int main(int argc, char **argv)
 	size_t ball_raw_size = ball_buffer_size * ball_buffer_size * 4;
 	ball_alloc.size = (ball_raw_size + page_size - 1) & ~(page_size - 1);
 
-	ball_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
+	ball_alloc.flags = G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &ball_alloc);
 	if (ret < 0) {
 		fprintf(stderr, "Failed to allocate DMA buffer for ball\n");
@@ -666,7 +646,7 @@ int main(int argc, char **argv)
 	/* Create DMA buffer for background (800x480 XRGB8888) */
 	struct g2d_alloc_buffer bg_alloc = { 0 };
 	bg_alloc.size = disp.width * disp.height * 4;
-	bg_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
+	bg_alloc.flags = G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &bg_alloc);
 	if (ret < 0) {
 		fprintf(stderr,
@@ -683,7 +663,7 @@ int main(int argc, char **argv)
 	/* Create temporary DMA buffer for composition (same size as background) */
 	struct g2d_alloc_buffer temp_alloc = { 0 };
 	temp_alloc.size = disp.width * disp.height * 4;
-	temp_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
+	temp_alloc.flags = G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &temp_alloc);
 	if (ret < 0) {
 		fprintf(stderr, "Failed to allocate DMA buffer for temp\n");
@@ -700,7 +680,7 @@ int main(int argc, char **argv)
 	/* Create blend output buffer (final composed frame before FB copy) */
 	struct g2d_alloc_buffer blend_alloc = { 0 };
 	blend_alloc.size = disp.width * disp.height * 4;
-	blend_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
+	blend_alloc.flags = G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &blend_alloc);
 	if (ret < 0) {
 		fprintf(stderr,
@@ -722,7 +702,7 @@ int main(int argc, char **argv)
 	struct g2d_alloc_buffer comp_alloc = { 0 };
 	comp_alloc.size =
 		ball_buffer_size * ball_buffer_size * 4; /* 110x110 XRGB8888 */
-	comp_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
+	comp_alloc.flags = G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &comp_alloc);
 	if (ret < 0) {
 		fprintf(stderr,
@@ -739,22 +719,20 @@ int main(int argc, char **argv)
 	       comp_dma_fd, comp_alloc.size, ball_buffer_size,
 	       ball_buffer_size);
 
-	/* Initialize comp buffer to fully transparent (0x00000000)
-	 * This ensures clean alpha blending - unwritten pixels are transparent */
+	/* Initialize comp buffer to fully transparent using CPU fill instead of g2d_write_buffer
+	 * CRITICAL: The SCALE operation only writes to the destination rectangle,
+	 * leaving the rest of the buffer undefined. We need transparent pixels (A=0). */
 	{
-		uint32_t *comp_init =
-			calloc(ball_buffer_size * ball_buffer_size, 4);
-		if (comp_init) {
-			ret = g2d_write_buffer(
-				disp.g2d_fd, comp_dma_fd, comp_init,
-				ball_buffer_size * ball_buffer_size * 4, 0);
-			free(comp_init);
-			if (ret < 0) {
-				fprintf(stderr,
-					"Failed to initialize comp buffer\n");
-			} else {
-				printf("Comp buffer initialized to transparent\n");
-			}
+		/* Mmap the comp buffer and fill it with zeros */
+		size_t comp_map_size = comp_alloc.size;
+		void *comp_map = mmap(NULL, comp_map_size, PROT_READ | PROT_WRITE,
+					MAP_SHARED, comp_dma_fd, 0);
+		if (comp_map != MAP_FAILED) {
+			memset(comp_map, 0, comp_map_size);  /* Fill with 0x00 = transparent */
+			munmap(comp_map, comp_map_size);
+			printf("Comp buffer filled with zeros (transparent) via mmap\n");
+		} else {
+			fprintf(stderr, "Failed to mmap comp_buffer for initialization\n");
 		}
 	}
 
@@ -767,17 +745,26 @@ int main(int argc, char **argv)
 		size_t map_size = ball_alloc.size;
 		void *ball_map = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
 					MAP_SHARED, ball_dma_fd, 0);
+		uint32_t *ball_pattern = NULL;
+		int using_mmap = 1;
 		if (ball_map == MAP_FAILED) {
 			perror("mmap (ball dma-buf)");
-			close(comp_dma_fd);
-			close(temp_dma_fd);
-			close(bg_dma_fd);
-			close(ball_dma_fd);
-			drm_display_cleanup(&disp);
-			return 1;
+			/* Fallback: allocate staging buffer and later upload via g2d_write_buffer */
+			ball_pattern = malloc(map_size);
+			if (!ball_pattern) {
+				fprintf(stderr, "Failed to allocate fallback buffer for ball pattern\n");
+				close(comp_dma_fd);
+				close(temp_dma_fd);
+				close(bg_dma_fd);
+				close(ball_dma_fd);
+				drm_display_cleanup(&disp);
+				return 1;
+			}
+			using_mmap = 0;
+			printf("Using fallback malloc buffer for ball pattern (will upload)\n");
+		} else {
+			ball_pattern = (uint32_t *)ball_map;
 		}
-
-		uint32_t *ball_pattern = (uint32_t *)ball_map;
 
 		/* If supported by kernel driver, use DMA_BUF_IOCTL_SYNC to synchronize
 		 * CPU writes with device access. START before CPU write, END after.
@@ -791,52 +778,54 @@ int main(int argc, char **argv)
 		}
 
 		/* Create ball pattern: circular gradient with alpha on transparent background
-		 * Format: ARGB8888
-		 */
-		int center_x = ball_buffer_size / 2;
-		int center_y = ball_buffer_size / 2;
-		float pattern_max_radius = (float)(ball_buffer_size / 2);
+	 * Format: ARGB8888 (standard format)
+	 */
+	int center_x = ball_buffer_size / 2;
+	int center_y = ball_buffer_size / 2;
+	float pattern_max_radius = (float)(ball_buffer_size / 2);
 
-		for (int y = 0; y < ball_buffer_size; y++) {
-			for (int x = 0; x < ball_buffer_size; x++) {
-				int dx = x - center_x;
-				int dy = y - center_y;
-				float dist = sqrtf((float)(dx * dx + dy * dy));
+	for (int y = 0; y < ball_buffer_size; y++) {
+		for (int x = 0; x < ball_buffer_size; x++) {
+			int dx = x - center_x;
+			int dy = y - center_y;
+			float dist = sqrtf((float)(dx * dx + dy * dy));
 
-				uint32_t color;
+			uint32_t color;
 
-				/* Normalized distance [0.0, 1.0] */
-				float norm_dist = dist / pattern_max_radius;
-				if (norm_dist > 1.0f)
-					norm_dist = 1.0f;
+			/* Normalized distance [0.0, 1.0] */
+			float norm_dist = dist / pattern_max_radius;
+			if (norm_dist > 1.0f)
+				norm_dist = 1.0f;
 
-				const float inner_radius_ratio = 0.98f;
-				uint8_t alpha;
-				if (norm_dist <= inner_radius_ratio) {
-					alpha = 255;
-				} else {
-					float t = (norm_dist - inner_radius_ratio) /
-						(1.0f - inner_radius_ratio);
-					float falloff = 1.0f - t * t;
-					if (falloff < 0.0f)
-						falloff = 0.0f;
-					alpha = (uint8_t)(falloff * 255.0f + 0.5f);
-				}
-
-				float norm_x = (float)x / (float)ball_buffer_size;
-				float norm_y = (float)y / (float)ball_buffer_size;
-				uint8_t r = (uint8_t)(norm_x * 255.0f);
-				uint8_t g = (uint8_t)((1.0f - norm_x) * 255.0f);
-				uint8_t b = (uint8_t)(norm_y * 192.0f);
-
-				color = ((uint32_t)alpha << 24) |
-					((uint32_t)r << 16) |
-					((uint32_t)g << 8) | (uint32_t)b;
-
-				ball_pattern[y * ball_buffer_size + x] = color;
+			const float inner_radius_ratio = 0.98f;
+			uint8_t alpha;
+			if (norm_dist <= inner_radius_ratio) {
+				alpha = 255;
+			} else {
+				float t = (norm_dist - inner_radius_ratio) /
+					(1.0f - inner_radius_ratio);
+				float falloff = 1.0f - t * t;
+				if (falloff < 0.0f)
+					falloff = 0.0f;
+				alpha = (uint8_t)(falloff * 255.0f + 0.5f);
 			}
-		}
 
+			float norm_x = (float)x / (float)ball_buffer_size;
+			float norm_y = (float)y / (float)ball_buffer_size;
+			uint8_t r = (uint8_t)(norm_x * 255.0f);
+			uint8_t g = (uint8_t)((1.0f - norm_x) * 255.0f);
+			uint8_t b = (uint8_t)(norm_y * 192.0f);
+
+		/* Pack as ARGB (natural order); driver swap handles hardware quirk */
+		color = ((uint32_t)alpha << 24) |
+			((uint32_t)r << 16) |
+			((uint32_t)g << 8) | (uint32_t)b;
+
+		ball_pattern[y * ball_buffer_size + x] = color;
+		}
+	}
+
+	if (using_mmap) {
 		/* END sync for CPU write
 		 * Prefer DMA_BUF_IOCTL_SYNC if supported; msync is kept as a fallback.
 		 */
@@ -848,7 +837,68 @@ int main(int argc, char **argv)
 		}
 
 		printf("Ball pattern written directly into DMA-BUF via mmap: ptr=%p size=%zu\n",
-			   ball_map, map_size);
+		       ball_map, map_size);
+		fflush(stdout);
+	} else {
+		/* Upload fallback buffer via g2d_write_buffer */
+		printf("Uploading ball pattern via g2d_write_buffer (fallback path)\n");
+		fflush(stdout);
+		ret = g2d_write_buffer(disp.g2d_fd, ball_dma_fd,
+				 ball_pattern, map_size, 0);
+		if (ret < 0) {
+			fprintf(stderr, "g2d_write_buffer failed for ball pattern\n");
+			free(ball_pattern);
+			close(comp_dma_fd);
+			close(temp_dma_fd);
+			close(bg_dma_fd);
+			close(ball_dma_fd);
+			drm_display_cleanup(&disp);
+			return 1;
+		}
+	}
+
+	/* Debug: dump first pixel to check channel ordering */
+	if (ball_buffer_size > 0) {
+		uint32_t p0 = ball_pattern[0];
+		printf("DEBUG ball pixel[0]=0x%08x (A=%02x R=%02x G=%02x B=%02x)\n",
+		       p0,
+		       (p0 >> 24) & 0xFF,
+		       (p0 >> 16) & 0xFF,
+		       (p0 >> 8) & 0xFF,
+		       p0 & 0xFF);
+		fflush(stdout);
+		fprintf(stderr, "DEBUG ball pixel[0]=0x%08x (A=%02x R=%02x G=%02x B=%02x)\n",
+		        p0,
+		        (p0 >> 24) & 0xFF,
+		        (p0 >> 16) & 0xFF,
+		        (p0 >> 8) & 0xFF,
+		        p0 & 0xFF);
+		fflush(stderr);
+
+		/* Dump center pixel (should be fully opaque inside the circle) */
+		int cx = ball_buffer_size / 2;
+		int cy = ball_buffer_size / 2;
+		uint32_t pc = ball_pattern[cy * ball_buffer_size + cx];
+		printf("DEBUG ball pixel[c]=0x%08x (A=%02x R=%02x G=%02x B=%02x) at (%d,%d)\n",
+		       pc,
+		       (pc >> 24) & 0xFF,
+		       (pc >> 16) & 0xFF,
+		       (pc >> 8) & 0xFF,
+		       pc & 0xFF,
+		       cx, cy);
+		fflush(stdout);
+		fprintf(stderr, "DEBUG ball pixel[c]=0x%08x (A=%02x R=%02x G=%02x B=%02x) at (%d,%d)\n",
+		        pc,
+		        (pc >> 24) & 0xFF,
+		        (pc >> 16) & 0xFF,
+		        (pc >> 8) & 0xFF,
+		        pc & 0xFF,
+		        cx, cy);
+		fflush(stderr);
+	}
+
+	if (!using_mmap)
+		free(ball_pattern);
 	}
 
 	/* NOTE: ball_scaled buffer is no longer needed
@@ -878,7 +928,7 @@ int main(int argc, char **argv)
 	struct g2d_alloc_buffer gradient_alloc = { 0 };
 	gradient_alloc.size =
 		gradient_width * gradient_height * 4; /* XRGB8888 */
-	gradient_alloc.flags = G2D_ALLOC_F_CONTIGUOUS | G2D_ALLOC_F_COHERENT;
+	gradient_alloc.flags = G2D_ALLOC_F_COHERENT;
 	ret = ioctl(disp.g2d_fd, G2D_IOC_ALLOC_BUFFER, &gradient_alloc);
 	if (ret < 0) {
 		fprintf(stderr,

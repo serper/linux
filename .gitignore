@@ -186,3 +186,4 @@ sphinx_*/
 
 # Temporary directory for testing
 **/tmp_test_dir/
+/patches/

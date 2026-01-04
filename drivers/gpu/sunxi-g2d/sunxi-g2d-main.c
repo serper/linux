@@ -145,7 +145,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
 	u8 out_color_space, bool mask_alpha, u32 rop3_code, bool ck_enable, bool ck_on_src,
-	u32 ck_min, u32 ck_max, struct g2d_csc_state *csc_state);
+	u32 ck_min, u32 ck_max, u32 back_flag, u32 fore_flag,
+	struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot_rcq(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -1422,7 +1423,8 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 			step->blit.color_key_mode = cmd->params.mask.color_key_mode;
 			step->blit.color_key_min = cmd->params.mask.color_key_min;
 			step->blit.color_key_max = cmd->params.mask.color_key_max;
-			step->blit.mask_alpha = cmd->params.mask.alpha_enable;
+			/* Force mask_alpha for MASK commands so ROP4 path is taken */
+			step->blit.mask_alpha = 1;
 			step->blit.back_flag = cmd->params.mask.back_flag;
 			step->blit.fore_flag = cmd->params.mask.fore_flag;
 
@@ -1504,7 +1506,10 @@ static int g2d_task_add_step(struct sunxi_g2d_ctx *ctx, struct g2d_task *task,
 				/* color key always targets source layer */
 				true,
 				step->blit.color_key_min,
-				step->blit.color_key_max, &step->csc_state);
+				step->blit.color_key_max,
+				step->blit.back_flag,
+				step->blit.fore_flag,
+				&step->csc_state);
 		} else if (cmd->cmd_type == G2D_CMD_ROTATE) {
 			u32 flags = 0;
 			step->type = G2D_JOB_CMD_ROTATE;
@@ -2448,7 +2453,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
 	u8 out_color_space, bool mask_alpha, u32 rop3_code, bool ck_enable, bool ck_on_src,
-	u32 ck_min, u32 ck_max, struct g2d_csc_state *csc_state);
+	u32 ck_min, u32 ck_max, u32 back_flag, u32 fore_flag,
+	struct g2d_csc_state *csc_state);
 
 static int sunxi_g2d_do_blit_rot(
 	struct sunxi_g2d_dev *g2d, struct g2d_rcq_mem *rcq, dma_addr_t src_dma,
@@ -5006,7 +5012,8 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 				/* key on source layer (UI2 unless swap_layers flips it to V0) */
 				true,
 				job->data.blit.color_key_min,
-				job->data.blit.color_key_max, &job->csc_state);
+				job->data.blit.color_key_max, 0, 0,
+				&job->csc_state);
 			if (ret)
 				goto cleanup;
 			job->rcq_ready = true;
@@ -5219,7 +5226,7 @@ static long sunxi_g2d_cmd_blend(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 						/* key on source layer (UI2 unless swap_layers flips to V0) */
 						true,
 						tjob->data.blit.color_key_min,
-						tjob->data.blit.color_key_max,
+						tjob->data.blit.color_key_max, 0, 0,
 						&tjob->csc_state);
 					if (ret) {
 						sunxi_g2d_rcq_free(g2d->dev,
@@ -5951,13 +5958,16 @@ static int sunxi_g2d_do_mask_rcq(
 	}
 	if (ret) goto cleanup;
 
-	/* Build BLD (ROP4) */
+	/* Build BLD (ROP4)
+	 * Note: hardware selects rop3_code0 when mask bit is 1 on T113, so swap
+	 * user-provided fore/back flags here to match expected polarity.
+	 */
 	ret = g2d_rcq_build_bld(blend_w, blend_h, blend_w, blend_h, blend_w,
 				blend_h, dst_hw_fmt, src_hw_fmt, out_hw_fmt,
 				0, 0, 0, true, true, 0, 0, 0, 0,
 				G2D_BLD_COPY, G2D_PREMUL_NONE, false, false,
 				false, 0, 0, csc_state,
-				true, back_flag, fore_flag,
+				true, fore_flag, back_flag,
 				(u32 **)&bld_regs, &bld_size);
 	if (ret) goto cleanup;
 
@@ -6502,7 +6512,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 					/* mask keys source layer */
 					true,
 					job->data.blit.color_key_min,
-					job->data.blit.color_key_max, &job->csc_state);
+					job->data.blit.color_key_max, 0, 0, &job->csc_state);
 			}
 			if (ret)
 				goto cleanup;
@@ -6744,7 +6754,7 @@ static long sunxi_g2d_cmd_mask(struct sunxi_g2d_ctx *ctx, unsigned long arg)
 						/* mask keys source layer */
 						true,
 						tjob->data.blit.color_key_min,
-						tjob->data.blit.color_key_max,
+						tjob->data.blit.color_key_max, 0, 0,
 						&tjob->csc_state);
 					if (ret) {
 						sunxi_g2d_rcq_free(g2d->dev,
@@ -8079,7 +8089,8 @@ static int sunxi_g2d_do_blend_rcq(
 	u32 blend_h, u32 bld_mode, u32 alpha_mode, u32 global_alpha,
 	u32 premul_mode, u8 src_color_space, u8 dst_color_space,
 	u8 out_color_space, bool mask_alpha, u32 rop3_code, bool ck_enable, bool ck_on_src,
-	u32 ck_min, u32 ck_max, struct g2d_csc_state *csc_state)
+	u32 ck_min, u32 ck_max, u32 back_flag, u32 fore_flag,
+	struct g2d_csc_state *csc_state)
 {
 	struct g2d_mixer_ovl_u_reg *ui2_regs = NULL; /* Foreground (src) */
 	struct g2d_mixer_ovl_v_reg *v0_regs = NULL; /* Background (dst) */
@@ -8444,15 +8455,16 @@ static int sunxi_g2d_do_blend_rcq(
 		/* Mask Operation using ROP4
 		 * P0 = Image (V0). P1 = Mask (UI2).
 		 * ROP4 uses Mask (P1) to select between two ROP3 codes.
-		 * - Mask=0 (Background): Use rop3_code0 (NOTSRCCOPY = 0x33)
-		 * - Mask=1 (Foreground): Use rop3_code1 (SRCINVERT = 0x66)
+		 * - Mask=0 (Background): Use rop3_code0 (fore_flag)
+		 * - Mask=1 (Foreground): Use rop3_code1 (back_flag)
+		 * Note: hardware mapping observed to be inverted, so swap here.
 		 */
 		use_rop4 = true;
 		bld_mode = G2D_BLD_COPY; /* ROP overrides blending */
 		
-		/* User requested specific ROP codes */
-		rop3_code0 = G2D_ROP3_NOTSRCCOPY; /* 0x33 */
-		rop3_code1 = G2D_ROP3_SRCINVERT;  /* 0x66 */
+		/* Read ROP codes from userspace parameters (swapped for HW mapping) */
+		rop3_code0 = fore_flag;
+		rop3_code1 = back_flag;
 		
 		hw_alpha_mode = G2D_GLOBAL_ALPHA;
 		global_alpha = 0xFF;

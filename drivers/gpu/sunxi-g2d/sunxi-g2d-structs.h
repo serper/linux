@@ -1181,10 +1181,12 @@ struct g2d_mixer_ovl_u_reg {
 union g2d_mixer_wb_attr {
 	u32 dwval;
 	struct {
-		u32 fmt:6;        /* Format (bits [5:0]) */
-		u32 res0:2;       /* Reserved (bits [7:6]) */
-		u32 round_en:1;   /* Round enable (bit 8) */
-		u32 res1:23;      /* Reserved (bits [31:9]) */
+		u32 en:1;         /* Writeback enable (bit 0) */
+		u32 res0:5;
+		u32 fmt:6;
+		u32 res1:2;
+		u32 round_en:1;
+		u32 res2:17;
 	} bits;
 };
 

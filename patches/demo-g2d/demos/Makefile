@@ -16,7 +16,7 @@ LDFLAGS = --sysroot=$(ALPINE_ROOTFS) -ldrm -lm
 DRM_BASE = demo-drm-base.c
 
 # Demo programs
-DEMOS = demo-bouncing-ball demo-fillrect-rcq-simple test_timing
+DEMOS = demo-bouncing-ball demo-fillrect-rcq-simple test_timing test-mask-rop4 test-rop4-pattern test-rop4-blackwhite
 
 # Build directory (optional, for cross-compilation output)
 BUILD_DIR = .
@@ -48,6 +48,21 @@ demo-scale-rotate: demo-scale-rotate.c $(DRM_BASE)
 # Test timing, display adjustment
 test_timing: test_timing.c $(DRM_BASE)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@"
+
+# Test mask operation with ROP4
+test-mask-rop4: test-mask-rop4.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "Built: $@"
+
+# Test ROP4 with pattern
+test-rop4-pattern: test-rop4-pattern.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "Built: $@"
+
+# Test ROP4 with black & white
+test-rop4-blackwhite: test-rop4-blackwhite.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "Built: $@"
 
 clean:
