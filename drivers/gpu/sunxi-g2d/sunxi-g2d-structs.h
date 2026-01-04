@@ -139,28 +139,6 @@ typedef enum {
 } g2d_fmt_enh;
 
 /**
- * enum g2d_rop3_cmd_flag - ROP3 (Raster Operation) commands
- * Standard ROP3 operations for bitblt
- */
-typedef enum {
-	G2D_ROP3_BLACKNESS    = 0x00,
-	G2D_ROP3_NOTSRCERASE  = 0x11,
-	G2D_ROP3_NOTSRCCOPY   = 0x33,
-	G2D_ROP3_SRCERASE     = 0x44,
-	G2D_ROP3_DSTINVERT    = 0x55,
-	G2D_ROP3_PATINVERT    = 0x5A,
-	G2D_ROP3_SRCINVERT    = 0x66,
-	G2D_ROP3_SRCAND       = 0x88,
-	G2D_ROP3_MERGEPAINT   = 0xBB,
-	G2D_ROP3_MERGECOPY    = 0xC0,
-	G2D_ROP3_SRCCOPY      = 0xCC,
-	G2D_ROP3_SRCPAINT     = 0xEE,
-	G2D_ROP3_PATCOPY      = 0xF0,
-	G2D_ROP3_PATPAINT     = 0xFB,
-	G2D_ROP3_WHITENESS    = 0xFF,
-} g2d_rop3_cmd_flag;
-
-/**
  * enum g2d_color_gmt - Color gamut / color space standards
  * @G2D_BT601: ITU-R BT.601 (SD video)
  * @G2D_BT709: ITU-R BT.709 (HD video)
@@ -1203,12 +1181,10 @@ struct g2d_mixer_ovl_u_reg {
 union g2d_mixer_wb_attr {
 	u32 dwval;
 	struct {
-		u32 en:1;         /* Writeback enable (bit 0) */
-		u32 res0:5;
-		u32 fmt:6;
-		u32 res1:2;
-		u32 round_en:1;
-		u32 res2:17;
+		u32 fmt:6;        /* Format (bits [5:0]) */
+		u32 res0:2;       /* Reserved (bits [7:6]) */
+		u32 round_en:1;   /* Round enable (bit 8) */
+		u32 res1:23;      /* Reserved (bits [31:9]) */
 	} bits;
 };
 

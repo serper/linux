@@ -276,12 +276,12 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 	wmb();
 	
 	/* Log initial state */
-	pr_debug("RCQ setup: Initial state - IRQ_CTL=0x%08x CTRL=0x%08x STATUS=0x%08x\n",
+	dev_dbg(NULL, "RCQ setup: Initial state - IRQ_CTL=0x%08x CTRL=0x%08x STATUS=0x%08x\n",
 	        readl(base + G2D_RCQ_IRQ_CTL),
 	        readl(base + G2D_RCQ_CTRL),
 	        readl(base + G2D_RCQ_STATUS));
 	
-	pr_debug("RCQ setup: CMD_CTL=0x%08x (should be 0x00010011 for DMA)\n",
+	dev_dbg(NULL, "RCQ setup: CMD_CTL=0x%08x (should be 0x00010011 for DMA)\n",
 	        readl(base + G2D_CMD_CTL));
 	
 	/* v2.1.7: DON'T clear STATUS here - BSP doesn't do it!
@@ -320,7 +320,7 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 	writel(high_addr, base + G2D_RCQ_HEAD_HIGH);
 	writel(header_len_bytes, base + G2D_RCQ_HEAD_LEN);
 	
-	pr_debug("RCQ setup: addr=0x%08x (high=0x%02x) headers=%u (%u bytes)\n", 
+	dev_dbg(NULL, "RCQ setup: addr=0x%08x (high=0x%02x) headers=%u (%u bytes)\n", 
 	        (u32)(rcq->phy_addr & 0xFFFFFFFF), high_addr, 
 	        rcq->header_count, header_len_bytes);
 	
@@ -371,13 +371,13 @@ void sunxi_g2d_rcq_setup_hw(void __iomem *base, struct g2d_rcq_mem *rcq)
 			else if (roff >= G2D_GSU && roff < (G2D_GSU + 0x1000))
 				blk = "GSU";
 
-			pr_debug("RCQ CPU hdr[%u]: low=0x%08x len=0x%08x high=0x%02x reg_off=0x%08x (%s)\n",
+			dev_dbg(NULL, "RCQ CPU hdr[%u]: low=0x%08x len=0x%08x high=0x%02x reg_off=0x%08x (%s)\n",
 				  i, low, len, high, roff, blk);
 		}
 	}
 	
 	/* Read back to verify */
-	pr_debug("RCQ regs written: HEAD_LOW=0x%08x HEAD_HIGH=0x%08x HEAD_LEN=0x%08x\n",
+	dev_dbg(NULL, "RCQ regs written: HEAD_LOW=0x%08x HEAD_HIGH=0x%08x HEAD_LEN=0x%08x\n",
 	        readl(base + G2D_RCQ_HEAD_LOW),
 	        readl(base + G2D_RCQ_HEAD_HIGH),
 	        readl(base + G2D_RCQ_HEAD_LEN));
@@ -558,11 +558,11 @@ void sunxi_g2d_rcq_start(void __iomem *base, bool use_en_bit, bool enable_irq)
 	if (enable_irq) {
 		irq_ctl.bits.task_end_irq_en = 1;        /* Enable for RCQ v2 (BSP pattern) */
 		irq_ctl.bits.rcq_cfg_finish_irq_en = 0;  /* Keep disabled - causes IRQ storm */
-		pr_debug("RCQ IRQ enabled: task_end_irq_en=1 (BSP pattern for RCQ v2)\n");
+		dev_dbg(NULL, "RCQ IRQ enabled: task_end_irq_en=1 (BSP pattern for RCQ v2)\n");
 	} else {
 		irq_ctl.bits.task_end_irq_en = 0;        /* Disable - legacy behavior */
 		irq_ctl.bits.rcq_cfg_finish_irq_en = 0;  /* Disable - causes IRQ storm */
-		pr_debug("RCQ IRQs disabled: using MIXER_IRQ for completion (legacy)\n");
+		dev_dbg(NULL, "RCQ IRQs disabled: using MIXER_IRQ for completion (legacy)\n");
 	}
 	writel(irq_ctl.dwval, base + G2D_RCQ_IRQ_CTL);
 	
@@ -570,14 +570,14 @@ void sunxi_g2d_rcq_start(void __iomem *base, bool use_en_bit, bool enable_irq)
 	ctrl.dwval = readl(base + G2D_RCQ_CTRL);
 	ctrl.bits.update = 1;   /* Trigger RCQ execution */
 	ctrl.bits.en = 1;       /* Force EN bit for T113 */
-	pr_debug("RCQ writing CTRL=0x%08x (update=1, en=1)\n",
+	dev_dbg(NULL, "RCQ writing CTRL=0x%08x (update=1, en=1)\n",
 	        ctrl.dwval);
 	writel(ctrl.dwval, base + G2D_RCQ_CTRL);
 	wmb();  /* Ensure all writes are committed before checking status */
 	
 	/* Read status immediately after UPDATE to see if anything happened */
-	pr_debug("RCQ started: IRQ_CTL=0x%08x\n", irq_ctl.dwval);
-	pr_debug("RCQ status after UPDATE: CTRL=0x%08x STATUS=0x%08x\n",
+	dev_dbg(NULL, "RCQ started: IRQ_CTL=0x%08x\n", irq_ctl.dwval);
+	dev_dbg(NULL, "RCQ status after UPDATE: CTRL=0x%08x STATUS=0x%08x\n",
 	        readl(base + G2D_RCQ_CTRL), readl(base + G2D_RCQ_STATUS));
 }
 
@@ -1078,7 +1078,7 @@ int sunxi_g2d_rcq_pack_frame_8blocks(struct g2d_rcq_mem *rcq,
 
 	/* Debug: show payload pointers and expected block sizes before packing */
 	for (i = 0; i < 8; i++) {
-		pr_debug("RCQ PACK PRE: payload[%u]=%p blk.size=%u reg_off=0x%08x\n",
+		dev_dbg(NULL, "RCQ PACK PRE: payload[%u]=%p blk.size=%u reg_off=0x%08x\n",
 				 i, payloads[i], layout->blocks[i].size, layout->blocks[i].reg_offset);
 	}
 
@@ -1113,7 +1113,7 @@ int sunxi_g2d_rcq_pack_frame_8blocks(struct g2d_rcq_mem *rcq,
 
 		hdr = &headers[i];
 		dst = (u8 *)rcq->vir_addr + data_offset;
-		pr_debug("RCQ PACK: idx=%u data_offset=0x%08x dst=%p payload=%p size=%u aligned=%u\n",
+		dev_dbg(NULL, "RCQ PACK: idx=%u data_offset=0x%08x dst=%p payload=%p size=%u aligned=%u\n",
 			 i, data_offset, dst, payloads[i], blk->size, aligned_size);
 		data_phy_addr = rcq->phy_addr + data_offset;
 

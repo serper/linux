@@ -52,7 +52,7 @@ struct g2d_csc_state {
 struct g2d_rot_reg;
 
 /* Special Blend Mode for Copy Operations (uses ROPs instead of Porter-Duff) */
-#define G2D_BLD_COPY            0xFF
+/* #define G2D_BLD_COPY            0xFF  <-- REMOVED: Conflicts with UAPI enum (1) */
 
 /**
  * struct g2d_rcq_header - RCQ command header
@@ -132,7 +132,7 @@ struct sunxi_g2d_rcq_frame_layout {
 	struct g2d_rcq_header *headers;
 	u32 header_count;
 	u32 header_len_bytes;
-	struct sunxi_g2d_reg_block blocks[8];  /* Max 7 used, 8 for alignment */
+	struct sunxi_g2d_reg_block blocks[10];  /* Max 7 used, 8 for alignment, increased to 10 for MIXER_CTL */
 	u32 block_count;
 };
 
@@ -210,8 +210,20 @@ int g2d_rcq_build_bld(u32 p0_w, u32 p0_h, u32 p1_w, u32 p1_h,
 		      bool p1_en, u32 p0_x, u32 p0_y, u32 p1_x, u32 p1_y,
 		      u32 bld_mode, u32 premul_mode, bool p1_is_copy_src,
 		      bool ck_enable, bool ck_on_ui2, u32 ck_min, u32 ck_max,
-		      struct g2d_csc_state *csc_state, u32 **out_block,
+		      struct g2d_csc_state *csc_state,
+		      bool use_rop4, u32 rop3_code0, u32 rop3_code1,
+		      u32 **out_block,
 		      u32 *out_size);
+int g2d_rcq_build_ui0_memory(u32 width, u32 height, u32 pitch,
+			     dma_addr_t dma_addr, u32 crop_offset, u32 src_fmt,
+			     u32 win_x, u32 win_y, u32 win_w, u32 win_h,
+			     u32 alpha_mode, u32 global_alpha, u32 premul_mode,
+			     struct g2d_mixer_ovl_u_reg **out_block, u32 *out_size);
+int g2d_rcq_build_ui1_memory(u32 width, u32 height, u32 pitch,
+			     dma_addr_t dma_addr, u32 crop_offset, u32 src_fmt,
+			     u32 win_x, u32 win_y, u32 win_w, u32 win_h,
+			     u32 alpha_mode, u32 global_alpha, u32 premul_mode,
+			     struct g2d_mixer_ovl_u_reg **out_block, u32 *out_size);
 int g2d_rcq_build_ui2_memory(u32 width, u32 height, u32 pitch,
 			     dma_addr_t dma_addr, u32 crop_offset, u32 src_fmt,
 			     u32 win_x, u32 win_y, u32 win_w, u32 win_h,
@@ -227,6 +239,7 @@ int g2d_rcq_build_scaler_dummy(u32 **out_block, u32 *out_size);
 int g2d_rcq_build_scaler_active(u32 in_w, u32 in_h, u32 out_w, u32 out_h,
 				u32 fmt, u8 alpha, u32 **out_block, u32 *out_size);
 int g2d_rcq_build_scaler_enable(u32 fmt, u32 **out_block, u32 *out_size);
+int g2d_rcq_build_scaler_disable(u32 **out_block, u32 *out_size);
 int g2d_rcq_build_rot(u32 src_w, u32 src_h, u32 src_pitch,
 		      dma_addr_t src_addr, u32 src_fmt,
 		      u32 dst_w, u32 dst_h, u32 dst_pitch,
